@@ -1,88 +1,118 @@
 # cc-clip
 
-Paste images into remote Claude Code over SSH — as if it were local.
+**Clipboard over SSH for Claude Code** — paste images from your local Mac into remote Claude Code sessions, as if it were local.
 
-## The Problem
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)](https://go.dev)
+[![Release](https://img.shields.io/github/v/release/ShunmeiCho/cc-clip)](https://github.com/ShunmeiCho/cc-clip/releases)
 
-When running Claude Code on a remote server via SSH, `Ctrl+V` image paste doesn't work.
-The remote `xclip` reads the server's clipboard, not your local Mac's clipboard.
+## Why
 
-## The Solution
+When running Claude Code on a remote server via SSH, `Ctrl+V` image paste doesn't work. The remote `xclip` reads the server's clipboard, not your local Mac's. No screenshots, no diagrams, no visual context — you're stuck with text-only.
 
-cc-clip creates a transparent bridge between your local clipboard and the remote server:
+cc-clip fixes this with a transparent bridge:
 
 ```
-Local Mac clipboard  -->  SSH tunnel  -->  xclip shim  -->  Claude Code
+Local Mac clipboard  →  HTTP daemon  →  SSH tunnel  →  xclip shim  →  Claude Code
 ```
 
-No changes to Claude Code. No terminal-specific hacks. Just works.
+No changes to Claude Code. No terminal-specific hacks. Works with any terminal emulator.
 
 ## Quick Start
 
-**1. Install locally (Mac):**
+**1. Install (Mac):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ShunmeiCho/cc-clip/main/scripts/install.sh | sh
 ```
 
-**2. One-command setup:**
+**2. Setup:**
 
 ```bash
 cc-clip setup myserver
 ```
 
-This single command handles everything:
+This single command:
 - Installs `pngpaste` via Homebrew (if missing)
-- Configures SSH `RemoteForward` and `ControlMaster no` in `~/.ssh/config`
+- Configures SSH `RemoteForward` in `~/.ssh/config`
 - Starts the local daemon via launchd (auto-restarts on reboot)
-- Deploys binary + shim to remote, syncs token, verifies tunnel
+- Deploys binary + shim to remote, syncs auth token, verifies tunnel
 
 **3. Done.** `Ctrl+V` in remote Claude Code now pastes images from your Mac.
 
-> **Already set up?** Use `cc-clip connect myserver` for subsequent deploys (incremental, skips unchanged components). Use `cc-clip connect myserver --token-only` to just re-sync the token.
+> **Already set up?** Use `cc-clip connect myserver` for subsequent deploys (incremental, skips unchanged components).
 
 ## How It Works
 
-1. **Local daemon** (`cc-clip serve`) — Reads your Mac clipboard, serves images via HTTP on `127.0.0.1:18339`
+```
+                    ┌─────────────┐
+                    │  Mac (local) │
+                    │              │
+                    │  pngpaste ──►│ cc-clip daemon (127.0.0.1:18339)
+                    └──────┬───────┘
+                           │ SSH RemoteForward
+                    ┌──────▼───────┐
+                    │ Linux (remote)│
+                    │              │
+  Claude Code ◄──── xclip shim ◄──┤ 127.0.0.1:18339 (tunneled)
+                    └──────────────┘
+```
+
+1. **Local daemon** (`cc-clip serve`) — Reads Mac clipboard via `pngpaste`, serves images over HTTP on loopback
 2. **SSH tunnel** (`RemoteForward`) — Forwards the daemon port to the remote server
-3. **xclip shim** — Intercepts only the clipboard calls Claude Code makes, fetches image data through the tunnel, passes everything else to the real `xclip`
+3. **xclip shim** — A bash script at `~/.local/bin/xclip` that intercepts only the clipboard calls Claude Code makes, fetches image data through the tunnel, and passes everything else to the real `xclip`
 
-### Security
+## Security
 
-- Daemon listens on loopback only (`127.0.0.1`)
-- Session-scoped token with TTL (default 12h)
-- Token transmitted via stdin, not command-line arguments
-- All non-shim calls pass through to real `xclip` unchanged
+| Layer | Protection |
+|-------|-----------|
+| Network | Daemon listens on loopback only (`127.0.0.1`) — never exposed to the network |
+| Auth | Session-scoped Bearer token with sliding expiration (default 30 days) |
+| Token delivery | Transmitted via stdin, never in command-line arguments or environment |
+| Transparency | All non-image clipboard calls pass through to real `xclip` unchanged |
+
+### Token Lifecycle
+
+The daemon generates a token on first start and persists it to `~/.cache/cc-clip/session.token`. The token has a **30-day TTL with sliding expiration** — every successful request automatically extends the expiry, so active users never encounter token expiry.
+
+**If you do hit token expiry** (e.g., after 30+ days of inactivity):
+
+```bash
+# Quick fix: re-sync token only (no binary re-upload)
+cc-clip connect myserver --token-only
+
+# Or diagnose first
+cc-clip doctor --host myserver
+```
+
+Symptoms of expired token: shim debug logs show `"token expired"` or `"401"`, and image paste silently falls back to the remote clipboard.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `cc-clip setup <host>` | **Full setup**: deps, SSH config, daemon, deploy |
-| `cc-clip serve` | Start local clipboard daemon (foreground) |
+| `cc-clip setup <host>` | Full setup: deps, SSH config, daemon, deploy |
+| `cc-clip connect <host>` | Deploy to remote (incremental) |
+| `cc-clip connect <host> --token-only` | Sync token only (fast) |
+| `cc-clip connect <host> --force` | Full redeploy ignoring cache |
+| `cc-clip serve` | Start daemon in foreground |
 | `cc-clip serve --rotate-token` | Start daemon with forced new token |
-| `cc-clip service install` | Install macOS launchd service (auto-start, background) |
+| `cc-clip service install` | Install macOS launchd service |
 | `cc-clip service uninstall` | Remove launchd service |
-| `cc-clip service status` | Show launchd service status |
-| `cc-clip connect <host>` | Deploy to remote server (incremental, one command) |
-| `cc-clip connect <host> --token-only` | Only sync token (fast, no binary upload) |
-| `cc-clip connect <host> --force` | Full redeploy ignoring cached state |
-| `cc-clip install` | Install xclip shim on remote |
-| `cc-clip uninstall` | Remove xclip shim |
-| `cc-clip uninstall --host H` | Remove shim and clean up remote PATH marker |
-| `cc-clip paste` | Manually fetch clipboard image (fallback) |
+| `cc-clip service status` | Show service status |
 | `cc-clip doctor` | Local health check |
-| `cc-clip doctor --host H` | End-to-end health check |
-| `cc-clip status` | Show component status (daemon, token, launchd) |
+| `cc-clip doctor --host <host>` | End-to-end health check |
+| `cc-clip status` | Show component status |
+| `cc-clip uninstall` | Remove xclip shim from remote |
 
 ## Configuration
 
-All settings have sensible defaults. Override via flags or environment variables:
+All settings have sensible defaults. Override via environment variables:
 
 | Setting | Default | Env Var |
 |---------|---------|---------|
 | Port | 18339 | `CC_CLIP_PORT` |
-| Token TTL | 12h | `CC_CLIP_TOKEN_TTL` |
+| Token TTL | 30d | `CC_CLIP_TOKEN_TTL` |
 | Output dir | `$XDG_RUNTIME_DIR/claude-images` | `CC_CLIP_OUT_DIR` |
 | Probe timeout | 500ms | `CC_CLIP_PROBE_TIMEOUT_MS` |
 | Fetch timeout | 5000ms | `CC_CLIP_FETCH_TIMEOUT_MS` |
@@ -92,37 +122,32 @@ All settings have sensible defaults. Override via flags or environment variables
 
 **Local (Mac):**
 - macOS 13+
-- `pngpaste` (`brew install pngpaste`) — auto-installed by `cc-clip setup`
-- `curl`
+- `pngpaste` — auto-installed by `cc-clip setup`
 
 **Remote (Linux):**
-- `xclip` (`sudo apt install xclip`) — the shim wraps it; the real binary must exist as fallback
-- `curl` (for shim HTTP calls)
-- `bash` (shim is a bash script)
-- `~/.local/bin` in `PATH` (must have higher priority than `/usr/bin`)
+- `xclip` (the shim wraps it; the real binary must exist)
+- `curl`, `bash`
+- `~/.local/bin` in `PATH` — auto-configured by `cc-clip connect`
 - SSH access with `RemoteForward` capability
 
 ## Platform Support
 
 | Local | Remote | Status |
 |-------|--------|--------|
-| macOS (arm64/amd64) | Linux (amd64/arm64) | GA |
+| macOS (Apple Silicon) | Linux (amd64) | Stable |
+| macOS (Intel) | Linux (arm64) | Stable |
 
 ## Troubleshooting
 
 ### Quick Diagnostics
 
 ```bash
-# Check everything at once
 cc-clip doctor --host myserver
-
-# Enable debug logging on the shim
-ssh myserver 'CC_CLIP_DEBUG=1 xclip -selection clipboard -t TARGETS -o'
 ```
 
 ### Step-by-Step Verification
 
-If image paste isn't working, run these checks **in order** to isolate the problem:
+If image paste isn't working, run these checks **in order**:
 
 ```bash
 # 1. Local: Is the daemon running?
@@ -133,166 +158,131 @@ curl -s http://127.0.0.1:18339/health
 ssh myserver "curl -s http://127.0.0.1:18339/health"
 # Expected: {"status":"ok"}
 
-# 3. Remote: Is the shim taking priority over real xclip?
+# 3. Remote: Is the shim taking priority?
 ssh myserver "which xclip"
-# Expected: /home/<user>/.local/bin/xclip  (NOT /usr/bin/xclip)
+# Expected: ~/.local/bin/xclip  (NOT /usr/bin/xclip)
 
-# 4. Remote: Does the shim intercept correctly? (copy an image on Mac first)
+# 4. Remote: Does the shim intercept correctly?
 ssh myserver 'CC_CLIP_DEBUG=1 xclip -selection clipboard -t TARGETS -o'
 # Expected: image/png
 ```
 
-### SSH ControlMaster Breaks RemoteForward
+### Common Issues
 
-**Symptom:** `cc-clip connect` reports "tunnel verified", but the tunnel doesn't work in your interactive SSH session. `curl -s http://127.0.0.1:18339/health` hangs on the remote.
+<details>
+<summary><b>SSH ControlMaster breaks RemoteForward</b></summary>
 
-**Cause:** If you use SSH `ControlMaster auto` (connection multiplexing), the first SSH connection becomes the "master". All subsequent connections **reuse the master** — even if you later add `RemoteForward` to your config. The old master connection does not have the port forwarding, so the tunnel silently fails.
+**Symptom:** Tunnel verified during `connect`, but `curl http://127.0.0.1:18339/health` hangs in your SSH session.
 
-`ssh -O exit` to kill the master often doesn't help because the control socket hash (`%C`) may differ between sessions.
+**Cause:** `ControlMaster auto` reuses the first (master) connection which doesn't have `RemoteForward`.
 
-**Fix:** Disable `ControlMaster` for hosts that use `RemoteForward`:
+**Fix:** `cc-clip setup` automatically adds `ControlMaster no` for your host. If you configured SSH manually:
 
 ```
 # ~/.ssh/config
 Host myserver
-    HostName 10.x.x.x
-    User myuser
     RemoteForward 18339 127.0.0.1:18339
     ControlMaster no
     ControlPath none
 ```
+</details>
 
-This ensures every SSH connection creates a fresh tunnel. The trade-off is slightly slower connection setup (no multiplexing), but it guarantees `RemoteForward` works reliably.
+<details>
+<summary><b>Stale sshd process blocks RemoteForward</b></summary>
 
-**Alternatively**, if you want to keep `ControlMaster` for other hosts, ensure it's only disabled for this specific host, while keeping the global `Host *` setting for others.
+**Symptom:** `Warning: remote port forwarding failed for listen port 18339`
 
-### Stale sshd Process Blocks RemoteForward
+**Cause:** A previous SSH session left a stale `sshd` child process holding the port.
 
-**Symptom:** `ssh myserver` shows `Warning: remote port forwarding failed for listen port 18339`. The tunnel never works regardless of how many times you reconnect.
-
-**Cause:** A previous SSH session (from an older `cc-clip connect` or a crashed SSH connection) left a stale `sshd` child process on the remote server that is still holding port 18339. New SSH connections cannot bind `RemoteForward` to a port that's already in use.
-
-This was caused by `cc-clip connect` (before v0.1.1) inheriting `RemoteForward` from `~/.ssh/config`, competing with the user's interactive SSH session for the same port. Fixed in [c306bda](https://github.com/ShunmeiCho/cc-clip/commit/c306bda) with `ClearAllForwardings=yes`.
-
-**Diagnosis (on remote):**
+**Fix:**
 
 ```bash
+# On remote: find and kill the stale process
 sudo ss -tlnp | grep 18339
-# Shows: sshd,pid=XXXXX listening on 18339
-```
-
-**Fix:**
-
-```bash
-# On remote: kill the stale sshd process
 sudo kill <PID>
-
-# Then reconnect from local (forwarding should succeed now)
-ssh myserver
-curl -s http://127.0.0.1:18339/health
-# Expected: {"status":"ok"}
 ```
 
-**Prevention:** Update to the latest cc-clip. The `connect` command now uses `ClearAllForwardings=yes` for its internal SSH session, so it never competes for the RemoteForward port.
+**Prevention:** Update to latest cc-clip — `connect` now uses `ClearAllForwardings=yes`.
+</details>
 
-### Daemon Restart Invalidates Token
+<details>
+<summary><b>Token expired or invalid</b></summary>
 
-**Symptom:** "fetch type failed" or "token invalid" in shim debug logs.
+**Symptom:** Shim debug logs show `"token expired"` or `"401"`. Image paste silently falls back.
 
-**Cause:** Each time `cc-clip serve` starts, it generates a **new token**. The remote server still has the old token from the previous session.
-
-**Fix (recommended):** Use `cc-clip service install` to run the daemon via launchd. The daemon auto-restarts and tokens are persisted with a 12h TTL — restarts reuse the existing token if it hasn't expired.
-
-**Fix (manual):** If the token did change, sync it without re-uploading the binary:
-
-```bash
-cc-clip connect <host> --token-only
-```
-
-To force a new token: `cc-clip serve --rotate-token`.
-
-### Remote `xclip` Not Installed
-
-**Symptom:** Shim debug log shows `/usr/bin/xclip: No such file or directory`.
-
-**Cause:** The shim needs the real `xclip` binary as a fallback for non-image clipboard operations (e.g., text paste).
+**Cause:** Token TTL (30 days) expired due to prolonged inactivity, or daemon restarted and generated a new token.
 
 **Fix:**
 
 ```bash
-sudo apt install xclip    # Debian/Ubuntu
-sudo yum install xclip    # RHEL/CentOS
+cc-clip connect myserver --token-only
 ```
 
-Then re-run `cc-clip connect <host>` to re-detect the real binary path.
+The token uses sliding expiration — it auto-renews on every successful request. You'll only hit this after 30+ days of zero usage.
+</details>
 
-### `~/.local/bin` Not in PATH
+<details>
+<summary><b>Launchd daemon returns "empty" for image clipboard</b></summary>
 
-**Symptom:** `cc-clip connect` shows WARNING: `'which xclip' resolves to /usr/bin/xclip, not ~/.local/bin/xclip`.
+**Symptom:** Daemon running via launchd, but `/clipboard/type` returns `{"type":"empty"}`.
 
-**Cause:** The shim is installed to `~/.local/bin/` but it's not first in PATH, so the system uses `/usr/bin/xclip` instead.
+**Cause:** macOS launchd doesn't source shell profile — `pngpaste` not in PATH.
 
-**Fix:** `cc-clip connect` now auto-detects your remote shell (bash/zsh) and injects a PATH marker into the appropriate rc file. If auto-fix didn't work, add manually to your remote `~/.bashrc` (or `~/.zshrc`):
+**Fix:** Reinstall the service (regenerates plist with correct PATH):
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+cc-clip service uninstall && cc-clip service install
 ```
+</details>
 
-Verify with `which xclip` — it should point to `~/.local/bin/xclip`.
+<details>
+<summary><b>Empty image data (API Error 400)</b></summary>
 
-### Empty Image Data (API Error 400)
+**Symptom:** Claude Code returns `API Error: 400 - image cannot be empty`.
 
-**Symptom:** Claude Code returns `API Error: 400 — image cannot be empty`. The conversation becomes corrupted and all subsequent image pastes fail in the same session.
+**Cause:** Race condition where clipboard changes between TARGETS check and image fetch.
 
-**Cause:** A race condition where the clipboard content changes between the TARGETS check and the image fetch. The daemon returns HTTP 204 (No Content), but `curl -sf` treats 2xx as success and writes 0 bytes. The shim outputs empty data, and Claude Code sends an empty base64 image to the API.
-
-**Fix:** This was fixed in [cc6b0b2](https://github.com/ShunmeiCho/cc-clip/commit/cc6b0b2). The shim now checks that downloaded data is non-empty before returning success. If you hit this error:
-
-1. In Claude Code, run `/clear` or start a new session (the old conversation is corrupted)
-2. Update to the latest cc-clip and re-run `cc-clip connect <host>`
-
-### Launchd Daemon Returns "empty" for Image Clipboard
-
-**Symptom:** `cc-clip service install` is running, but `/clipboard/type` returns `{"type":"empty"}` even when you have an image in your Mac clipboard. Running `cc-clip serve` in the foreground works correctly.
-
-**Cause:** macOS `launchd` does not source your shell profile, so `PATH` doesn't include Homebrew directories (`/opt/homebrew/bin` on Apple Silicon, `/usr/local/bin` on Intel). The daemon can't find `pngpaste`, silently falls through to `pbpaste`, which either hangs or returns empty for image clipboard content.
-
-**Fix:** This was fixed in [6b4b5e2](https://github.com/ShunmeiCho/cc-clip/commit/6b4b5e2). The fix has two layers:
-1. The launchd plist now injects `PATH` including Homebrew directories
-2. The clipboard reader falls back to well-known paths (`/opt/homebrew/bin/pngpaste`, `/usr/local/bin/pngpaste`) when `LookPath` fails
-
-If you're on an older version, reinstall the service to regenerate the plist:
+**Fix:** Update to latest cc-clip, then:
 
 ```bash
-cc-clip service uninstall
-cc-clip service install
+cc-clip connect myserver   # redeploy shim with fix
 ```
 
-### No Image in Clipboard
+In Claude Code, run `/clear` to reset the corrupted conversation.
+</details>
 
-**Symptom:** Shim returns `image/png` for TARGETS but Claude Code says "No image found in clipboard".
+<details>
+<summary><b>~/.local/bin not in PATH</b></summary>
 
-**Cause:** You may not have an image in your Mac clipboard. The shim falls back to real `xclip` which reads the remote server's (empty) clipboard.
+**Symptom:** `which xclip` points to `/usr/bin/xclip` instead of `~/.local/bin/xclip`.
 
-**Fix:** Copy an image on your Mac first:
-- **Screenshot to clipboard:** `Cmd + Shift + Ctrl + 4` (select area) or `Cmd + Shift + Ctrl + 3` (full screen)
-- **Copy from an app:** Right-click an image → Copy Image
+**Fix:** `cc-clip connect` auto-configures PATH. If it didn't work, add manually:
 
-## Known Limitations
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+</details>
 
-The following are known pain points that we plan to improve iteratively:
+<details>
+<summary><b>No image in clipboard</b></summary>
 
-| Issue | Description | Status |
-|-------|-------------|--------|
-| Token re-sync on daemon restart | Every `cc-clip serve` restart generates a new token, requiring a full `cc-clip connect` to re-sync | ✅ Fixed — token persistence with TTL, `--token-only` flag |
-| Full redeploy on every `connect` | `connect` re-compiles and re-uploads the binary even when only the token changed | ✅ Fixed — incremental deploy with hash-based skip |
-| SSH passphrase prompted multiple times | `connect` makes multiple SSH calls internally, each prompting for passphrase | ✅ Fixed — SSH ControlMaster session reuse |
-| Remote PATH not auto-configured | `connect` detects `~/.local/bin` not in PATH but doesn't fix it automatically | ✅ Fixed — auto-detect shell and inject PATH marker |
-| No daemon auto-start | Daemon runs in foreground; `nohup` is a workaround, no launchd/systemd integration yet | ✅ Fixed — `cc-clip service install` for macOS launchd |
+Copy an image on your Mac first:
+- **Screenshot:** `Cmd + Shift + Ctrl + 4` (area) or `Cmd + Shift + Ctrl + 3` (full screen)
+- **From app:** Right-click image → Copy Image
+</details>
 
-Contributions and ideas welcome — see [Issues](https://github.com/ShunmeiCho/cc-clip/issues).
+## Contributing
 
-## Related Issues
+Contributions welcome. Please open an issue first for major changes.
+
+```bash
+git clone https://github.com/ShunmeiCho/cc-clip.git
+cd cc-clip
+make build
+make test
+```
+
+## Related
 
 - [anthropics/claude-code#5277](https://github.com/anthropics/claude-code/issues/5277) — Image paste in SSH sessions
 - [anthropics/claude-code#29204](https://github.com/anthropics/claude-code/issues/29204) — xclip/wl-paste dependency
@@ -300,4 +290,4 @@ Contributions and ideas welcome — see [Issues](https://github.com/ShunmeiCho/c
 
 ## License
 
-MIT
+[MIT](LICENSE)

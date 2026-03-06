@@ -76,9 +76,9 @@ func (m *Manager) LoadOrGenerate(ttl time.Duration) (Session, bool, error) {
 	return s, false, nil
 }
 
-func (m *Manager) Validate(token string) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (m *Manager) Validate(tok string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	if m.session == nil {
 		return ErrTokenInvalid
@@ -86,9 +86,18 @@ func (m *Manager) Validate(token string) error {
 	if time.Now().After(m.session.ExpiresAt) {
 		return ErrTokenExpired
 	}
-	if m.session.Token != strings.TrimSpace(token) {
+	if m.session.Token != strings.TrimSpace(tok) {
 		return ErrTokenInvalid
 	}
+
+	// Sliding expiration: extend if remaining TTL < half of total TTL.
+	remaining := time.Until(m.session.ExpiresAt)
+	if m.ttl > 0 && remaining < m.ttl/2 {
+		m.session.ExpiresAt = time.Now().Add(m.ttl)
+		// Best-effort persist; failure here is non-fatal.
+		_, _ = WriteTokenFile(m.session.Token, m.session.ExpiresAt)
+	}
+
 	return nil
 }
 

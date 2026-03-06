@@ -277,6 +277,64 @@ func TestLoadOrGenerate_OldFormatTreatedAsExpired(t *testing.T) {
 	}
 }
 
+func TestValidateSlidingExpiration(t *testing.T) {
+	tmpDir := filepath.Join(t.TempDir(), "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	ttl := 1 * time.Hour
+
+	m := NewManager(ttl)
+	s, err := m.Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Manually set expiry to just under half TTL remaining (should trigger renewal)
+	m.mu.Lock()
+	m.session.ExpiresAt = time.Now().Add(ttl/2 - 1*time.Minute)
+	m.mu.Unlock()
+
+	expiryBefore := m.Current().ExpiresAt
+
+	if err := m.Validate(s.Token); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+
+	expiryAfter := m.Current().ExpiresAt
+	if !expiryAfter.After(expiryBefore) {
+		t.Fatalf("expected expiry to be extended: before=%v, after=%v", expiryBefore, expiryAfter)
+	}
+
+	// Verify token file was updated
+	_, fileExpiry, err := ReadTokenFileWithExpiry()
+	if err != nil {
+		t.Fatalf("ReadTokenFileWithExpiry failed: %v", err)
+	}
+	if !fileExpiry.Equal(expiryAfter.Truncate(time.Second)) {
+		t.Fatalf("token file expiry mismatch: expected %v, got %v", expiryAfter.Truncate(time.Second), fileExpiry)
+	}
+}
+
+func TestValidateNoSlidingWhenFresh(t *testing.T) {
+	m := NewManager(1 * time.Hour)
+	s, err := m.Generate()
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	expiryBefore := m.Current().ExpiresAt
+
+	if err := m.Validate(s.Token); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+
+	expiryAfter := m.Current().ExpiresAt
+	if !expiryAfter.Equal(expiryBefore) {
+		t.Fatalf("expiry should not change when remaining > ttl/2: before=%v, after=%v", expiryBefore, expiryAfter)
+	}
+}
+
 func TestRotateToken_ForcesNewGeneration(t *testing.T) {
 	tmpDir := filepath.Join(t.TempDir(), "cc-clip")
 	TokenDirOverride = tmpDir

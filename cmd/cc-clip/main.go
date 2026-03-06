@@ -140,7 +140,7 @@ func hasFlag(name string) bool {
 }
 
 func getTokenTTL() time.Duration {
-	ttl := 12 * time.Hour
+	ttl := 30 * 24 * time.Hour
 	if env := os.Getenv("CC_CLIP_TOKEN_TTL"); env != "" {
 		if d, err := time.ParseDuration(env); err == nil {
 			ttl = d
