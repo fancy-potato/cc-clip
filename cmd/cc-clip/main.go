@@ -481,16 +481,16 @@ func connectVerifyTunnel(session *shim.SSHSession, port int, host string) {
 	probeOut, _ := session.Exec(probeCmd)
 
 	if probeOut == "tunnel:ok" {
-		fmt.Println("      tunnel verified")
+		fmt.Println("      tunnel verified (via existing SSH session)")
 	} else {
-		fmt.Println("      WARNING: tunnel not reachable from remote")
+		fmt.Println("      tunnel not detected (this is normal if no interactive SSH session is open)")
+		fmt.Println("      The tunnel is provided by your SSH connection, not by 'cc-clip connect'.")
 		fmt.Println("      Ensure your SSH session includes RemoteForward:")
 		fmt.Printf("        ssh -R %d:127.0.0.1:%d %s\n", port, port, host)
 		fmt.Println()
 		fmt.Println("      Or add to ~/.ssh/config:")
 		fmt.Printf("        Host %s\n", host)
 		fmt.Printf("            RemoteForward %d 127.0.0.1:%d\n", port, port)
-		return
 	}
 
 	// Verify remote binary is functional

@@ -27,9 +27,10 @@ func NewSSHSession(host string) (*SSHSession, error) {
 		"-fN",
 		"-o", "ControlMaster=yes",
 		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
-		"-o", "ControlPersist=60",
+		"-o", "ControlPersist=10",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
+		"-o", "ClearAllForwardings=yes",
 		host,
 	)
 	cmd.Stdin = os.Stdin
@@ -53,9 +54,10 @@ func NewSSHSessionWithControlPath(host, controlPath string) (*SSHSession, error)
 		"-fN",
 		"-o", "ControlMaster=yes",
 		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
-		"-o", "ControlPersist=60",
+		"-o", "ControlPersist=10",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
+		"-o", "ClearAllForwardings=yes",
 		host,
 	)
 	cmd.Stdin = os.Stdin
