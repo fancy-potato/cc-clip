@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.png" alt="cc-clip logo" width="128">
+  <img src="docs/logo.png" alt="cc-clip logo" width="200">
 </p>
 <h1 align="center">cc-clip</h1>
 <p align="center">
