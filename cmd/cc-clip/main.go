@@ -460,6 +460,20 @@ func stopLocalProcess(pidFile string, expectedCmd string) {
 		return
 	}
 
+	if expectedCmd != "" {
+		cmdline, err := localProcessCommand(pid)
+		if err != nil {
+			fmt.Printf("      could not verify command, skipping stop: %v\n", err)
+			os.Remove(pidFile)
+			return
+		}
+		if !strings.Contains(strings.ToLower(cmdline), strings.ToLower(expectedCmd)) {
+			fmt.Printf("      PID %d belongs to %q, not %q; leaving it running\n", pid, cmdline, expectedCmd)
+			os.Remove(pidFile)
+			return
+		}
+	}
+
 	// Send SIGTERM
 	proc.Signal(syscall.SIGTERM)
 	time.Sleep(500 * time.Millisecond)
@@ -471,6 +485,18 @@ func stopLocalProcess(pidFile string, expectedCmd string) {
 
 	os.Remove(pidFile)
 	fmt.Println("      stopped")
+}
+
+func localProcessCommand(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ps failed: %w", err)
+	}
+	cmdline := strings.TrimSpace(string(out))
+	if cmdline == "" {
+		return "", fmt.Errorf("process command line is empty")
+	}
+	return cmdline, nil
 }
 
 type connectOpts struct {
@@ -1098,6 +1124,14 @@ func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded 
 	session.Exec(fmt.Sprintf("mkdir -p %s", codexStateDir))
 	fmt.Println("      Xvfb available")
 
+	// --force: tear down both bridge and Xvfb so they restart fresh.
+	// This handles port changes, display drift, and stale state.
+	if opts.force {
+		fmt.Println("      --force: stopping existing Codex runtime")
+		stopBridgeRemote(session)
+		xvfb.StopRemote(session, codexStateDir)
+	}
+
 	// Step 9: Start or reuse Xvfb
 	fmt.Println("[9/11] Starting Xvfb...")
 	xvfbState, err := xvfb.StartRemote(session, codexStateDir)
@@ -1111,12 +1145,13 @@ func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded 
 	// Step 10: Start or reuse x11-bridge
 	fmt.Println("[10/11] Starting x11-bridge...")
 
-	// If binary was uploaded, unconditionally restart bridge (old binary).
-	if binaryUploaded {
+	// Unconditionally restart bridge if binary was uploaded or --force was used.
+	needsBridgeRestart := binaryUploaded || opts.force
+	if needsBridgeRestart {
 		stopBridgeRemote(session)
 	}
 
-	if !binaryUploaded && isBridgeHealthy(session) {
+	if !needsBridgeRestart && isBridgeHealthy(session) {
 		fmt.Println("      x11-bridge already running, reusing")
 	} else {
 		// Stop any existing bridge first.
