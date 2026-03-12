@@ -74,6 +74,12 @@ main() {
     cp "${TMP_DIR}/cc-clip" "${INSTALL_DIR}/cc-clip"
     chmod +x "${INSTALL_DIR}/cc-clip"
 
+    # Remove macOS quarantine attribute to prevent Gatekeeper from killing the binary.
+    # Downloaded files get com.apple.quarantine which causes "zsh: killed" on unsigned binaries.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        xattr -d com.apple.quarantine "${INSTALL_DIR}/cc-clip" 2>/dev/null || true
+    fi
+
     echo ""
     echo "cc-clip ${VERSION} installed to ${INSTALL_DIR}/cc-clip"
 
