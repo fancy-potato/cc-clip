@@ -58,7 +58,7 @@ func main() {
 		cmdService()
 	case "x11-bridge":
 		cmdX11Bridge()
-	case "version":
+	case "version", "--version", "-v":
 		fmt.Printf("cc-clip %s\n", version)
 	case "help", "--help", "-h":
 		printUsage()
