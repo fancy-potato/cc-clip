@@ -321,6 +321,10 @@ func hotkeyPIDPath() string {
 }
 
 func hotkeyLogPath() string {
+	return hotkeyLogPathFunc()
+}
+
+var hotkeyLogPathFunc = func() string {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()

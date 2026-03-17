@@ -14,6 +14,24 @@ import (
 const hotkeyRegistryKey = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 const hotkeyRegistryValue = "cc-clip-hotkey"
 
+var hotkeyConfigPathOverride string
+var hotkeyAutostartVBSPathOverride string
+var hotkeyExecutablePath = os.Executable
+var hotkeyEvalSymlinks = filepath.EvalSymlinks
+var hotkeyRegAdd = func(key, name, value string) error {
+	return hotkeyRegistryAdd(key, name, value)
+}
+var hotkeyRegDelete = func(key, name string) error {
+	out, err := hotkeyRegistryQuery(key, name)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return nil
+	}
+	return hotkeyRegistryDelete(key, name)
+}
+var hotkeyRegQuery = func(key, name string) (string, error) {
+	return hotkeyRegistryQuery(key, name)
+}
+
 type hotkeyConfig struct {
 	Host      string `json:"host"`
 	RemoteDir string `json:"remote_dir"`
@@ -71,6 +89,9 @@ func normalizeHotkeyConfig(cfg *hotkeyConfig) {
 }
 
 func hotkeyConfigPath() string {
+	if hotkeyConfigPathOverride != "" {
+		return hotkeyConfigPathOverride
+	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		cacheDir, cacheErr := os.UserCacheDir()
@@ -84,6 +105,9 @@ func hotkeyConfigPath() string {
 }
 
 func hotkeyAutostartVBSPath() string {
+	if hotkeyAutostartVBSPathOverride != "" {
+		return hotkeyAutostartVBSPathOverride
+	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
@@ -93,16 +117,16 @@ func hotkeyAutostartVBSPath() string {
 }
 
 func hotkeyAutostartEnabled() bool {
-	cmd := exec.Command("reg.exe", "query", hotkeyRegistryKey, "/v", hotkeyRegistryValue)
-	return cmd.Run() == nil
+	_, err := hotkeyRegQuery(hotkeyRegistryKey, hotkeyRegistryValue)
+	return err == nil
 }
 
 func installHotkeyAutostart() error {
-	exe, err := os.Executable()
+	exe, err := hotkeyExecutablePath()
 	if err != nil {
 		return fmt.Errorf("cannot determine executable path: %w", err)
 	}
-	exe, err = filepath.EvalSymlinks(exe)
+	exe, err = hotkeyEvalSymlinks(exe)
 	if err != nil {
 		return fmt.Errorf("cannot resolve executable path: %w", err)
 	}
@@ -124,23 +148,42 @@ WshShell.Run "cmd.exe /c """"%s"" hotkey --run-loop >> ""%s"" 2>&1""", 0, False
 	}
 
 	regValue := fmt.Sprintf(`wscript.exe "%s"`, vbsPath)
-	cmd := exec.Command("reg.exe", "add", hotkeyRegistryKey, "/v", hotkeyRegistryValue, "/t", "REG_SZ", "/d", regValue, "/f")
+	if err := hotkeyRegAdd(hotkeyRegistryKey, hotkeyRegistryValue, regValue); err != nil {
+		_ = os.Remove(vbsPath)
+		return err
+	}
+	return nil
+}
+
+func uninstallHotkeyAutostart() error {
+	if err := hotkeyRegDelete(hotkeyRegistryKey, hotkeyRegistryValue); err != nil {
+		return err
+	}
+	_ = os.Remove(hotkeyAutostartVBSPath())
+	return nil
+}
+
+func hotkeyRegistryAdd(key, name, value string) error {
+	cmd := exec.Command("reg.exe", "add", key, "/v", name, "/t", "REG_SZ", "/d", value, "/f")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("reg add failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
 
-func uninstallHotkeyAutostart() error {
-	cmd := exec.Command("reg.exe", "delete", hotkeyRegistryKey, "/v", hotkeyRegistryValue, "/f")
+func hotkeyRegistryDelete(key, name string) error {
+	cmd := exec.Command("reg.exe", "delete", key, "/v", name, "/f")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		trimmed := strings.TrimSpace(string(out))
-		if strings.Contains(strings.ToLower(trimmed), "unable to find") {
-			_ = os.Remove(hotkeyAutostartVBSPath())
-			return nil
-		}
-		return fmt.Errorf("reg delete failed: %s: %w", trimmed, err)
+		return fmt.Errorf("reg delete failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-	_ = os.Remove(hotkeyAutostartVBSPath())
 	return nil
+}
+
+func hotkeyRegistryQuery(key, name string) (string, error) {
+	cmd := exec.Command("reg.exe", "query", key, "/v", name)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("reg query failed: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
