@@ -33,10 +33,11 @@ var hotkeyRegQuery = func(key, name string) (string, error) {
 }
 
 type hotkeyConfig struct {
-	Host      string `json:"host"`
-	RemoteDir string `json:"remote_dir"`
-	DelayMS   int    `json:"delay_ms"`
-	Hotkey    string `json:"hotkey"`
+	Host          string `json:"host"`
+	RemoteDir     string `json:"remote_dir"`
+	DelayMS       int    `json:"delay_ms"`
+	Hotkey        string `json:"hotkey"`
+	Notifications *bool  `json:"notifications,omitempty"`
 }
 
 func loadHotkeyConfig() (hotkeyConfig, bool, error) {
@@ -95,6 +96,14 @@ func normalizeHotkeyConfig(cfg *hotkeyConfig) {
 	if strings.TrimSpace(cfg.Hotkey) == "" {
 		cfg.Hotkey = defaultHotkeyString
 	}
+	if cfg.Notifications == nil {
+		v := true
+		cfg.Notifications = &v
+	}
+}
+
+func (cfg *hotkeyConfig) notificationsEnabled() bool {
+	return cfg.Notifications == nil || *cfg.Notifications
 }
 
 func hotkeyConfigPath() string {

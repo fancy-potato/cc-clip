@@ -53,9 +53,10 @@ const (
 	menuIDHotkey     = 101
 	menuIDHost       = 102
 	menuIDDaemon     = 103
-	menuIDOpenLog    = 200
-	menuIDOpenConfig = 201
-	menuIDQuit       = 300
+	menuIDOpenLog       = 200
+	menuIDOpenConfig    = 201
+	menuIDToggleNotify  = 202
+	menuIDQuit          = 300
 )
 
 type trayStatus int
@@ -249,7 +250,7 @@ func (t *trayState) setStatus(s trayStatus) {
 }
 
 func (t *trayState) showBalloon(title, msg string, _ uint32) {
-	if t.toastVBS == "" {
+	if t.toastVBS == "" || !t.cfg.notificationsEnabled() {
 		return
 	}
 	// wscript.exe is a GUI subsystem process — no console window flash.
@@ -278,7 +279,7 @@ func (t *trayState) writeToastScripts() error {
 $x = New-Object Windows.Data.Xml.Dom.XmlDocument
 $et = [System.Security.SecurityElement]::Escape($Title)
 $em = [System.Security.SecurityElement]::Escape($Message)
-$x.LoadXml("<toast><visual><binding template=""ToastText02""><text id=""1"">$et</text><text id=""2"">$em</text></binding></visual></toast>")
+$x.LoadXml("<toast duration=""short""><visual><binding template=""ToastText02""><text id=""1"">$et</text><text id=""2"">$em</text></binding></visual><audio silent=""true""/></toast>")
 $t = New-Object Windows.UI.Notifications.ToastNotification $x
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("cc-clip").Show($t)
 `
@@ -339,6 +340,11 @@ func (t *trayState) showContextMenu() {
 	appendMenuItem(hMenu, mfSeparator, 0, "")
 	appendMenuItem(hMenu, mfString, menuIDOpenLog, "Open Log")
 	appendMenuItem(hMenu, mfString, menuIDOpenConfig, "Open Config Folder")
+	if t.cfg.notificationsEnabled() {
+		appendMenuItem(hMenu, mfString, menuIDToggleNotify, "Mute Notifications")
+	} else {
+		appendMenuItem(hMenu, mfString, menuIDToggleNotify, "Enable Notifications")
+	}
 	appendMenuItem(hMenu, mfSeparator, 0, "")
 	appendMenuItem(hMenu, mfString, menuIDQuit, "Quit")
 
@@ -358,6 +364,15 @@ func (t *trayState) handleMenuCommand(id uint16) {
 	case menuIDOpenConfig:
 		configPath := hotkeyConfigPath()
 		exec.Command("explorer.exe", filepath.Dir(configPath)).Start()
+	case menuIDToggleNotify:
+		enabled := t.cfg.notificationsEnabled()
+		v := !enabled
+		t.cfg.Notifications = &v
+		if err := saveHotkeyConfig(t.cfg); err != nil {
+			log.Printf("tray: failed to save notification setting: %v", err)
+		} else if v {
+			t.showBalloon("cc-clip", "Notifications enabled", niifInfo)
+		}
 	case menuIDQuit:
 		t.quit()
 	}
