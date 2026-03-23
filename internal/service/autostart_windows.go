@@ -131,9 +131,11 @@ func Status() (bool, error) {
 		return false, fmt.Errorf("not installed")
 	}
 	// Registry entry exists — check if process is actually running
-	// by looking for cc-clip serve in the process list
-	cmd := exec.Command("wmic", "process", "where",
-		"name='cc-clip.exe'", "get", "CommandLine", "/format:list")
+	// by looking for cc-clip serve in the process list.
+	// Use PowerShell Get-CimInstance instead of wmic, which is deprecated
+	// and removed by default on Windows 11 24H2+.
+	psCmd := `(Get-CimInstance Win32_Process -Filter "name='cc-clip.exe'").CommandLine`
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return false, nil // Registry entry exists but daemon not running

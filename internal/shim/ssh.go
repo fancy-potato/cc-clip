@@ -91,6 +91,10 @@ func (s *SSHSession) Exec(cmd string) (string, error) {
 	args := []string{}
 	if s.controlPath != "" {
 		args = append(args, "-o", fmt.Sprintf("ControlPath=%s", s.controlPath))
+	} else {
+		// Without ControlMaster (Windows), prevent user's RemoteForward from
+		// triggering on every independent SSH invocation.
+		args = append(args, "-o", "ClearAllForwardings=yes")
 	}
 	args = append(args, s.host, cmd)
 	c := exec.Command("ssh", args...)
@@ -103,6 +107,8 @@ func (s *SSHSession) Upload(localPath, remotePath string) error {
 	scpArgs := []string{}
 	if s.controlPath != "" {
 		scpArgs = append(scpArgs, "-o", fmt.Sprintf("ControlPath=%s", s.controlPath))
+	} else {
+		scpArgs = append(scpArgs, "-o", "ClearAllForwardings=yes")
 	}
 	scpArgs = append(scpArgs, localPath, fmt.Sprintf("%s:%s", s.host, remotePath))
 	cmd := exec.Command("scp", scpArgs...)
@@ -114,6 +120,8 @@ func (s *SSHSession) Upload(localPath, remotePath string) error {
 	chmodArgs := []string{}
 	if s.controlPath != "" {
 		chmodArgs = append(chmodArgs, "-o", fmt.Sprintf("ControlPath=%s", s.controlPath))
+	} else {
+		chmodArgs = append(chmodArgs, "-o", "ClearAllForwardings=yes")
 	}
 	chmodArgs = append(chmodArgs, s.host, fmt.Sprintf("chmod +x %s", remotePath))
 	chmodCmd := exec.Command("ssh", chmodArgs...)
@@ -197,6 +205,8 @@ func WriteRemoteTokenViaSession(session *SSHSession, tok string) error {
 	args := []string{}
 	if session.controlPath != "" {
 		args = append(args, "-o", fmt.Sprintf("ControlPath=%s", session.controlPath))
+	} else {
+		args = append(args, "-o", "ClearAllForwardings=yes")
 	}
 	args = append(args, session.host,
 		"mkdir -p ~/.cache/cc-clip && cat > ~/.cache/cc-clip/session.token && chmod 600 ~/.cache/cc-clip/session.token")

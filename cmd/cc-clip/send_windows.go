@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 	"time"
 )
 
 // hiddenExec creates an exec.Cmd that won't flash a console window.
 func hiddenExec(name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	hideConsoleWindow(cmd)
 	return cmd
 }
 

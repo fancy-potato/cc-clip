@@ -343,6 +343,9 @@ func stopHotkeyProcess() {
 		os.Remove(hotkeyPIDPath())
 		return
 	}
+	// Write stop sentinel before killing so the VBS autostart loop exits
+	// instead of respawning the process.
+	writeHotkeyStopFile()
 	_ = proc.Kill()
 	os.Remove(hotkeyPIDPath())
 	fmt.Printf("hotkey: stopped PID %d\n", pid)

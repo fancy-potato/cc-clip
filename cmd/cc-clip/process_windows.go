@@ -47,33 +47,26 @@ func stopLocalProcess(pidFile string, expectedCmd string) {
 		}
 	}
 
-	// On Windows, use taskkill for graceful termination
+	// On Windows, use taskkill for graceful termination, then force kill if needed.
 	exec.Command("taskkill", "/PID", strconv.Itoa(pid)).Run()
 	time.Sleep(500 * time.Millisecond)
-
-	// Force kill if still alive
-	if proc.Signal(os.Kill) == nil {
-		proc.Kill()
-	}
+	_ = proc.Kill() // Force kill if still alive (no-op if already exited)
 
 	os.Remove(pidFile)
 	fmt.Println("      stopped")
 }
 
 func localProcessCommand(pid int) (string, error) {
-	out, err := exec.Command("wmic", "process", "where",
-		fmt.Sprintf("ProcessId=%d", pid), "get", "CommandLine", "/format:list").CombinedOutput()
+	// Use PowerShell Get-CimInstance instead of wmic, which is deprecated
+	// and removed by default on Windows 11 24H2+.
+	psCmd := fmt.Sprintf(`(Get-CimInstance Win32_Process -Filter "ProcessId=%d").CommandLine`, pid)
+	out, err := exec.Command("powershell", "-NoProfile", "-Command", psCmd).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("wmic failed: %w", err)
+		return "", fmt.Errorf("Get-CimInstance failed: %w", err)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "CommandLine=") {
-			cmdline := strings.TrimPrefix(line, "CommandLine=")
-			if cmdline != "" {
-				return cmdline, nil
-			}
-		}
+	cmdline := strings.TrimSpace(string(out))
+	if cmdline == "" {
+		return "", fmt.Errorf("process command line not found")
 	}
-	return "", fmt.Errorf("process command line not found")
+	return cmdline, nil
 }
