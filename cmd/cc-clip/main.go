@@ -18,6 +18,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/doctor"
 	"github.com/shunmei/cc-clip/internal/exitcode"
 	"github.com/shunmei/cc-clip/internal/service"
+	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
@@ -192,39 +193,46 @@ func cmdServe() {
 
 	tm := token.NewManager(ttl)
 
-	var session token.Session
+	var sess token.Session
 	var reused bool
 	var err error
 
 	if rotateToken {
-		session, err = tm.Generate()
+		sess, err = tm.Generate()
 		if err != nil {
 			log.Fatalf("failed to generate token: %v", err)
 		}
 		log.Printf("Token rotated (--rotate-token): new token generated")
 	} else {
-		session, reused, err = tm.LoadOrGenerate(ttl)
+		sess, reused, err = tm.LoadOrGenerate(ttl)
 		if err != nil {
 			log.Fatalf("failed to load or generate token: %v", err)
 		}
 		if reused {
-			log.Printf("Token reused from existing file (expires %s)", session.ExpiresAt.Format(time.RFC3339))
+			log.Printf("Token reused from existing file (expires %s)", sess.ExpiresAt.Format(time.RFC3339))
 		} else {
 			log.Printf("Token generated (no valid existing token found)")
 		}
 	}
 
-	tokenPath, err := token.WriteTokenFile(session.Token, session.ExpiresAt)
+	tokenPath, err := token.WriteTokenFile(sess.Token, sess.ExpiresAt)
 	if err != nil {
 		log.Fatalf("failed to write token file: %v", err)
 	}
 
 	clipboard := daemon.NewClipboardReader()
-	srv := daemon.NewServer(addr, clipboard, tm)
+	store := session.NewStore(12 * time.Hour)
+	srv := daemon.NewServer(addr, clipboard, tm, store)
 
 	log.Printf("Token written to: %s", tokenPath)
-	log.Printf("Token expires at: %s", session.ExpiresAt.Format(time.RFC3339))
+	log.Printf("Token expires at: %s", sess.ExpiresAt.Format(time.RFC3339))
 	log.Printf("Starting daemon on %s", addr)
+
+	// Start notification delivery and session cleanup in background
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.RunNotifier(ctx, daemon.NewDarwinNotifier())
+	go store.RunCleanup(ctx, 30*time.Minute)
 
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
@@ -505,11 +513,17 @@ func runConnect(opts connectOpts) {
 		fmt.Println("[4/7] Skipping binary upload (--token-only)")
 		fmt.Println("[5/7] Skipping shim install (--token-only)")
 
-		fmt.Printf("[6/7] Syncing token...\n")
+		fmt.Printf("[6/7] Syncing token and session...\n")
 		if err := shim.WriteRemoteTokenViaSession(session, daemonToken); err != nil {
 			log.Fatalf("      failed to write token: %v", err)
 		}
 		fmt.Println("      token synced from local daemon")
+
+		if sid, genErr := shim.GenerateSessionID(); genErr == nil {
+			if writeErr := shim.WriteRemoteSessionID(session, sid); writeErr == nil {
+				fmt.Printf("      session ID: %s\n", sid[:16])
+			}
+		}
 
 		connectVerifyTunnel(session, port, host)
 		return
@@ -614,12 +628,23 @@ func runConnect(opts connectOpts) {
 		pathFixed = true
 	}
 
-	// Step 6: Always sync token
-	fmt.Printf("[6/7] Syncing token...\n")
+	// Step 6: Sync token and session ID
+	fmt.Printf("[6/7] Syncing token and session...\n")
 	if err := shim.WriteRemoteTokenViaSession(session, daemonToken); err != nil {
 		log.Fatalf("      failed to write token: %v", err)
 	}
 	fmt.Println("      token synced from local daemon")
+
+	sessionID, err := shim.GenerateSessionID()
+	if err != nil {
+		log.Printf("      warning: failed to generate session ID: %v", err)
+	} else {
+		if err := shim.WriteRemoteSessionID(session, sessionID); err != nil {
+			log.Printf("      warning: failed to write session ID: %v", err)
+		} else {
+			fmt.Printf("      session ID: %s\n", sessionID[:16])
+		}
+	}
 
 	// Update remote deploy state
 	localHash, _ := shim.LocalBinaryHash(localBin)

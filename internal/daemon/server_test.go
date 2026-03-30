@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/token"
 )
 
@@ -29,7 +30,8 @@ func (m *mockClipboard) ImageBytes() ([]byte, error) {
 func newTestServer(clip ClipboardReader) (*Server, string) {
 	tm := token.NewManager(1 * time.Hour)
 	s, _ := tm.Generate()
-	srv := NewServer("127.0.0.1:0", clip, tm)
+	store := session.NewStore(12 * time.Hour)
+	srv := NewServer("127.0.0.1:0", clip, tm, store)
 	return srv, s.Token
 }
 

@@ -128,6 +128,9 @@ func TestXclipShimContent(t *testing.T) {
 		"TARGETS",
 		"image/",
 		"_cc_clip_fallback",
+		"CC_CLIP_SESSION_FILE",
+		"X-CC-Clip-Session",
+		"_cc_clip_session_header",
 	}
 	for _, check := range checks {
 		if !strings.Contains(content, check) {

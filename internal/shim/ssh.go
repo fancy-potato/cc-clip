@@ -1,6 +1,8 @@
 package shim
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -198,6 +200,27 @@ func WriteRemoteTokenViaSession(session *SSHSession, tok string) error {
 	cmd.Stdin = strings.NewReader(tok + "\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to write remote token: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// GenerateSessionID creates a random session identifier for transfer tracking.
+func GenerateSessionID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate session ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// WriteRemoteSessionID writes a session ID to ~/.cache/cc-clip/session.id on the remote.
+func WriteRemoteSessionID(session *SSHSession, sessionID string) error {
+	args := append(session.connArgs(), session.host,
+		"mkdir -p ~/.cache/cc-clip && cat > ~/.cache/cc-clip/session.id && chmod 600 ~/.cache/cc-clip/session.id")
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = strings.NewReader(sessionID + "\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to write remote session ID: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }

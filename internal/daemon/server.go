@@ -1,13 +1,21 @@
 package daemon
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"bytes"
 	"log"
 	"net"
 	"net/http"
 	"strings"
 
+	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/token"
 )
 
@@ -16,17 +24,23 @@ const (
 	userAgent    = "cc-clip"
 )
 
+const notifyChCap = 8
+
 type Server struct {
 	clipboard ClipboardReader
 	tokens    *token.Manager
+	sessions  *session.Store
+	notifyCh  chan NotifyEvent
 	addr      string
 	mux       *http.ServeMux
 }
 
-func NewServer(addr string, clipboard ClipboardReader, tokens *token.Manager) *Server {
+func NewServer(addr string, clipboard ClipboardReader, tokens *token.Manager, sessions *session.Store) *Server {
 	s := &Server{
 		clipboard: clipboard,
 		tokens:    tokens,
+		sessions:  sessions,
+		notifyCh:  make(chan NotifyEvent, notifyChCap),
 		addr:      addr,
 		mux:       http.NewServeMux(),
 	}
@@ -34,6 +48,29 @@ func NewServer(addr string, clipboard ClipboardReader, tokens *token.Manager) *S
 	s.mux.HandleFunc("GET /clipboard/type", s.authMiddleware(s.handleClipboardType))
 	s.mux.HandleFunc("GET /clipboard/image", s.authMiddleware(s.handleClipboardImage))
 	return s
+}
+
+// RunNotifier consumes transfer events and delivers notifications.
+// It blocks until ctx is cancelled. Panics in Notify are recovered
+// to prevent notification failures from crashing the daemon.
+func (s *Server) RunNotifier(ctx context.Context, n Notifier) {
+	for {
+		select {
+		case evt := <-s.notifyCh:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("notification panic recovered: %v", r)
+					}
+				}()
+				if err := n.Notify(ctx, evt); err != nil {
+					log.Printf("notification failed: %v", err)
+				}
+			}()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (s *Server) ListenAndServe() error {
@@ -126,5 +163,47 @@ func (s *Server) handleClipboardImage(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-	w.Write(data)
+	_, writeErr := w.Write(data)
+
+	// Only notify if the image was successfully written to the client.
+	// If the client disconnected mid-transfer, skip notification to avoid
+	// false-positive "image transferred" confirmations.
+	if writeErr != nil {
+		return
+	}
+
+	sessionID := r.Header.Get("X-CC-Clip-Session")
+	if sessionID != "" && s.sessions != nil {
+		hash := sha256.Sum256(data)
+		fingerprint := hex.EncodeToString(hash[:8])
+
+		width, height := decodeImageDimensions(data)
+
+		evt := s.sessions.AnalyzeAndRecord(sessionID, fingerprint, width, height, info.Format)
+		notify := NotifyEvent{
+			SessionID:   evt.SessionID,
+			Seq:         evt.Seq,
+			Fingerprint: evt.Fingerprint,
+			ImageData:   data,
+			Format:      info.Format,
+			Width:       width,
+			Height:      height,
+			DuplicateOf: evt.DuplicateOf,
+		}
+		select {
+		case s.notifyCh <- notify:
+		default:
+			// channel full: drop notification
+		}
+	}
+}
+
+// decodeImageDimensions reads width and height from image data.
+// Returns 0, 0 if decoding fails.
+func decodeImageDimensions(data []byte) (int, int) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0
+	}
+	return cfg.Width, cfg.Height
 }
