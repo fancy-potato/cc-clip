@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -327,6 +328,17 @@ func (b *Bridge) readToken() (string, error) {
 	return tok, nil
 }
 
+// readSessionID reads the session ID from the session.id file next to the token file.
+// Returns empty string (not error) if file doesn't exist, since session tracking is optional.
+func (b *Bridge) readSessionID() string {
+	dir := filepath.Dir(b.tokenFile)
+	data, err := os.ReadFile(filepath.Join(dir, "session.id"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // fetchClipboardType queries the cc-clip daemon for clipboard content type.
 func (b *Bridge) fetchClipboardType() (*clipboardTypeResponse, error) {
 	tok, err := b.readToken()
@@ -341,6 +353,9 @@ func (b *Bridge) fetchClipboardType() (*clipboardTypeResponse, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("User-Agent", "cc-clip/0.1")
+	if sid := b.readSessionID(); sid != "" {
+		req.Header.Set("X-CC-Clip-Session", sid)
+	}
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
@@ -377,6 +392,9 @@ func (b *Bridge) fetchClipboardImage() ([]byte, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("User-Agent", "cc-clip/0.1")
+	if sid := b.readSessionID(); sid != "" {
+		req.Header.Set("X-CC-Clip-Session", sid)
+	}
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {

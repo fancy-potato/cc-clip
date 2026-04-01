@@ -12,6 +12,7 @@ set -euo pipefail
 CC_CLIP_PORT="${CC_CLIP_PORT:-%d}"
 CC_CLIP_ADDR="127.0.0.1:${CC_CLIP_PORT}"
 CC_CLIP_TOKEN_FILE="${CC_CLIP_TOKEN_FILE:-${HOME}/.cache/cc-clip/session.token}"
+CC_CLIP_SESSION_FILE="${CC_CLIP_SESSION_FILE:-${HOME}/.cache/cc-clip/session.id}"
 CC_CLIP_PROBE_TIMEOUT_MS="${CC_CLIP_PROBE_TIMEOUT_MS:-500}"
 CC_CLIP_FETCH_TIMEOUT_MS="${CC_CLIP_FETCH_TIMEOUT_MS:-5000}"
 CC_CLIP_TOTAL_TIMEOUT_MS="${CC_CLIP_TOTAL_TIMEOUT_MS:-8000}"
@@ -35,6 +36,12 @@ _cc_clip_read_token() {
     cat "$CC_CLIP_TOKEN_FILE"
 }
 
+_cc_clip_session_header() {
+    if [ -f "$CC_CLIP_SESSION_FILE" ]; then
+        echo "X-CC-Clip-Session: $(cat "$CC_CLIP_SESSION_FILE" 2>/dev/null)"
+    fi
+}
+
 _cc_clip_probe() {
     local timeout_s
     timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_PROBE_TIMEOUT_MS}/1000}")
@@ -54,9 +61,12 @@ _cc_clip_fetch_json() {
     token=$(_cc_clip_read_token) || return 12
     local timeout_s
     timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    local session_hdr
+    session_hdr=$(_cc_clip_session_header)
     curl -sf --max-time "$timeout_s" \
         -H "Authorization: Bearer ${token}" \
         -H "User-Agent: cc-clip/0.1" \
+        ${session_hdr:+-H "$session_hdr"} \
         "http://${CC_CLIP_ADDR}${path}"
 }
 
@@ -67,12 +77,15 @@ _cc_clip_fetch_binary() {
     token=$(_cc_clip_read_token) || return 12
     local timeout_s
     timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    local session_hdr
+    session_hdr=$(_cc_clip_session_header)
     local tmpfile
     tmpfile=$(mktemp 2>/dev/null) || return 20
     if curl -sf --max-time "$timeout_s" \
         -o "$tmpfile" \
         -H "Authorization: Bearer ${token}" \
         -H "User-Agent: cc-clip/0.1" \
+        ${session_hdr:+-H "$session_hdr"} \
         "http://${CC_CLIP_ADDR}${path}"; then
         # Guard against empty response (e.g. HTTP 204 No Content)
         if [ ! -s "$tmpfile" ]; then
@@ -151,6 +164,7 @@ set -euo pipefail
 CC_CLIP_PORT="${CC_CLIP_PORT:-%d}"
 CC_CLIP_ADDR="127.0.0.1:${CC_CLIP_PORT}"
 CC_CLIP_TOKEN_FILE="${CC_CLIP_TOKEN_FILE:-${HOME}/.cache/cc-clip/session.token}"
+CC_CLIP_SESSION_FILE="${CC_CLIP_SESSION_FILE:-${HOME}/.cache/cc-clip/session.id}"
 CC_CLIP_PROBE_TIMEOUT_MS="${CC_CLIP_PROBE_TIMEOUT_MS:-500}"
 CC_CLIP_FETCH_TIMEOUT_MS="${CC_CLIP_FETCH_TIMEOUT_MS:-5000}"
 REAL_WL_PASTE="%s"
@@ -173,6 +187,12 @@ _cc_clip_read_token() {
     cat "$CC_CLIP_TOKEN_FILE"
 }
 
+_cc_clip_session_header() {
+    if [ -f "$CC_CLIP_SESSION_FILE" ]; then
+        echo "X-CC-Clip-Session: $(cat "$CC_CLIP_SESSION_FILE" 2>/dev/null)"
+    fi
+}
+
 _cc_clip_probe() {
     if command -v nc >/dev/null 2>&1; then
         nc -z -w 1 "${CC_CLIP_ADDR%%%%:*}" "${CC_CLIP_ADDR##*:}" 2>/dev/null
@@ -187,9 +207,12 @@ _cc_clip_fetch_json() {
     token=$(cat "$CC_CLIP_TOKEN_FILE" 2>/dev/null) || return 12
     local timeout_s
     timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    local session_hdr
+    session_hdr=$(_cc_clip_session_header)
     curl -sf --max-time "$timeout_s" \
         -H "Authorization: Bearer ${token}" \
         -H "User-Agent: cc-clip/0.1" \
+        ${session_hdr:+-H "$session_hdr"} \
         "http://${CC_CLIP_ADDR}${path}"
 }
 
@@ -199,12 +222,15 @@ _cc_clip_fetch_binary() {
     token=$(cat "$CC_CLIP_TOKEN_FILE" 2>/dev/null) || return 12
     local timeout_s
     timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    local session_hdr
+    session_hdr=$(_cc_clip_session_header)
     local tmpfile
     tmpfile=$(mktemp 2>/dev/null) || return 20
     if curl -sf --max-time "$timeout_s" \
         -o "$tmpfile" \
         -H "Authorization: Bearer ${token}" \
         -H "User-Agent: cc-clip/0.1" \
+        ${session_hdr:+-H "$session_hdr"} \
         "http://${CC_CLIP_ADDR}${path}"; then
         # Guard against empty response (e.g. HTTP 204 No Content)
         if [ ! -s "$tmpfile" ]; then
