@@ -753,14 +753,20 @@ func connectNotifySetup(session *shim.SSHSession, port int, daemonToken string, 
 
 	hookInstalled := true
 
-	// Step N4: Print Claude Code hook config
-	fmt.Println("  [N4] Claude Code hook configuration:")
-	fmt.Println("      Add the following to your Claude Code settings (hooks):")
-	fmt.Println()
-	for _, line := range strings.Split(claudeHookConfigJSON(), "\n") {
-		fmt.Printf("      %s\n", line)
+	// Step N4: Install claude wrapper (auto-injects hooks via --settings)
+	fmt.Println("  [N4] Installing claude wrapper...")
+	if err := shim.InstallRemoteClaudeWrapper(session, port); err != nil {
+		log.Printf("      warning: failed to install claude wrapper: %v", err)
+		fmt.Println("      Falling back to manual hook config:")
+		fmt.Println()
+		for _, line := range strings.Split(claudeHookConfigJSON(), "\n") {
+			fmt.Printf("      %s\n", line)
+		}
+		fmt.Println()
+	} else {
+		fmt.Println("      claude wrapper installed to ~/.local/bin/claude")
+		fmt.Println("      Hooks will be auto-injected when tunnel is alive")
 	}
-	fmt.Println()
 
 	// Step N5: Detect and configure Codex notify
 	codexInjected := false

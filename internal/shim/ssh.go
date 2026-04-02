@@ -252,6 +252,22 @@ func InstallRemoteHookScript(session *SSHSession, port int) error {
 	return nil
 }
 
+// InstallRemoteClaudeWrapper installs the claude wrapper script to
+// ~/.local/bin/claude on the remote. The wrapper auto-injects notification
+// hooks via --settings when the cc-clip tunnel is alive, and transparently
+// passes through to the real claude binary when the tunnel is down.
+func InstallRemoteClaudeWrapper(session *SSHSession, port int) error {
+	script := ClaudeWrapperScript(port)
+	args := append(session.connArgs(), session.host,
+		"mkdir -p ~/.local/bin && cat > ~/.local/bin/claude && chmod +x ~/.local/bin/claude")
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to install remote claude wrapper: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // RemoteHasCodex checks whether ~/.codex directory exists on the remote.
 func RemoteHasCodex(session *SSHSession) bool {
 	_, err := session.Exec("test -d ~/.codex")
