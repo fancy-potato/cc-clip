@@ -91,7 +91,7 @@ If you are on Windows and want the SSH/Claude Code workflow, use the dedicated g
 macOS / Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShunmeiCho/cc-clip/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh
 ```
 
 Windows:
@@ -514,7 +514,7 @@ xattr -d com.apple.quarantine ~/.local/bin/cc-clip
 Or reinstall (the latest install script handles this automatically):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShunmeiCho/cc-clip/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh
 ```
 
 </details>
@@ -696,7 +696,7 @@ Token uses sliding expiration — auto-renews on every use. Only expires after 3
 
 ```bash
 cc-clip service uninstall
-curl -fsSL https://raw.githubusercontent.com/ShunmeiCho/cc-clip/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh
 cc-clip setup myserver
 ```
 

@@ -29,7 +29,7 @@ Show
 
 Sleep 500ms
 
-Type "curl -fsSL https://raw.githubusercontent.com/ShunmeiCho/cc-clip/main/scripts/install.sh | sh"
+Type "curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh"
 Sleep 200ms
 Enter
 Sleep 1.2s

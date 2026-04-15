@@ -2,9 +2,9 @@
 set -e
 
 # cc-clip installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/ShunmeiCho/cc-clip/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh
 
-REPO="ShunmeiCho/cc-clip"
+REPO="fancy-potato/cc-clip"
 INSTALL_DIR="${CC_CLIP_INSTALL_DIR:-$HOME/.local/bin}"
 
 detect_platform() {
