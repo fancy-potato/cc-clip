@@ -8,6 +8,9 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
+
+	"github.com/shunmei/cc-clip/internal/shellutil"
 )
 
 // SSHSession manages a persistent SSH ControlMaster connection for reuse
@@ -15,6 +18,14 @@ import (
 type SSHSession struct {
 	host        string
 	controlPath string
+}
+
+func baseConnArgs() []string {
+	return []string{
+		"-o", "RemoteCommand=none",
+		"-o", "RequestTTY=no",
+		"-o", "ClearAllForwardings=yes",
+	}
 }
 
 // NewSSHSession starts an SSH ControlMaster session to the given host.
@@ -36,14 +47,14 @@ func NewSSHSession(host string) (*SSHSession, error) {
 	controlPath := "/tmp/cc-clip-ssh-%C"
 
 	cmd := exec.Command("ssh",
-		"-fN",
-		"-o", "ControlMaster=yes",
-		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
-		"-o", "ControlPersist=10",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "ClearAllForwardings=yes",
-		host,
+		append([]string{
+			"-fN",
+			"-o", "ControlMaster=yes",
+			"-o", fmt.Sprintf("ControlPath=%s", controlPath),
+			"-o", "ControlPersist=10",
+			"-o", "ServerAliveInterval=15",
+			"-o", "ServerAliveCountMax=3",
+		}, append(baseConnArgs(), host)...)...,
 	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -63,14 +74,14 @@ func NewSSHSession(host string) (*SSHSession, error) {
 // This is primarily useful for testing.
 func NewSSHSessionWithControlPath(host, controlPath string) (*SSHSession, error) {
 	cmd := exec.Command("ssh",
-		"-fN",
-		"-o", "ControlMaster=yes",
-		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
-		"-o", "ControlPersist=10",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "ClearAllForwardings=yes",
-		host,
+		append([]string{
+			"-fN",
+			"-o", "ControlMaster=yes",
+			"-o", fmt.Sprintf("ControlPath=%s", controlPath),
+			"-o", "ControlPersist=10",
+			"-o", "ServerAliveInterval=15",
+			"-o", "ServerAliveCountMax=3",
+		}, append(baseConnArgs(), host)...)...,
 	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -91,9 +102,9 @@ func NewSSHSessionWithControlPath(host, controlPath string) (*SSHSession, error)
 // to prevent user's RemoteForward from triggering on every independent invocation.
 func (s *SSHSession) connArgs() []string {
 	if s.controlPath != "" {
-		return []string{"-o", fmt.Sprintf("ControlPath=%s", s.controlPath)}
+		return append(baseConnArgs(), "-o", fmt.Sprintf("ControlPath=%s", s.controlPath))
 	}
-	return []string{"-o", "ClearAllForwardings=yes"}
+	return baseConnArgs()
 }
 
 // Exec runs a command on the remote host via the SSH master connection.
@@ -108,17 +119,23 @@ func (s *SSHSession) Exec(cmd string) (string, error) {
 
 // Upload copies a local file to the remote host via the SSH master connection.
 func (s *SSHSession) Upload(localPath, remotePath string) error {
-	scpArgs := append(s.connArgs(), localPath, fmt.Sprintf("%s:%s", s.host, remotePath))
+	remoteTmpPath := uniqueUploadTempPath(remotePath)
+	scpArgs := append(s.connArgs(), localPath, fmt.Sprintf("%s:%s", s.host, remoteTmpPath))
 	cmd := exec.Command("scp", scpArgs...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("scp failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
-	// Make the uploaded file executable
-	chmodArgs := append(s.connArgs(), s.host, fmt.Sprintf("chmod +x %s", remotePath))
+	// Finalize atomically so other running peers can keep using the old inode.
+	chmodArgs := append(s.connArgs(), s.host, fmt.Sprintf(
+		"chmod +x %s && mv -f %s %s",
+		remoteShellPath(remoteTmpPath),
+		remoteShellPath(remoteTmpPath),
+		remoteShellPath(remotePath),
+	))
 	chmodCmd := exec.Command("ssh", chmodArgs...)
 	if out, err := chmodCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("chmod failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("finalize upload failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
 	return nil
@@ -193,9 +210,11 @@ func RemoteExecViaSession(session *SSHSession, args ...string) (string, error) {
 // WriteRemoteTokenViaSession writes the session token to the remote host
 // via the SSH master connection, using stdin to avoid exposing the token
 // in process arguments or shell history.
-func WriteRemoteTokenViaSession(session *SSHSession, tok string) error {
+func WriteRemoteTokenViaSession(session *SSHSession, tok string, stateDir string) error {
+	stateDirExpr := remoteShellPath(stateDir)
+	tokenPathExpr := stateDirExpr + "/session.token"
 	args := append(session.connArgs(), session.host,
-		"mkdir -p ~/.cache/cc-clip && cat > ~/.cache/cc-clip/session.token && chmod 600 ~/.cache/cc-clip/session.token")
+		fmt.Sprintf("mkdir -p %s && cat > %s && chmod 600 %s", stateDirExpr, tokenPathExpr, tokenPathExpr))
 	cmd := exec.Command("ssh", args...)
 	cmd.Stdin = strings.NewReader(tok + "\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -227,9 +246,11 @@ func GenerateNotificationNonce() (string, error) {
 
 // WriteRemoteNotificationNonce writes the notification nonce to
 // ~/.cache/cc-clip/notify.nonce on the remote with chmod 600.
-func WriteRemoteNotificationNonce(session *SSHSession, nonce string) error {
+func WriteRemoteNotificationNonce(session *SSHSession, nonce string, stateDir string) error {
+	stateDirExpr := remoteShellPath(stateDir)
+	noncePathExpr := stateDirExpr + "/notify.nonce"
 	args := append(session.connArgs(), session.host,
-		"mkdir -p ~/.cache/cc-clip && cat > ~/.cache/cc-clip/notify.nonce && chmod 600 ~/.cache/cc-clip/notify.nonce")
+		fmt.Sprintf("mkdir -p %s && cat > %s && chmod 600 %s", stateDirExpr, noncePathExpr, noncePathExpr))
 	cmd := exec.Command("ssh", args...)
 	cmd.Stdin = strings.NewReader(nonce + "\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -248,6 +269,18 @@ func InstallRemoteHookScript(session *SSHSession, port int) error {
 	cmd.Stdin = strings.NewReader(script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to install remote hook script: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+func InstallRemoteShellEntryScript(session *SSHSession) error {
+	script := ShellEntryScript()
+	args := append(session.connArgs(), session.host,
+		"mkdir -p ~/.local/bin && cat > ~/.local/bin/cc-clip-shell-enter && chmod +x ~/.local/bin/cc-clip-shell-enter")
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to install remote shell entry script: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
@@ -326,7 +359,6 @@ func EnsureRemoteCodexNotifyConfig(session *SSHSession, port int) error {
 }
 
 func codexNotifyManagedBlock(markerStart, markerEnd string, port int) string {
-	// Include port in CC_CLIP_PORT env so non-default ports work.
 	if port == 18339 {
 		return markerStart + "\n" +
 			`notify = ["cc-clip", "notify", "--from-codex-stdin"]` + "\n" +
@@ -338,13 +370,39 @@ func codexNotifyManagedBlock(markerStart, markerEnd string, port int) string {
 }
 
 // WriteRemoteSessionID writes a session ID to ~/.cache/cc-clip/session.id on the remote.
-func WriteRemoteSessionID(session *SSHSession, sessionID string) error {
+func WriteRemoteSessionID(session *SSHSession, sessionID string, stateDir string) error {
+	stateDirExpr := remoteShellPath(stateDir)
+	sessionPathExpr := stateDirExpr + "/session.id"
 	args := append(session.connArgs(), session.host,
-		"mkdir -p ~/.cache/cc-clip && cat > ~/.cache/cc-clip/session.id && chmod 600 ~/.cache/cc-clip/session.id")
+		fmt.Sprintf("mkdir -p %s && cat > %s && chmod 600 %s", stateDirExpr, sessionPathExpr, sessionPathExpr))
 	cmd := exec.Command("ssh", args...)
 	cmd.Stdin = strings.NewReader(sessionID + "\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to write remote session ID: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+func remoteShellPath(path string) string {
+	return shellutil.RemoteShellPath(path)
+}
+
+func shellQuote(s string) string {
+	return shellutil.ShellQuote(s)
+}
+
+func uniqueUploadTempPath(remotePath string) string {
+	suffix, err := randomHex(8)
+	if err != nil {
+		suffix = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%s.cc-clip-upload-%s", remotePath, suffix)
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

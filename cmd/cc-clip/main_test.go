@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/daemon"
+	"github.com/shunmei/cc-clip/internal/peer"
 	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/token"
 )
@@ -277,6 +279,472 @@ func TestClaudeHookConfigJSONIncludesNotificationAndStop(t *testing.T) {
 	if strings.Count(cfg, `"command": "cc-clip-hook"`) != 2 {
 		t.Fatalf("expected hook command to appear twice, got %q", cfg)
 	}
+}
+
+func TestResolveUninstallPeerTargetUsesExplicitPeerID(t *testing.T) {
+	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
+
+	peerID, alias, err := resolveUninstallPeerTarget("myserver", "other-peer", ident)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "other-peer" {
+		t.Fatalf("expected explicit peer ID to be preserved, got %q", peerID)
+	}
+	if alias != "" {
+		t.Fatalf("expected explicit peer ID cleanup to skip alias removal, got %q", alias)
+	}
+}
+
+func TestResolveUninstallPeerTargetAcceptsManagedAliasWithoutHost(t *testing.T) {
+	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
+
+	peerID, alias, err := resolveUninstallPeerTarget("", "myserver-cc-clip-macbook", ident)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "local-peer" {
+		t.Fatalf("expected local peer ID for alias removal, got %q", peerID)
+	}
+	if alias != "myserver-cc-clip-macbook" {
+		t.Fatalf("unexpected alias %q", alias)
+	}
+}
+
+func TestResolveUninstallPeerTargetRejectsManagedAliasWithHost(t *testing.T) {
+	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
+
+	_, _, err := resolveUninstallPeerTarget("myserver", "myserver-cc-clip-macbook", ident)
+	if err == nil {
+		t.Fatal("expected alias + host to be rejected")
+	}
+	if !strings.Contains(err.Error(), "cannot be used with --host") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestResolveUninstallPeerTargetUsesAliasForLocalPeerID(t *testing.T) {
+	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
+
+	peerID, alias, err := resolveUninstallPeerTarget("myserver", "local-peer", ident)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "local-peer" {
+		t.Fatalf("expected local peer ID to be preserved, got %q", peerID)
+	}
+	if alias != "myserver-cc-clip-macbook" {
+		t.Fatalf("unexpected alias %q", alias)
+	}
+}
+
+func TestParsePeerRegistrationEmptyOutput(t *testing.T) {
+	reg, err := parsePeerRegistration("   \n")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg != nil {
+		t.Fatalf("expected nil registration for empty output, got %#v", reg)
+	}
+}
+
+func TestParsePeerRegistrationJSON(t *testing.T) {
+	reg, err := parsePeerRegistration(`{"peer_id":"peer-a","label":"macbook","reserved_port":18340,"state_dir":"~/.cache/cc-clip/peers/peer-a"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg == nil {
+		t.Fatal("expected registration")
+	}
+	if reg.PeerID != "peer-a" || reg.ReservedPort != 18340 {
+		t.Fatalf("unexpected registration: %#v", reg)
+	}
+}
+
+func TestEnsureRemotePeerRegistrySupportAcceptsPeerAwareBinary(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			"~/.local/bin/cc-clip peer 2>&1 || true": {
+				out: "usage: cc-clip peer <reserve|release|show> [flags]\n",
+			},
+		},
+	}
+
+	if err := ensureRemotePeerRegistrySupport(session, "~/.local/bin/cc-clip"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnsureRemotePeerRegistrySupportRejectsLegacyBinary(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			"~/.local/bin/cc-clip peer 2>&1 || true": {
+				out: "unknown command: peer\n",
+			},
+		},
+	}
+
+	err := ensureRemotePeerRegistrySupport(session, "~/.local/bin/cc-clip")
+	if err == nil {
+		t.Fatal("expected legacy remote binary to be rejected")
+	}
+	if !strings.Contains(err.Error(), "re-run without --token-only") {
+		t.Fatalf("expected actionable redeploy hint, got %v", err)
+	}
+}
+
+func TestParseRemoteCodexStateDirsDeduplicatesAndSkipsBlankLines(t *testing.T) {
+	got := parseRemoteCodexStateDirs(strings.Join([]string{
+		"",
+		"~/.cache/cc-clip/peers/peer-a/codex",
+		"~/.cache/cc-clip/peers/peer-b/codex",
+		"~/.cache/cc-clip/peers/peer-a/codex",
+		"",
+	}, "\n"))
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unique state dirs, got %v", got)
+	}
+	if got[0] != "~/.cache/cc-clip/peers/peer-a/codex" {
+		t.Fatalf("unexpected first state dir %q", got[0])
+	}
+	if got[1] != "~/.cache/cc-clip/peers/peer-b/codex" {
+		t.Fatalf("unexpected second state dir %q", got[1])
+	}
+}
+
+func TestRemoteCodexStateDirsIncludesAllPeerStateDirectories(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 -type d -name codex -print 2>/dev/null`: {
+				out: strings.Join([]string{
+					"~/.cache/cc-clip/peers/peer-a/codex",
+					"~/.cache/cc-clip/peers/peer-b/codex",
+					"",
+				}, "\n"),
+			},
+		},
+	}
+
+	got := remoteCodexStateDirs(session)
+	want := []string{
+		legacyCodexStateDir,
+		"~/.cache/cc-clip/peers/peer-a/codex",
+		"~/.cache/cc-clip/peers/peer-b/codex",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected state dirs %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("state dirs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTargetRemoteCodexStateDirUsesPeerStateWhenPresent(t *testing.T) {
+	reg := &peer.Registration{StateDir: "~/.cache/cc-clip/peers/peer-a"}
+
+	if got := targetRemoteCodexStateDir(reg); got != "~/.cache/cc-clip/peers/peer-a/codex" {
+		t.Fatalf("unexpected peer codex state dir %q", got)
+	}
+}
+
+func TestTargetRemoteCodexStateDirFallsBackToLegacy(t *testing.T) {
+	if got := targetRemoteCodexStateDir(nil); got != legacyCodexStateDir {
+		t.Fatalf("expected legacy codex state dir %q, got %q", legacyCodexStateDir, got)
+	}
+}
+
+func TestCodexCleanupStateDirsIncludesLegacyAndPeerState(t *testing.T) {
+	reg := &peer.Registration{StateDir: "~/.cache/cc-clip/peers/peer-a"}
+
+	got := codexCleanupStateDirs(reg)
+	want := []string{
+		legacyCodexStateDir,
+		"~/.cache/cc-clip/peers/peer-a/codex",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected cleanup state dirs %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cleanup state dirs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCodexCleanupStateDirsDeduplicatesLegacyFallback(t *testing.T) {
+	got := codexCleanupStateDirs(nil)
+	if len(got) != 1 || got[0] != legacyCodexStateDir {
+		t.Fatalf("expected only legacy codex state dir, got %v", got)
+	}
+}
+
+func TestCompatStateDirsIncludesPeerAndLegacyState(t *testing.T) {
+	got := compatStateDirs("~/.cache/cc-clip/peers/peer-a")
+	want := []string{"~/.cache/cc-clip/peers/peer-a", legacyStateDir}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected compat state dirs %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("compat state dirs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCompatStateDirsDeduplicatesLegacyState(t *testing.T) {
+	got := compatStateDirs(legacyStateDir)
+	if len(got) != 1 || got[0] != legacyStateDir {
+		t.Fatalf("expected only legacy state dir, got %v", got)
+	}
+}
+
+func TestShimShellQuoteExpandsHomeRelativePaths(t *testing.T) {
+	got := shimShellQuote("~/.cache/cc-clip/codex")
+	if got != `"$HOME/.cache/cc-clip/codex"` {
+		t.Fatalf("unexpected quoted path %q", got)
+	}
+}
+
+func TestCleanupPeerRemoteStateStopsCodexProcessesBeforeRemovingStateDir(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			`cat "$HOME/.cache/cc-clip/peers/peer-a/codex/xvfb.pid" 2>/dev/null`: {
+				out: "123\n",
+			},
+			"ps -p 123 -o comm= 2>/dev/null": {
+				out: "Xvfb\n",
+			},
+		},
+	}
+
+	if err := cleanupPeerRemoteState(session, "~/.cache/cc-clip/peers/peer-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	bridgeStop := session.indexOfCommandContaining("bridge.pid")
+	xvfbRead := session.indexOfCommandContaining("codex/xvfb.pid")
+	stateRemove := session.indexOfCommandContaining(`rm -rf "$HOME/.cache/cc-clip/peers/peer-a"`)
+
+	if bridgeStop < 0 {
+		t.Fatalf("expected bridge stop command, got %v", session.commands)
+	}
+	if xvfbRead < 0 {
+		t.Fatalf("expected Xvfb stop command, got %v", session.commands)
+	}
+	if stateRemove < 0 {
+		t.Fatalf("expected peer state removal command, got %v", session.commands)
+	}
+	if stateRemove < bridgeStop || stateRemove < xvfbRead {
+		t.Fatalf("expected state removal after stopping Codex runtime, got %v", session.commands)
+	}
+}
+
+func TestBridgeConfiguredForPort(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			`cat "$HOME/.cache/cc-clip/peers/peer-a/codex/bridge.port" 2>/dev/null`: {
+				out: "18340\n",
+			},
+		},
+	}
+
+	if !bridgeConfiguredForPort(session, "~/.cache/cc-clip/peers/peer-a/codex", 18340) {
+		t.Fatal("expected bridge port match")
+	}
+	if bridgeConfiguredForPort(session, "~/.cache/cc-clip/peers/peer-a/codex", 18341) {
+		t.Fatal("expected bridge port mismatch")
+	}
+}
+
+func TestStartBridgeRemoteWritesBridgePortFile(t *testing.T) {
+	session := &recordingRemoteExecutor{}
+
+	if err := startBridgeRemote(session, "42", 18340, "~/.cache/cc-clip/peers/peer-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(session.commands) != 1 {
+		t.Fatalf("expected one remote command, got %v", session.commands)
+	}
+	if !strings.Contains(session.commands[0], `printf '18340\n' > "$HOME/.cache/cc-clip/peers/peer-a/codex/bridge.port"`) {
+		t.Fatalf("expected bridge start command to persist configured port, got %q", session.commands[0])
+	}
+}
+
+func TestStartBridgeRemoteQuotesStateDirPaths(t *testing.T) {
+	session := &recordingRemoteExecutor{}
+	stateDir := "/tmp/cc clip/peer-a"
+
+	if err := startBridgeRemote(session, "42", 18340, stateDir); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(session.commands) != 1 {
+		t.Fatalf("expected one remote command, got %v", session.commands)
+	}
+	for _, needle := range []string{
+		"CC_CLIP_STATE_DIR='/tmp/cc clip/peer-a'",
+		"> '/tmp/cc clip/peer-a/codex/bridge.log' 2>&1",
+		"echo $! > '/tmp/cc clip/peer-a/codex/bridge.pid'",
+		"printf '18340\\n' > '/tmp/cc clip/peer-a/codex/bridge.port'",
+		"cat '/tmp/cc clip/peer-a/codex/bridge.pid' 2>/dev/null",
+	} {
+		if !strings.Contains(session.commands[0], needle) {
+			t.Fatalf("expected bridge start command to contain %q, got %q", needle, session.commands[0])
+		}
+	}
+}
+
+func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			"head -5 ~/.local/bin/cc-clip-hook 2>/dev/null || true": {
+				out: "#!/usr/bin/env bash\n# cc-clip-hook — Claude Code hook bridge\n",
+			},
+			"head -5 ~/.local/bin/claude 2>/dev/null || true": {
+				out: "#!/usr/bin/env bash\n# cc-clip claude wrapper — auto-inject notification hooks\n",
+			},
+		},
+	}
+
+	if err := connectNotifyDisable(session, "~/.cache/cc-clip/peers/peer-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, needle := range []string{
+		`rm -f "$HOME/.cache/cc-clip/peers/peer-a/notify.nonce" "$HOME/.cache/cc-clip/peers/peer-a/notify-health.log"`,
+		`rm -f "$HOME/.cache/cc-clip/notify.nonce" "$HOME/.cache/cc-clip/notify-health.log"`,
+		`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 \( -name 'notify.nonce' -o -name 'notify-health.log' \) -delete 2>/dev/null || true`,
+		`rm -f "$HOME/.local/bin/cc-clip-hook"`,
+		`if [ -f "$HOME/.local/bin/claude.cc-clip-bak" ]; then mv -f "$HOME/.local/bin/claude.cc-clip-bak" "$HOME/.local/bin/claude"; else rm -f "$HOME/.local/bin/claude"; fi`,
+		`sed -i.cc-clip-bak '/# >>> cc-clip notify \(do not edit\) >>>/,/# <<< cc-clip notify \(do not edit\) <<</d' ~/.codex/config.toml 2>/dev/null || true; rm -f ~/.codex/config.toml.cc-clip-bak`,
+	} {
+		if session.indexOfCommandContaining(needle) < 0 {
+			t.Fatalf("expected command containing %q, got %v", needle, session.commands)
+		}
+	}
+}
+
+func TestConnectNotifyDisableLeavesUserClaudeWrapperUntouched(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			"head -5 ~/.local/bin/cc-clip-hook 2>/dev/null || true": {
+				out: "#!/usr/bin/env bash\n# cc-clip-hook — Claude Code hook bridge\n",
+			},
+			"head -5 ~/.local/bin/claude 2>/dev/null || true": {
+				out: "#!/usr/bin/env bash\n# user-managed wrapper\n",
+			},
+		},
+	}
+
+	if err := connectNotifyDisable(session, "~/.cache/cc-clip/peers/peer-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if session.indexOfCommandContaining("claude.cc-clip-bak") >= 0 {
+		t.Fatalf("expected user-managed Claude wrapper to be left alone, got %v", session.commands)
+	}
+}
+
+func TestUninstallPeerRemoteAndAliasRemovesAliasWhenRemoteReleaseFails(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldHome := os.Getenv("HOME")
+	t.Setenv("HOME", home)
+	defer func() { _ = os.Setenv("HOME", oldHome) }()
+
+	configPath := filepath.Join(home, ".ssh", "config")
+	config := strings.Join([]string{
+		"# >>> cc-clip managed: myserver-cc-clip-macbook >>>",
+		"Host myserver-cc-clip-macbook",
+		"    HostName myserver",
+		"# <<< cc-clip managed: myserver-cc-clip-macbook <<<",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := uninstallPeerRemoteAndAlias("myserver-cc-clip-macbook", func() (*peer.Registration, error) {
+		return nil, fmt.Errorf("peer peer-a not found")
+	})
+	if err == nil {
+		t.Fatal("expected remote cleanup failure")
+	}
+
+	content, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(content), "myserver-cc-clip-macbook") {
+		t.Fatalf("expected managed alias to be removed, got:\n%s", string(content))
+	}
+}
+
+func TestUninstallPeerRemoteAndAliasSkipsAliasRemovalWhenAliasEmpty(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldHome := os.Getenv("HOME")
+	t.Setenv("HOME", home)
+	defer func() { _ = os.Setenv("HOME", oldHome) }()
+
+	configPath := filepath.Join(home, ".ssh", "config")
+	config := strings.Join([]string{
+		"# >>> cc-clip managed: myserver-cc-clip-macbook >>>",
+		"Host myserver-cc-clip-macbook",
+		"    HostName myserver",
+		"# <<< cc-clip managed: myserver-cc-clip-macbook <<<",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := uninstallPeerRemoteAndAlias("", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(content), "myserver-cc-clip-macbook") {
+		t.Fatalf("expected managed alias to remain untouched, got:\n%s", string(content))
+	}
+}
+
+type recordingRemoteExecutor struct {
+	commands  []string
+	responses map[string]remoteExecResponse
+}
+
+type remoteExecResponse struct {
+	out string
+	err error
+}
+
+func (r *recordingRemoteExecutor) Exec(cmd string) (string, error) {
+	r.commands = append(r.commands, cmd)
+	if resp, ok := r.responses[cmd]; ok {
+		return resp.out, resp.err
+	}
+	return "", nil
+}
+
+func (r *recordingRemoteExecutor) indexOfCommandContaining(substr string) int {
+	for i, cmd := range r.commands {
+		if strings.Contains(cmd, substr) {
+			return i
+		}
+	}
+	return -1
 }
 
 // testClipboard is a minimal mock for daemon.ClipboardReader.

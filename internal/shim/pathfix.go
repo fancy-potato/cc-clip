@@ -161,8 +161,11 @@ func RemoveRemotePathSession(session RemoteExecutor) error {
 // format (:{num}) because Codex CLI runs inside a sandbox that blocks access to
 // the Unix socket at /tmp/.X11-unix/. TCP loopback bypasses this restriction.
 func displayBlock() string {
-	body := `if [ -z "${DISPLAY:-}" ] && [ -r "$HOME/.cache/cc-clip/codex/display" ]; then
-  _cc_clip_display="$(cat "$HOME/.cache/cc-clip/codex/display" 2>/dev/null)"
+	body := `if [ -z "${DISPLAY:-}" ]; then
+  _cc_clip_state_dir="${CC_CLIP_STATE_DIR:-$HOME/.cache/cc-clip}"
+  _cc_clip_display_file="$_cc_clip_state_dir/codex/display"
+  if [ -r "$_cc_clip_display_file" ]; then
+    _cc_clip_display="$(cat "$_cc_clip_display_file" 2>/dev/null)"
   case "$_cc_clip_display" in
     :[0-9]*) _cc_clip_num="${_cc_clip_display#:}" ;;
     [0-9]*)  _cc_clip_num="$_cc_clip_display" ;;
@@ -172,6 +175,8 @@ func displayBlock() string {
     export DISPLAY="127.0.0.1:${_cc_clip_num}"
   fi
   unset _cc_clip_display _cc_clip_num
+  fi
+  unset _cc_clip_state_dir _cc_clip_display_file
 fi`
 	return displayMarkerStart + "\n" + body + "\n" + displayMarkerEnd + "\n"
 }

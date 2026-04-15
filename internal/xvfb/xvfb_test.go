@@ -148,10 +148,10 @@ func TestIsHealthy_AllGood(t *testing.T) {
 	m := newMockExecutor()
 	stateDir := "/tmp/test-xvfb"
 
-	m.on("cat "+stateDir+"/xvfb.pid", "12345", nil)
-	m.on("cat "+stateDir+"/display", "42", nil)
+	m.on("cat '"+stateDir+"/xvfb.pid'", "12345", nil)
+	m.on("cat '"+stateDir+"/display'", "42", nil)
 	m.on("kill -0 12345", "", nil)
-	m.on("test -S /tmp/.X11-unix/X42", "", nil)
+	m.on("test -S '/tmp/.X11-unix/X42'", "", nil)
 
 	state, healthy := IsHealthy(m, stateDir)
 	if !healthy {
@@ -172,7 +172,7 @@ func TestIsHealthy_NoPidFile(t *testing.T) {
 	m := newMockExecutor()
 	stateDir := "/tmp/test-xvfb"
 
-	m.on("cat "+stateDir+"/xvfb.pid", "", fmt.Errorf("no such file"))
+	m.on("cat '"+stateDir+"/xvfb.pid' 2>/dev/null", "", fmt.Errorf("no such file"))
 
 	_, healthy := IsHealthy(m, stateDir)
 	if healthy {
@@ -184,8 +184,8 @@ func TestIsHealthy_ProcessDead(t *testing.T) {
 	m := newMockExecutor()
 	stateDir := "/tmp/test-xvfb"
 
-	m.on("cat "+stateDir+"/xvfb.pid", "12345", nil)
-	m.on("cat "+stateDir+"/display", "42", nil)
+	m.on("cat '"+stateDir+"/xvfb.pid'", "12345", nil)
+	m.on("cat '"+stateDir+"/display'", "42", nil)
 	m.on("kill -0 12345", "", fmt.Errorf("no such process"))
 
 	_, healthy := IsHealthy(m, stateDir)
@@ -198,10 +198,10 @@ func TestIsHealthy_NoSocket(t *testing.T) {
 	m := newMockExecutor()
 	stateDir := "/tmp/test-xvfb"
 
-	m.on("cat "+stateDir+"/xvfb.pid", "12345", nil)
-	m.on("cat "+stateDir+"/display", "42", nil)
+	m.on("cat '"+stateDir+"/xvfb.pid'", "12345", nil)
+	m.on("cat '"+stateDir+"/display'", "42", nil)
 	m.on("kill -0 12345", "", nil)
-	m.on("test -S /tmp/.X11-unix/X42", "", fmt.Errorf("not a socket"))
+	m.on("test -S '/tmp/.X11-unix/X42'", "", fmt.Errorf("not a socket"))
 
 	_, healthy := IsHealthy(m, stateDir)
 	if healthy {
@@ -233,6 +233,51 @@ func TestCleanStale(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected rm -f command for state files, got: %v", m.execLog)
+	}
+}
+
+func TestShellQuoteExpandsHomeRelativePaths(t *testing.T) {
+	got := shellQuote("~/.cache/cc-clip/codex/xvfb.pid")
+	if got != `"$HOME/.cache/cc-clip/codex/xvfb.pid"` {
+		t.Fatalf("unexpected quoted path %q", got)
+	}
+}
+
+func TestStartRemoteQuotesStateDirPaths(t *testing.T) {
+	m := newMockExecutor()
+	stateDir := "/tmp/cc clip/test-xvfb"
+
+	m.on("which Xvfb", "/usr/bin/Xvfb", nil)
+	m.on("cat '"+stateDir+"/xvfb.pid' 2>/dev/null", "", fmt.Errorf("no such file"))
+	m.on("rm -f", "", nil)
+	m.on("mkdir -p", "42", nil)
+	m.on("cat '"+stateDir+"/xvfb.pid'", "12345", nil)
+	m.on("test -S '/tmp/.X11-unix/X42'", "", nil)
+
+	if _, err := StartRemote(m, stateDir); err != nil {
+		t.Fatalf("StartRemote failed: %v", err)
+	}
+
+	startCmd := ""
+	for _, cmd := range m.execLog {
+		if strings.HasPrefix(cmd, "mkdir -p ") {
+			startCmd = cmd
+			break
+		}
+	}
+	if startCmd == "" {
+		t.Fatalf("expected start command, got: %v", m.execLog)
+	}
+	for _, needle := range []string{
+		"mkdir -p '/tmp/cc clip/test-xvfb'",
+		"rm -f '/tmp/cc clip/test-xvfb/display'",
+		"> '/tmp/cc clip/test-xvfb/display'",
+		"2> '/tmp/cc clip/test-xvfb/xvfb.log'",
+		"echo $! > '/tmp/cc clip/test-xvfb/xvfb.pid'",
+	} {
+		if !strings.Contains(startCmd, needle) {
+			t.Fatalf("expected start command to contain %q, got: %s", needle, startCmd)
+		}
 	}
 }
 

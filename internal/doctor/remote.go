@@ -1,16 +1,25 @@
 package doctor
 
 import (
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
 
+	"github.com/shunmei/cc-clip/internal/peer"
+	"github.com/shunmei/cc-clip/internal/shellutil"
 	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
 )
 
 func RunRemote(host string, port int) []CheckResult {
 	var results []CheckResult
+	ident, identErr := peer.LoadOrCreateLocalIdentity()
+	var reg *peer.Registration
+	var (
+		deployState *shim.DeployState
+		deployErr   error
+	)
 
 	// Check SSH connectivity
 	out, err := remoteExecNoForward(host, "echo ok")
@@ -30,6 +39,14 @@ func RunRemote(host string, port int) []CheckResult {
 		results = append(results, CheckResult{"remote-bin", false, "cc-clip not found at ~/.local/bin/cc-clip"})
 	} else {
 		results = append(results, CheckResult{"remote-bin", true, strings.TrimSpace(out)})
+	}
+	deployState, deployErr = readDeployState(host)
+
+	if identErr != nil {
+		results = append(results, CheckResult{"peer", false, fmt.Sprintf("cannot load local peer identity: %v", identErr)})
+	} else {
+		reg, err = lookupPeer(host, ident.ID)
+		results = append(results, peerLookupCheckResult(reg, err))
 	}
 
 	// Check shim installation — detect which target (xclip or wl-paste)
@@ -59,35 +76,49 @@ func RunRemote(host string, port int) []CheckResult {
 		results = append(results, CheckResult{"path-order", false, fmt.Sprintf("%s resolves to %s (shim not first)", checkTarget, strings.TrimSpace(out))})
 	}
 
+	results = append(results, checkAliasPort(host, reg, port)...)
+
 	// Check tunnel from remote side
+	remotePort := port
+	if reg != nil && reg.ReservedPort != 0 {
+		remotePort = reg.ReservedPort
+	}
 	out, err = remoteExecNoForward(host, fmt.Sprintf(
-		"bash -c 'echo >/dev/tcp/127.0.0.1/%d' 2>&1 && echo 'tunnel ok' || echo 'tunnel fail'", port))
+		"bash -c 'echo >/dev/tcp/127.0.0.1/%d' 2>&1 && echo 'tunnel ok' || echo 'tunnel fail'", remotePort))
 	if strings.Contains(out, "tunnel ok") {
-		results = append(results, CheckResult{"tunnel", true, fmt.Sprintf("port %d forwarded", port)})
+		results = append(results, CheckResult{"tunnel", true, fmt.Sprintf("port %d forwarded", remotePort)})
 	} else {
-		results = append(results, CheckResult{"tunnel", false, fmt.Sprintf("port %d not reachable from remote", port)})
+		results = append(results, CheckResult{"tunnel", false, fmt.Sprintf("port %d not reachable from remote", remotePort)})
 	}
 
 	// Check token on remote
-	out, err = remoteExecNoForward(host, "test -f ~/.cache/cc-clip/session.token && echo 'present' || echo 'missing'")
+	stateDir := "~/.cache/cc-clip"
+	if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
+		stateDir = reg.StateDir
+	}
+	stateDirExpr := remotePathExpr(stateDir)
+	out, err = remoteExecNoForward(host, fmt.Sprintf("test -f %s/session.token && echo 'present' || echo 'missing'", stateDirExpr))
 	if strings.Contains(out, "present") {
 		results = append(results, CheckResult{"remote-token", true, "token file present"})
 	} else {
 		results = append(results, CheckResult{"remote-token", false, "token file missing"})
 	}
 
+	out, err = remoteExecNoForward(host, fmt.Sprintf("test -f %s/notify.nonce && echo 'present' || echo 'missing'", stateDirExpr))
+	results = append(results, remoteNonceResult(deployState, strings.Contains(out, "present")))
+
 	// Check remote token matches local token
-	results = append(results, checkTokenMatch(host)...)
+	results = append(results, checkTokenMatch(host, stateDir)...)
 
 	// Check deploy state file
-	results = append(results, checkDeployState(host)...)
+	results = append(results, checkDeployStateResult(deployState, deployErr)...)
 
 	// Check PATH fix (rc file marker)
 	results = append(results, checkPathFix(host)...)
 
 	// End-to-end image round-trip (only if tunnel is up)
 	if tunnelOK(results) {
-		results = append(results, runImageProbe(host, port)...)
+		results = append(results, runImageProbe(host, remotePort, stateDir)...)
 	}
 
 	return results
@@ -97,7 +128,11 @@ func RunRemote(host string, port int) []CheckResult {
 // Doctor checks should inspect the existing tunnel, not compete with it by opening a new one.
 func remoteExecNoForward(host string, args ...string) (string, error) {
 	cmdStr := strings.Join(args, " ")
-	cmd := exec.Command("ssh", "-o", "ClearAllForwardings=yes", host, cmdStr)
+	cmd := exec.Command("ssh",
+		"-o", "ClearAllForwardings=yes",
+		"-o", "RemoteCommand=none",
+		"-o", "RequestTTY=no",
+		host, cmdStr)
 	hideConsoleWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
@@ -127,16 +162,17 @@ func tunnelOK(results []CheckResult) bool {
 	return false
 }
 
-func runImageProbe(host string, port int) []CheckResult {
+func runImageProbe(host string, port int, stateDir string) []CheckResult {
 	// Run the probe FROM the remote host through the tunnel, not from local.
 	// This validates the full chain: remote -> tunnel -> daemon.
+	stateDirExpr := remotePathExpr(stateDir)
 	cmd := fmt.Sprintf(
-		`TOKEN=$(cat ~/.cache/cc-clip/session.token 2>/dev/null) && `+
+		`TOKEN=$(cat %s/session.token 2>/dev/null) && `+
 			`curl -sf --max-time 5 `+
 			`-H "Authorization: Bearer ${TOKEN}" `+
 			`-H "User-Agent: cc-clip/0.1" `+
 			`"http://127.0.0.1:%d/clipboard/type"`,
-		port)
+		stateDirExpr, port)
 
 	out, err := remoteExecNoForward(host, cmd)
 	if err != nil {
@@ -154,13 +190,13 @@ func runImageProbe(host string, port int) []CheckResult {
 }
 
 // checkTokenMatch verifies the remote token matches the local daemon token.
-func checkTokenMatch(host string) []CheckResult {
+func checkTokenMatch(host string, stateDir string) []CheckResult {
 	localToken, err := token.ReadTokenFile()
 	if err != nil {
 		return []CheckResult{{"token-match", false, "cannot read local token to compare"}}
 	}
 
-	remoteToken, err := remoteExecNoForward(host, "cat ~/.cache/cc-clip/session.token 2>/dev/null")
+	remoteToken, err := remoteExecNoForward(host, fmt.Sprintf("cat %s/session.token 2>/dev/null", remotePathExpr(stateDir)))
 	if err != nil || strings.TrimSpace(remoteToken) == "" {
 		return []CheckResult{{"token-match", false, "cannot read remote token"}}
 	}
@@ -172,17 +208,43 @@ func checkTokenMatch(host string) []CheckResult {
 }
 
 // checkDeployState checks if the deploy state file exists on the remote.
-func checkDeployState(host string) []CheckResult {
-	out, err := remoteExecNoForward(host, "cat ~/.cache/cc-clip/deploy.json 2>/dev/null || echo 'not found'")
-	if err != nil || strings.Contains(out, "not found") || strings.TrimSpace(out) == "" {
+func readDeployState(host string) (*shim.DeployState, error) {
+	out, err := remoteExecNoForward(host, "cat ~/.cache/cc-clip/deploy.json 2>/dev/null || echo '__NOTFOUND__'")
+	if err != nil {
+		return nil, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "__NOTFOUND__" || out == "" {
+		return nil, nil
+	}
+	var state shim.DeployState
+	if err := json.Unmarshal([]byte(out), &state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func checkDeployStateResult(state *shim.DeployState, err error) []CheckResult {
+	if err != nil {
+		return []CheckResult{{"deploy-state", false, fmt.Sprintf("cannot read deploy.json: %v", err)}}
+	}
+	if state == nil {
 		return []CheckResult{{"deploy-state", false, "deploy.json not found (deploy state not tracked)"}}
 	}
-
-	// Basic validation: check it contains expected fields
-	if strings.Contains(out, "binary_hash") {
+	if state.BinaryHash != "" {
 		return []CheckResult{{"deploy-state", true, "deploy.json present and valid"}}
 	}
 	return []CheckResult{{"deploy-state", false, "deploy.json exists but may be malformed"}}
+}
+
+func remoteNonceResult(state *shim.DeployState, noncePresent bool) CheckResult {
+	if state != nil && state.Notify != nil && !state.Notify.Enabled {
+		return CheckResult{"remote-nonce", true, "notifications disabled by deploy config"}
+	}
+	if noncePresent {
+		return CheckResult{"remote-nonce", true, "notify nonce present"}
+	}
+	return CheckResult{"remote-nonce", false, "notify nonce missing"}
 }
 
 // checkPathFix verifies the PATH marker block exists in the remote shell rc file.
@@ -195,4 +257,80 @@ func checkPathFix(host string) []CheckResult {
 		return []CheckResult{{"path-fix", true, "PATH marker present in shell rc file"}}
 	}
 	return []CheckResult{{"path-fix", false, "PATH marker not found in shell rc file"}}
+}
+
+func lookupPeer(host, peerID string) (*peer.Registration, error) {
+	out, err := remoteExecNoForward(host, fmt.Sprintf("~/.local/bin/cc-clip peer show --peer-id %s", shellQuote(peerID)))
+	out = strings.TrimSpace(out)
+	if err != nil {
+		if out != "" {
+			return nil, fmt.Errorf("%s", out)
+		}
+		return nil, err
+	}
+	var reg peer.Registration
+	if err := json.Unmarshal([]byte(out), &reg); err != nil {
+		return nil, fmt.Errorf("unexpected peer registry output: %s", out)
+	}
+	return &reg, nil
+}
+
+func peerLookupCheckResult(reg *peer.Registration, err error) CheckResult {
+	switch {
+	case err == nil && reg != nil:
+		return CheckResult{"peer", true, fmt.Sprintf("%s -> port %d", reg.Label, reg.ReservedPort)}
+	case err == nil:
+		return CheckResult{"peer", true, "peer registry not configured on remote; using legacy state path"}
+	case isLegacyPeerLookupError(err):
+		return CheckResult{"peer", true, "peer registry not configured on remote; using legacy state path"}
+	default:
+		return CheckResult{"peer", false, fmt.Sprintf("peer registry lookup failed: %v", err)}
+	}
+}
+
+func isLegacyPeerLookupError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "unknown command: peer") ||
+		strings.Contains(msg, "usage: cc-clip") ||
+		strings.Contains(msg, "peer show failed: peer ") && strings.Contains(msg, " not found")
+}
+
+func checkAliasPort(host string, reg *peer.Registration, localPort int) []CheckResult {
+	if reg == nil || reg.ReservedPort == 0 {
+		return []CheckResult{{"ssh-alias", true, "peer alias not configured; skipping alias port check"}}
+	}
+
+	want := fmt.Sprintf("%d 127.0.0.1:%d", reg.ReservedPort, localPort)
+
+	candidates := []string{host}
+	derivedAlias := peer.AliasForHost(host, reg.Label)
+	if derivedAlias != host {
+		candidates = append(candidates, derivedAlias)
+	}
+	for _, candidate := range candidates {
+		cmd := exec.Command("ssh", "-G", candidate)
+		hideConsoleWindow(cmd)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "remoteforward ") && strings.Contains(line, want) {
+				return []CheckResult{{"ssh-alias", true, fmt.Sprintf("%s forwards %s", candidate, want)}}
+			}
+		}
+	}
+	return []CheckResult{{"ssh-alias", false, fmt.Sprintf("ssh config missing RemoteForward %s", want)}}
+}
+
+func shellQuote(s string) string {
+	return shellutil.ShellQuote(s)
+}
+
+func remotePathExpr(path string) string {
+	return shellutil.RemoteShellPath(path)
 }

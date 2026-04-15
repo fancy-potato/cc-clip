@@ -22,9 +22,11 @@ import (
 	"github.com/shunmei/cc-clip/internal/daemon"
 	"github.com/shunmei/cc-clip/internal/doctor"
 	"github.com/shunmei/cc-clip/internal/exitcode"
+	"github.com/shunmei/cc-clip/internal/peer"
 	"github.com/shunmei/cc-clip/internal/service"
 	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/setup"
+	"github.com/shunmei/cc-clip/internal/shellutil"
 	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
@@ -69,6 +71,8 @@ func main() {
 		cmdNotify()
 	case "x11-bridge":
 		cmdX11Bridge()
+	case "peer":
+		cmdPeer()
 	case "version", "--version", "-v":
 		fmt.Printf("cc-clip %s\n", version)
 	case "help", "--help", "-h":
@@ -101,6 +105,7 @@ Remote:
     --path           Install directory (default: ~/.local/bin)
   uninstall          Remove shim
     --host           Also clean up PATH marker on remote host
+    --peer           Remove the managed peer alias; with --host also releases the remote peer lease
   paste              Fetch clipboard image and output path
     --out-dir        Output directory (env: CC_CLIP_OUT_DIR)
   send [<host>]      Upload local clipboard image to remote file path
@@ -150,6 +155,7 @@ Notifications:
     --port           Daemon port (default: 18339, env: CC_CLIP_PORT)
 
 Internal (used by deploy):
+  peer               Internal registry management
   x11-bridge         X11 clipboard bridge daemon (started by connect --codex)
     --display        X11 display (default: $DISPLAY)
     --port           cc-clip daemon port (default: 18339)`)
@@ -355,7 +361,13 @@ func cmdUninstall() {
 	targetStr := getFlag("target", "auto")
 	installPath := getFlag("path", "")
 	host := getFlag("host", "")
+	peerArg := getFlag("peer", "")
 	codex := hasFlag("codex")
+
+	if peerArg != "" {
+		cmdUninstallPeer(host, peerArg)
+		return
+	}
 
 	// --codex mode: only clean up Codex assets, don't touch Claude shim.
 	if codex {
@@ -395,6 +407,80 @@ func cmdUninstall() {
 	}
 }
 
+func cmdUninstallPeer(host, peerArg string) {
+	ident, err := peer.LoadOrCreateLocalIdentity()
+	if err != nil {
+		log.Fatalf("uninstall peer failed: %v", err)
+	}
+
+	peerID, alias, err := resolveUninstallPeerTarget(host, peerArg, ident)
+	if err != nil {
+		log.Fatalf("uninstall peer failed: %v", err)
+	}
+
+	if host == "" {
+		if err := setup.RemoveManagedAliasConfig(alias); err != nil {
+			log.Fatalf("uninstall peer failed to remove managed alias: %v", err)
+		}
+		fmt.Printf("Removed managed alias %s from ~/.ssh/config\n", alias)
+		return
+	}
+
+	session, err := shim.NewSSHSession(host)
+	if err != nil {
+		log.Fatalf("uninstall peer failed: %v", err)
+	}
+	defer session.Close()
+
+	if err := uninstallPeerRemoteAndAlias(alias, func() (*peer.Registration, error) {
+		return cleanupAndReleasePeer(session, "~/.local/bin/cc-clip", peerID)
+	}); err != nil {
+		log.Fatalf("uninstall peer failed: %v", err)
+	}
+}
+
+func resolveUninstallPeerTarget(host, peerArg string, ident peer.Identity) (string, string, error) {
+	if strings.Contains(peerArg, "-cc-clip-") {
+		if host != "" {
+			return "", "", fmt.Errorf("--peer alias cannot be used with --host; pass the peer ID for remote cleanup, or omit --host to remove only the local alias")
+		}
+		return ident.ID, peerArg, nil
+	}
+	if host == "" {
+		return "", "", fmt.Errorf("--host is required when --peer is not an alias")
+	}
+	if peerArg == ident.ID {
+		return peerArg, peer.AliasForHost(host, ident.Label), nil
+	}
+	return peerArg, "", nil
+}
+
+func uninstallPeerRemoteAndAlias(alias string, remoteCleanup func() (*peer.Registration, error)) error {
+	reg, remoteErr := remoteCleanup()
+	var aliasErr error
+	if alias != "" {
+		aliasErr = setup.RemoveManagedAliasConfig(alias)
+	}
+
+	if remoteErr == nil && reg != nil {
+		fmt.Printf("Released peer %s on remote port %d\n", reg.Label, reg.ReservedPort)
+	}
+	if alias != "" && aliasErr == nil {
+		fmt.Printf("Removed managed alias %s from ~/.ssh/config\n", alias)
+	}
+
+	switch {
+	case remoteErr != nil && alias != "" && aliasErr != nil:
+		return fmt.Errorf("%v; additionally failed to remove managed alias: %w", remoteErr, aliasErr)
+	case remoteErr != nil:
+		return remoteErr
+	case alias != "" && aliasErr != nil:
+		return fmt.Errorf("failed to remove managed alias: %w", aliasErr)
+	default:
+		return nil
+	}
+}
+
 // cmdUninstallCodexRemote cleans up Codex support on a remote host via SSH.
 func cmdUninstallCodexRemote(host string) {
 	fmt.Printf("Uninstalling Codex support from %s...\n", host)
@@ -405,34 +491,48 @@ func cmdUninstallCodexRemote(host string) {
 	}
 	defer session.Close()
 
-	var hasError bool
+	var (
+		hasError          bool
+		remainingCodexEnv bool
+	)
+	codexStateDirs := remoteCodexStateDirs(session)
 
 	// Step 1: Stop x11-bridge
 	fmt.Println("[1/5] Stopping x11-bridge...")
-	stopBridgeRemote(session)
+	for _, codexStateDir := range codexStateDirs {
+		stopBridgeRemote(session, codexStateDir)
+	}
 	fmt.Println("      done")
 
 	// Step 2: Stop Xvfb
 	fmt.Println("[2/5] Stopping Xvfb...")
-	if err := xvfb.StopRemote(session, codexStateDir); err != nil {
-		fmt.Printf("      warning: %v\n", err)
-		hasError = true
-	} else {
-		fmt.Println("      done")
+	for _, codexStateDir := range codexStateDirs {
+		if err := xvfb.StopRemote(session, codexStateDir); err != nil {
+			fmt.Printf("      warning: %v\n", err)
+			hasError = true
+		}
 	}
+	fmt.Println("      done")
 
 	// Step 3: Remove codex state directory
 	fmt.Println("[3/5] Removing codex state files...")
-	session.Exec(fmt.Sprintf("rm -rf %s", codexStateDir))
+	for _, codexStateDir := range codexStateDirs {
+		session.Exec(fmt.Sprintf("rm -rf %s", shimShellQuote(codexStateDir)))
+	}
+	remainingCodexEnv = remoteHasRemainingCodexState(session)
 	fmt.Println("      done")
 
 	// Step 4: Remove DISPLAY marker
 	fmt.Println("[4/5] Removing DISPLAY marker...")
-	if err := shim.RemoveDisplayMarkerSession(session); err != nil {
-		fmt.Printf("      warning: %v\n", err)
-		hasError = true
+	if remainingCodexEnv {
+		fmt.Println("      skipped (other peer Codex runtimes still configured)")
 	} else {
-		fmt.Println("      done")
+		if err := shim.RemoveDisplayMarkerSession(session); err != nil {
+			fmt.Printf("      warning: %v\n", err)
+			hasError = true
+		} else {
+			fmt.Println("      done")
+		}
 	}
 
 	// Step 5: Update deploy state
@@ -442,12 +542,16 @@ func cmdUninstallCodexRemote(host string) {
 		fmt.Printf("      warning: could not read deploy state: %v\n", err)
 	}
 	if remoteState != nil {
-		remoteState.Codex = nil
-		if err := shim.WriteRemoteState(session, remoteState); err != nil {
-			fmt.Printf("      warning: could not update deploy state: %v\n", err)
-			hasError = true
+		if remainingCodexEnv {
+			fmt.Println("      preserved codex block (other peer Codex runtimes still configured)")
 		} else {
-			fmt.Println("      codex block removed from deploy.json")
+			remoteState.Codex = nil
+			if err := shim.WriteRemoteState(session, remoteState); err != nil {
+				fmt.Printf("      warning: could not update deploy state: %v\n", err)
+				hasError = true
+			} else {
+				fmt.Println("      codex block removed from deploy.json")
+			}
 		}
 	} else {
 		fmt.Println("      no deploy state found (already clean)")
@@ -508,14 +612,16 @@ func cmdConnect() {
 
 func runConnect(opts connectOpts) {
 	host := opts.host
-	port := opts.port
+	localPort := opts.port
 	force := opts.force
 	tokenOnly := opts.tokenOnly
+	remoteBin := "~/.local/bin/cc-clip"
+	hadExistingPeerReservation := false
 
 	// Step 1: Check local daemon
-	fmt.Printf("[1/7] Checking local daemon on :%d...\n", port)
+	fmt.Printf("[1/8] Checking local daemon on :%d...\n", localPort)
 	probeTimeout := envDuration("CC_CLIP_PROBE_TIMEOUT_MS", 500*time.Millisecond)
-	if err := tunnel.Probe(fmt.Sprintf("127.0.0.1:%d", port), probeTimeout); err != nil {
+	if err := tunnel.Probe(fmt.Sprintf("127.0.0.1:%d", localPort), probeTimeout); err != nil {
 		log.Fatalf("Local daemon not running. Start it first: cc-clip serve")
 	}
 	fmt.Println("      daemon running")
@@ -527,8 +633,14 @@ func runConnect(opts connectOpts) {
 		log.Fatalf("      cannot read daemon token (is 'cc-clip serve' running?): %v", err)
 	}
 
+	ident, err := peer.LoadOrCreateLocalIdentity()
+	if err != nil {
+		log.Fatalf("      cannot load local peer identity: %v", err)
+	}
+	fmt.Printf("      peer: %s (%s)\n", ident.Label, ident.ID[:12])
+
 	// Step 2: Start SSH master session (passphrase prompted once here)
-	fmt.Printf("[2/7] Establishing SSH session to %s...\n", host)
+	fmt.Printf("[2/8] Establishing SSH session to %s...\n", host)
 	session, err := shim.NewSSHSession(host)
 	if err != nil {
 		log.Fatalf("      failed: %v", err)
@@ -536,30 +648,8 @@ func runConnect(opts connectOpts) {
 	defer session.Close()
 	fmt.Println("      SSH master connected")
 
-	// --token-only: skip binary/shim, just sync token and verify tunnel
-	if tokenOnly {
-		fmt.Println("[3/7] Skipping binary check (--token-only)")
-		fmt.Println("[4/7] Skipping binary upload (--token-only)")
-		fmt.Println("[5/7] Skipping shim install (--token-only)")
-
-		fmt.Printf("[6/7] Syncing token and session...\n")
-		if err := shim.WriteRemoteTokenViaSession(session, daemonToken); err != nil {
-			log.Fatalf("      failed to write token: %v", err)
-		}
-		fmt.Println("      token synced from local daemon")
-
-		if sid, genErr := shim.GenerateSessionID(); genErr == nil {
-			if writeErr := shim.WriteRemoteSessionID(session, sid); writeErr == nil {
-				fmt.Printf("      session ID: %s\n", sid[:16])
-			}
-		}
-
-		connectVerifyTunnel(session, port, host)
-		return
-	}
-
 	// Step 3: Read remote deploy state and detect arch
-	fmt.Printf("[3/7] Checking remote state...\n")
+	fmt.Printf("[3/8] Checking remote state...\n")
 	remoteState, err := shim.ReadRemoteState(session)
 	if err != nil {
 		log.Printf("      warning: could not read remote state: %v", err)
@@ -573,43 +663,100 @@ func runConnect(opts connectOpts) {
 		fmt.Println("      no previous deploy state")
 	}
 
-	remoteOS, remoteArch, err := shim.DetectRemoteArchViaSession(session)
-	if err != nil {
-		log.Fatalf("      failed to detect remote arch: %v", err)
-	}
-	fmt.Printf("      %s/%s\n", remoteOS, remoteArch)
-
-	remoteBin := "~/.local/bin/cc-clip"
-
-	// Step 4: Prepare and upload binary (skip if hash matches)
-	localBin, err := prepareBinaryLocal(host, remoteOS, remoteArch)
-	if err != nil {
-		log.Fatalf("[4/7] Prepare binary failed: %v", err)
-	}
-
-	needsUpload := force || shim.NeedsUpload(localBin, remoteState)
-	if !needsUpload {
-		// Verify the remote binary actually exists — deploy state can be stale.
+	needsUpload := false
+	localBin := ""
+	if tokenOnly {
+		fmt.Println("[4/8] Skipping binary prepare/upload (--token-only)")
 		if _, err := session.Exec(fmt.Sprintf("test -x %s", remoteBin)); err != nil {
-			fmt.Println("[4/7] Remote binary missing despite cached state, re-uploading")
-			needsUpload = true
+			log.Fatalf("      remote binary missing; re-run without --token-only to deploy it")
 		}
-	}
-	if needsUpload {
-		fmt.Printf("[4/7] Uploading cc-clip binary...\n")
-		// Stop bridge if running — it holds the binary open, preventing overwrite.
-		stopBridgeRemote(session)
-		// Ensure remote directory exists
-		session.Exec("mkdir -p ~/.local/bin")
-		if err := shim.UploadBinaryViaSession(session, localBin, remoteBin); err != nil {
-			log.Fatalf("      failed: %v", err)
+		if err := ensureRemotePeerRegistrySupport(session, remoteBin); err != nil {
+			log.Fatalf("      %v", err)
 		}
-		fmt.Printf("      uploaded to %s\n", remoteBin)
 	} else {
-		fmt.Println("[4/7] Binary up to date, skipping upload")
+		remoteOS, remoteArch, err := shim.DetectRemoteArchViaSession(session)
+		if err != nil {
+			log.Fatalf("      failed to detect remote arch: %v", err)
+		}
+		fmt.Printf("      %s/%s\n", remoteOS, remoteArch)
+
+		// Step 4: Prepare and upload binary (skip if hash matches)
+		localBin, err = prepareBinaryLocal(host, remoteOS, remoteArch)
+		if err != nil {
+			log.Fatalf("[4/8] Prepare binary failed: %v", err)
+		}
+
+		needsUpload = force || shim.NeedsUpload(localBin, remoteState)
+		if !needsUpload {
+			// Verify the remote binary actually exists — deploy state can be stale.
+			if _, err := session.Exec(fmt.Sprintf("test -x %s", remoteBin)); err != nil {
+				fmt.Println("[4/8] Remote binary missing despite cached state, re-uploading")
+				needsUpload = true
+			}
+		}
+		if needsUpload {
+			fmt.Printf("[4/8] Uploading cc-clip binary...\n")
+			// Ensure remote directory exists
+			session.Exec("mkdir -p ~/.local/bin")
+			if err := shim.UploadBinaryViaSession(session, localBin, remoteBin); err != nil {
+				log.Fatalf("      failed: %v", err)
+			}
+			fmt.Printf("      uploaded to %s\n", remoteBin)
+		} else {
+			fmt.Println("[4/8] Binary up to date, skipping upload")
+		}
 	}
 
-	// Step 5: Install shim (skip if already installed and not forced)
+	fmt.Printf("[5/8] Reserving peer port and updating alias...\n")
+	if existingReg, err := lookupPeerReservation(session, remoteBin, ident.ID); err != nil {
+		log.Printf("      warning: could not check existing peer reservation: %v", err)
+	} else if existingReg != nil {
+		hadExistingPeerReservation = true
+	}
+	reg, err := shim.ReservePeerViaSession(session, remoteBin, ident.ID, ident.Label, peer.DefaultRangeStart, peer.DefaultRangeEnd)
+	if err != nil {
+		log.Fatalf("      failed to reserve peer port: %v", err)
+	}
+	if err := shim.InstallRemoteShellEntryScript(session); err != nil {
+		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		log.Fatalf("      failed to install shell entry script: %v", err)
+	}
+	alias := peer.AliasForHost(host, ident.Label)
+	changes, err := setup.EnsureManagedAliasConfig(setup.ManagedAliasSpec{
+		BaseHost:   host,
+		Alias:      alias,
+		RemotePort: reg.ReservedPort,
+		LocalPort:  localPort,
+		PeerID:     ident.ID,
+		PeerLabel:  ident.Label,
+	})
+	if err != nil {
+		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		log.Fatalf("      failed to write managed SSH alias: %v", err)
+	}
+	for _, c := range changes {
+		fmt.Printf("      %s: %s\n", c.Action, c.Detail)
+	}
+	fmt.Printf("      alias: %s\n", alias)
+	fmt.Printf("      remote port: %d\n", reg.ReservedPort)
+	fmt.Printf("      state dir: %s\n", reg.StateDir)
+
+	if tokenOnly {
+		fmt.Println("[6/8] Skipping shim install (--token-only)")
+		fmt.Printf("[7/8] Syncing peer token and session...\n")
+		sid, _ := shim.GenerateSessionID()
+		if err := syncRemoteTokenAndSession(session, daemonToken, reg.StateDir, sid); err != nil {
+			log.Fatalf("      failed to write token: %v", err)
+		}
+		fmt.Println("      token synced from local daemon")
+		if sid != "" {
+			fmt.Printf("      session ID: %s\n", sid[:16])
+		}
+		connectVerifyTunnel(session, reg.ReservedPort, alias)
+		return
+	}
+
+	// Step 6: Install shim (skip if already installed and not forced)
 	needsShim := force || shim.NeedsShimInstall(remoteState)
 	if !needsShim {
 		// Verify the shim file actually exists — cached state can be stale.
@@ -625,8 +772,8 @@ func runConnect(opts connectOpts) {
 	}
 	var installOut string
 	if needsShim {
-		fmt.Printf("[5/7] Installing shim...\n")
-		installCmd := fmt.Sprintf("%s install --port %d", remoteBin, port)
+		fmt.Printf("[6/8] Installing shim...\n")
+		installCmd := fmt.Sprintf("%s install --port %d", remoteBin, reg.ReservedPort)
 		out, err := session.Exec(installCmd)
 		if err != nil {
 			// Shim might already exist, try uninstall then install
@@ -639,7 +786,7 @@ func runConnect(opts connectOpts) {
 		installOut = out
 		fmt.Printf("      %s\n", out)
 	} else {
-		fmt.Println("[5/7] Shim already installed, skipping")
+		fmt.Println("[6/8] Shim already installed, skipping")
 	}
 
 	// Step 5b: Fix PATH if needed — always re-check, don't trust cached state
@@ -658,23 +805,15 @@ func runConnect(opts connectOpts) {
 	} else {
 		pathFixed = true
 	}
-
-	// Step 6: Sync token and session ID
-	fmt.Printf("[6/7] Syncing token and session...\n")
-	if err := shim.WriteRemoteTokenViaSession(session, daemonToken); err != nil {
+	// Step 7: Sync token and session ID
+	fmt.Printf("[7/8] Syncing peer token and session...\n")
+	sessionID, _ := shim.GenerateSessionID()
+	if err := syncRemoteTokenAndSession(session, daemonToken, reg.StateDir, sessionID); err != nil {
 		log.Fatalf("      failed to write token: %v", err)
 	}
 	fmt.Println("      token synced from local daemon")
-
-	sessionID, err := shim.GenerateSessionID()
-	if err != nil {
-		log.Printf("      warning: failed to generate session ID: %v", err)
-	} else {
-		if err := shim.WriteRemoteSessionID(session, sessionID); err != nil {
-			log.Printf("      warning: failed to write session ID: %v", err)
-		} else {
-			fmt.Printf("      session ID: %s\n", sessionID[:16])
-		}
+	if sessionID != "" {
+		fmt.Printf("      session ID: %s\n", sessionID[:16])
 	}
 
 	// Update remote deploy state
@@ -696,36 +835,41 @@ func runConnect(opts connectOpts) {
 		ShimTarget:    shimTarget,
 		PathFixed:     pathFixed,
 	}
-	// Preserve existing codex state when not using --codex.
-	if remoteState != nil && remoteState.Codex != nil && !opts.codex {
+	if remoteState != nil {
+		newState.Notify = remoteState.Notify
 		newState.Codex = remoteState.Codex
 	}
 	if err := shim.WriteRemoteState(session, newState); err != nil {
 		log.Printf("      warning: could not write remote deploy state: %v", err)
 	}
 
-	// Step 7: Verify tunnel
-	connectVerifyTunnel(session, port, host)
+	// Step 8: Verify tunnel
+	connectVerifyTunnel(session, reg.ReservedPort, alias)
 
 	// Notification bridge setup (unless --no-notify)
-	if !opts.noNotify {
-		connectNotifySetup(session, port, daemonToken, newState)
+	if opts.noNotify {
+		// Notify assets are host-scoped, so --no-notify must remain a pure skip.
+		fmt.Println()
+		fmt.Println("Notification bridge setup:")
+		fmt.Println("  skipped (--no-notify)")
+	} else if notifyState := connectNotifySetup(session, localPort, reg.ReservedPort, reg.StateDir); notifyState != nil {
+		newState.Notify = notifyState
 		if err := shim.WriteRemoteState(session, newState); err != nil {
-			log.Printf("      warning: could not write remote deploy state: %v", err)
+			log.Printf("      warning: could not update remote deploy state: %v", err)
 		}
 	}
 
 	// Steps 8-11: Codex support (only if --codex flag is set)
 	if opts.codex {
-		codexOk := runConnectCodex(session, opts, needsUpload, newState)
-		if err := shim.WriteRemoteState(session, newState); err != nil {
-			log.Printf("      warning: could not update deploy state: %v", err)
-		}
+		codexOk := runConnectCodex(session, reg.ReservedPort, reg.StateDir, needsUpload, opts.force, newState)
 		if !codexOk {
 			fmt.Println()
 			fmt.Println("Claude shim is ready, but Codex support failed.")
 			fmt.Println("Fix the issues above and re-run: cc-clip connect", host, "--codex")
 			os.Exit(1)
+		}
+		if err := shim.WriteRemoteState(session, newState); err != nil {
+			log.Printf("      warning: could not update remote deploy state: %v", err)
 		}
 	}
 }
@@ -737,7 +881,7 @@ func runConnect(opts connectOpts) {
 // 4. Print Claude Code hook config
 // 5. Detect and configure Codex notify (if ~/.codex exists)
 // 6. Run health probe
-func connectNotifySetup(session *shim.SSHSession, port int, daemonToken string, state *shim.DeployState) {
+func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, stateDir string) *shim.NotifyDeployState {
 	fmt.Println()
 	fmt.Println("Notification bridge setup:")
 
@@ -746,29 +890,34 @@ func connectNotifySetup(session *shim.SSHSession, port int, daemonToken string, 
 	notifyNonce, err := shim.GenerateNotificationNonce()
 	if err != nil {
 		log.Printf("      warning: failed to generate notification nonce: %v", err)
-		return
+		return nil
 	}
 
 	// Register nonce with the local daemon via HTTP
-	if err := registerNonceWithDaemon(port, daemonToken, notifyNonce); err != nil {
+	daemonToken, err := token.ReadTokenFile()
+	if err != nil {
+		log.Printf("      warning: failed to re-read local daemon token: %v", err)
+		return nil
+	}
+	if err := registerNonceWithDaemon(localPort, daemonToken, notifyNonce); err != nil {
 		log.Printf("      warning: failed to register nonce with daemon: %v", err)
-		return
+		return nil
 	}
 	fmt.Printf("      nonce: %s...\n", notifyNonce[:16])
 
 	// Step N2: Write nonce to remote
 	fmt.Println("  [N2] Writing nonce to remote...")
-	if err := shim.WriteRemoteNotificationNonce(session, notifyNonce); err != nil {
+	if err := syncRemoteNotificationNonce(session, notifyNonce, stateDir); err != nil {
 		log.Printf("      warning: failed to write remote nonce: %v", err)
-		return
+		return nil
 	}
 	fmt.Println("      nonce synced")
 
 	// Step N3: Install hook script
 	fmt.Println("  [N3] Installing hook script...")
-	if err := shim.InstallRemoteHookScript(session, port); err != nil {
+	if err := shim.InstallRemoteHookScript(session, remotePort); err != nil {
 		log.Printf("      warning: failed to install hook script: %v", err)
-		return
+		return nil
 	}
 	fmt.Println("      cc-clip-hook installed to ~/.local/bin/cc-clip-hook")
 
@@ -776,7 +925,7 @@ func connectNotifySetup(session *shim.SSHSession, port int, daemonToken string, 
 
 	// Step N4: Install claude wrapper (auto-injects hooks via --settings)
 	fmt.Println("  [N4] Installing claude wrapper...")
-	if err := shim.InstallRemoteClaudeWrapper(session, port); err != nil {
+	if err := shim.InstallRemoteClaudeWrapper(session, remotePort); err != nil {
 		log.Printf("      warning: failed to install claude wrapper: %v", err)
 		fmt.Println("      Falling back to manual hook config:")
 		fmt.Println()
@@ -793,7 +942,7 @@ func connectNotifySetup(session *shim.SSHSession, port int, daemonToken string, 
 	codexInjected := false
 	if shim.RemoteHasCodex(session) {
 		fmt.Println("  [N5] Codex detected, injecting notify config...")
-		if err := shim.EnsureRemoteCodexNotifyConfig(session, port); err != nil {
+		if err := shim.EnsureRemoteCodexNotifyConfig(session, remotePort); err != nil {
 			log.Printf("      warning: codex config injection failed: %v", err)
 		} else {
 			codexInjected = true
@@ -806,20 +955,71 @@ func connectNotifySetup(session *shim.SSHSession, port int, daemonToken string, 
 	// Step N6: Health probe
 	fmt.Println("  [N6] Running notification health probe...")
 	healthVerified := false
-	if err := runNotificationHealthProbe(port, notifyNonce); err != nil {
+	if err := runNotificationHealthProbe(localPort, notifyNonce); err != nil {
 		log.Printf("      warning: health probe failed: %v", err)
 	} else {
 		healthVerified = true
 		fmt.Println("      health probe passed")
 	}
-
-	// Update deploy state
-	state.Notify = &shim.NotifyDeployState{
+	return &shim.NotifyDeployState{
 		Enabled:        true,
 		HookInstalled:  hookInstalled,
 		CodexInjected:  codexInjected,
 		HealthVerified: healthVerified,
 	}
+}
+
+func connectNotifyDisable(session remoteExecutor, stateDir string) error {
+	fmt.Println()
+	fmt.Println("Notification bridge teardown:")
+
+	steps := []struct {
+		label   string
+		success string
+		fn      func() error
+	}{
+		{
+			label:   "Removing notify nonce files",
+			success: "notify state removed",
+			fn: func() error {
+				return removeRemoteNotifyState(session, stateDir)
+			},
+		},
+		{
+			label:   "Removing hook script",
+			success: "hook script removed",
+			fn: func() error {
+				return removeRemoteManagedHookScript(session)
+			},
+		},
+		{
+			label:   "Restoring Claude wrapper",
+			success: "Claude wrapper restored",
+			fn: func() error {
+				return restoreRemoteClaudeBinary(session)
+			},
+		},
+		{
+			label:   "Removing Codex notify config",
+			success: "Codex notify config removed",
+			fn: func() error {
+				return removeRemoteCodexNotifyConfig(session)
+			},
+		},
+	}
+
+	var errs []error
+	for i, step := range steps {
+		fmt.Printf("  [N%d] %s...\n", i+1, step.label)
+		if err := step.fn(); err != nil {
+			fmt.Printf("      warning: %v\n", err)
+			errs = append(errs, err)
+		} else {
+			fmt.Printf("      %s\n", step.success)
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // registerNonceWithDaemon sends the notification nonce to the local daemon
@@ -901,7 +1101,7 @@ func cmdSetup() {
 		log.Fatal("usage: cc-clip setup <host> [--port PORT]")
 	}
 	host := os.Args[2]
-	port := getPort()
+	localPort := getPort()
 
 	// Step 1: Dependencies
 	fmt.Println("[1/4] Checking local dependencies...")
@@ -921,28 +1121,18 @@ func cmdSetup() {
 		fmt.Println("      skipped (not macOS)")
 	}
 
-	// Step 2: SSH config
-	fmt.Printf("[2/4] Configuring SSH for %s...\n", host)
-	changes, err := setup.EnsureSSHConfig(host, port)
-	if err != nil {
-		log.Fatalf("      %v", err)
-	}
-	for _, c := range changes {
-		fmt.Printf("      %s: %s\n", c.Action, c.Detail)
-	}
-
-	// Step 3: Daemon
-	fmt.Println("[3/4] Starting local daemon...")
+	// Step 2: Daemon
+	fmt.Println("[2/4] Starting local daemon...")
 	probeTimeout := envDuration("CC_CLIP_PROBE_TIMEOUT_MS", 500*time.Millisecond)
-	if err := tunnel.Probe(fmt.Sprintf("127.0.0.1:%d", port), probeTimeout); err == nil {
-		fmt.Printf("      daemon already running on :%d\n", port)
+	if err := tunnel.Probe(fmt.Sprintf("127.0.0.1:%d", localPort), probeTimeout); err == nil {
+		fmt.Printf("      daemon already running on :%d\n", localPort)
 	} else if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		exePath, err := os.Executable()
 		if err != nil {
 			log.Fatalf("      cannot determine executable path: %v", err)
 		}
 		exePath, _ = filepath.EvalSymlinks(exePath)
-		if err := service.Install(exePath, port); err != nil {
+		if err := service.Install(exePath, localPort); err != nil {
 			log.Fatalf("      service install failed: %v", err)
 		}
 		if runtime.GOOS == "darwin" {
@@ -956,20 +1146,20 @@ func cmdSetup() {
 		log.Fatal("      daemon not running. Start it first: cc-clip serve")
 	}
 
-	// Step 4: Deploy to remote
-	fmt.Printf("\n[4/4] Deploying to %s...\n", host)
+	// Step 3: Deploy to remote and create managed alias
+	fmt.Printf("\n[3/4] Deploying to %s and creating peer alias...\n", host)
 	runConnect(connectOpts{
 		host:  host,
-		port:  port,
+		port:  localPort,
 		codex: hasFlag("codex"),
 	})
 }
 
 // connectVerifyTunnel verifies the SSH tunnel from the remote side.
-func connectVerifyTunnel(session *shim.SSHSession, port int, host string) {
+func connectVerifyTunnel(session *shim.SSHSession, port int, alias string) {
 	remoteBin := "~/.local/bin/cc-clip"
 
-	fmt.Printf("[7/7] Verifying tunnel from remote...\n")
+	fmt.Printf("[8/8] Verifying tunnel from remote...\n")
 	probeCmd := fmt.Sprintf(
 		"bash -c 'echo >/dev/tcp/127.0.0.1/%d' 2>/dev/null && echo 'tunnel:ok' || echo 'tunnel:fail'",
 		port)
@@ -980,12 +1170,7 @@ func connectVerifyTunnel(session *shim.SSHSession, port int, host string) {
 	} else {
 		fmt.Println("      tunnel not detected (this is normal if no interactive SSH session is open)")
 		fmt.Println("      The tunnel is provided by your SSH connection, not by 'cc-clip connect'.")
-		fmt.Println("      Ensure your SSH session includes RemoteForward:")
-		fmt.Printf("        ssh -R %d:127.0.0.1:%d %s\n", port, port, host)
-		fmt.Println()
-		fmt.Println("      Or add to ~/.ssh/config:")
-		fmt.Printf("        Host %s\n", host)
-		fmt.Printf("            RemoteForward %d 127.0.0.1:%d\n", port, port)
+		fmt.Printf("      Open your managed alias to activate it: ssh %s\n", alias)
 	}
 
 	// Verify remote binary is functional
@@ -994,13 +1179,13 @@ func connectVerifyTunnel(session *shim.SSHSession, port int, host string) {
 	if shimErr != nil {
 		fmt.Printf("      WARNING: remote cc-clip status failed: %s\n", shimOut)
 		fmt.Println("      The remote binary may be missing or broken.")
-		fmt.Println("      Re-run with --force to redeploy: cc-clip connect", host, "--force")
+		fmt.Println("      Re-run with --force to redeploy: cc-clip connect <base-host> --force")
 		os.Exit(1)
 	}
 	fmt.Printf("      %s\n", shimOut)
 
 	fmt.Println()
-	fmt.Println("Setup complete. Ctrl+V in remote Claude Code will paste images from your local clipboard.")
+	fmt.Printf("Setup complete. Open the managed alias with: ssh %s\n", alias)
 }
 
 // prepareBinaryLocal resolves the local binary path without performing remote operations.
@@ -1241,6 +1426,10 @@ func cmdStatus() {
 		}
 	}
 
+	if ident, err := peer.LoadOrCreateLocalIdentity(); err == nil {
+		fmt.Printf("peer:    %s (%s)\n", ident.Label, ident.ID[:12])
+	}
+
 	fmt.Printf("out-dir: %s\n", tunnel.DefaultOutDir())
 }
 
@@ -1340,22 +1529,281 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+func shimShellQuote(s string) string {
+	return shellutil.RemoteShellPath(s)
+}
+
 // --- Codex support ---
 
-const codexStateDir = "~/.cache/cc-clip/codex"
+const (
+	legacyStateDir      = "~/.cache/cc-clip"
+	legacyCodexStateDir = legacyStateDir + "/codex"
+)
+
+func remoteCodexStateDirs(session remoteExecutor) []string {
+	stateDirs := []string{legacyCodexStateDir}
+	out, err := session.Exec(`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 -type d -name codex -print 2>/dev/null`)
+	if err != nil {
+		return stateDirs
+	}
+	return appendUniqueStrings(stateDirs, parseRemoteCodexStateDirs(out)...)
+}
+
+func remoteHasRemainingCodexState(session *shim.SSHSession) bool {
+	out, err := session.Exec(`find "$HOME/.cache/cc-clip" -path '*/codex/display' -print -quit 2>/dev/null`)
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+func localPeerRegistration(session *shim.SSHSession, remoteBin string) (*peer.Registration, error) {
+	ident, err := peer.LoadOrCreateLocalIdentity()
+	if err != nil {
+		return nil, err
+	}
+	return lookupPeerReservation(session, remoteBin, ident.ID)
+}
+
+func lookupPeerReservation(session *shim.SSHSession, remoteBin, peerID string) (*peer.Registration, error) {
+	out, err := session.Exec(fmt.Sprintf("%s peer show --peer-id %s 2>/dev/null || true", remoteBin, shimShellQuote(peerID)))
+	if err != nil {
+		return nil, err
+	}
+	return parsePeerRegistration(out)
+}
+
+func targetRemoteCodexStateDir(reg *peer.Registration) string {
+	if reg == nil || strings.TrimSpace(reg.StateDir) == "" {
+		return legacyCodexStateDir
+	}
+	return reg.StateDir + "/codex"
+}
+
+func codexCleanupStateDirs(reg *peer.Registration) []string {
+	return appendUniqueStrings([]string{legacyCodexStateDir}, targetRemoteCodexStateDir(reg))
+}
+
+func compatStateDirs(stateDir string) []string {
+	return appendUniqueStrings(nil, stateDir, legacyStateDir)
+}
+
+func syncRemoteTokenAndSession(session *shim.SSHSession, tok, stateDir, sessionID string) error {
+	for _, dir := range compatStateDirs(stateDir) {
+		if err := shim.WriteRemoteTokenViaSession(session, tok, dir); err != nil {
+			return err
+		}
+		if sessionID != "" {
+			if err := shim.WriteRemoteSessionID(session, sessionID, dir); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func syncRemoteNotificationNonce(session *shim.SSHSession, nonce, stateDir string) error {
+	for _, dir := range compatStateDirs(stateDir) {
+		if err := shim.WriteRemoteNotificationNonce(session, nonce, dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parsePeerRegistration(out string) (*peer.Registration, error) {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	var reg peer.Registration
+	if err := json.Unmarshal([]byte(out), &reg); err != nil {
+		return nil, err
+	}
+	return &reg, nil
+}
+
+func ensureRemotePeerRegistrySupport(session remoteExecutor, remoteBin string) error {
+	out, err := session.Exec(fmt.Sprintf("%s peer 2>&1 || true", remoteBin))
+	if err != nil {
+		return fmt.Errorf("failed to probe remote peer support: %w", err)
+	}
+	if strings.Contains(out, "usage: cc-clip peer") {
+		return nil
+	}
+	return fmt.Errorf("remote binary predates peer registry support; re-run without --token-only to redeploy it")
+}
+
+func parseRemoteCodexStateDirs(out string) []string {
+	var stateDirs []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		stateDirs = append(stateDirs, line)
+	}
+	return appendUniqueStrings(nil, stateDirs...)
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	seen := make(map[string]struct{}, len(dst)+len(values))
+	for _, value := range dst {
+		if value == "" {
+			continue
+		}
+		seen[value] = struct{}{}
+	}
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		dst = append(dst, value)
+	}
+	return dst
+}
+
+type remoteExecutor interface {
+	Exec(cmd string) (string, error)
+}
+
+func removeRemoteNotifyState(session remoteExecutor, stateDir string) error {
+	var errs []error
+
+	for _, dir := range compatStateDirs(stateDir) {
+		cmd := fmt.Sprintf("rm -f %s %s",
+			shimShellQuote(dir+"/notify.nonce"),
+			shimShellQuote(dir+"/notify-health.log"),
+		)
+		if _, err := session.Exec(cmd); err != nil {
+			errs = append(errs, fmt.Errorf("remove notify state from %s: %w", dir, err))
+		}
+	}
+
+	// Notifications are host-scoped because the hook script, Claude wrapper,
+	// and Codex config are shared. Remove any peer-scoped leftovers as well.
+	if _, err := session.Exec(`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 \( -name 'notify.nonce' -o -name 'notify-health.log' \) -delete 2>/dev/null || true`); err != nil {
+		errs = append(errs, fmt.Errorf("remove peer notify state: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+func removeRemoteManagedHookScript(session remoteExecutor) error {
+	out, err := session.Exec("head -5 ~/.local/bin/cc-clip-hook 2>/dev/null || true")
+	if err != nil {
+		return fmt.Errorf("inspect hook script: %w", err)
+	}
+	if !strings.Contains(out, "cc-clip-hook") {
+		return nil
+	}
+	if _, err := session.Exec(fmt.Sprintf("rm -f %s", shimShellQuote("~/.local/bin/cc-clip-hook"))); err != nil {
+		return fmt.Errorf("remove hook script: %w", err)
+	}
+	return nil
+}
+
+func restoreRemoteClaudeBinary(session remoteExecutor) error {
+	out, err := session.Exec("head -5 ~/.local/bin/claude 2>/dev/null || true")
+	if err != nil {
+		return fmt.Errorf("inspect Claude wrapper: %w", err)
+	}
+	if !strings.Contains(out, "cc-clip claude wrapper") {
+		return nil
+	}
+
+	wrapperPath := shimShellQuote("~/.local/bin/claude")
+	backupPath := shimShellQuote("~/.local/bin/claude.cc-clip-bak")
+	restoreCmd := fmt.Sprintf("if [ -f %s ]; then mv -f %s %s; else rm -f %s; fi",
+		backupPath, backupPath, wrapperPath, wrapperPath)
+	if _, err := session.Exec(restoreCmd); err != nil {
+		return fmt.Errorf("restore Claude wrapper: %w", err)
+	}
+	return nil
+}
+
+func removeRemoteCodexNotifyConfig(session remoteExecutor) error {
+	const (
+		markerStart = "# >>> cc-clip notify (do not edit) >>>"
+		markerEnd   = "# <<< cc-clip notify (do not edit) <<<"
+		configPath  = "~/.codex/config.toml"
+	)
+
+	sedCmd := fmt.Sprintf(
+		`sed -i.cc-clip-bak '/%s/,/%s/d' %s 2>/dev/null || true; rm -f %s.cc-clip-bak`,
+		sedPatternEscape(markerStart), sedPatternEscape(markerEnd), configPath, configPath,
+	)
+	if _, err := session.Exec(sedCmd); err != nil {
+		return fmt.Errorf("remove Codex notify config: %w", err)
+	}
+	return nil
+}
+
+func sedPatternEscape(s string) string {
+	replacer := strings.NewReplacer(
+		"/", `\/`,
+		".", `\.`,
+		"[", `\[`,
+		"]", `\]`,
+		"(", `\(`,
+		")", `\)`,
+		"*", `\*`,
+		"+", `\+`,
+		"?", `\?`,
+		"{", `\{`,
+		"}", `\}`,
+		"^", `\^`,
+		"$", `\$`,
+	)
+	return replacer.Replace(s)
+}
+
+func cleanupPeerRemoteState(session remoteExecutor, stateDir string) error {
+	codexStateDir := stateDir + "/codex"
+	stopBridgeRemote(session, codexStateDir)
+	if err := xvfb.StopRemote(session, codexStateDir); err != nil {
+		return fmt.Errorf("stop peer xvfb: %w", err)
+	}
+	if _, err := session.Exec(fmt.Sprintf("rm -rf %s", shimShellQuote(stateDir))); err != nil {
+		return fmt.Errorf("remove peer state dir: %w", err)
+	}
+	return nil
+}
+
+func cleanupAndReleasePeer(session *shim.SSHSession, remoteBin, peerID string) (*peer.Registration, error) {
+	reg, err := shim.LookupPeerViaSession(session, remoteBin, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("lookup peer lease: %w", err)
+	}
+	stateDir := strings.TrimSpace(reg.StateDir)
+	if stateDir == "" {
+		stateDir = legacyStateDir + "/peers/" + peerID
+	}
+	if err := cleanupPeerRemoteState(session, stateDir); err != nil {
+		return nil, fmt.Errorf("cleanup peer state: %w", err)
+	}
+	released, err := shim.ReleasePeerViaSession(session, remoteBin, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("release peer lease: %w", err)
+	}
+	if strings.TrimSpace(released.StateDir) == "" {
+		released.StateDir = stateDir
+	}
+	return &released, nil
+}
+
+func bestEffortReleasePeer(session *shim.SSHSession, remoteBin, peerID string, allowRelease bool) {
+	if !allowRelease {
+		return
+	}
+	_, _ = cleanupAndReleasePeer(session, remoteBin, peerID)
+}
 
 // runConnectCodex executes steps 8-11 of the Codex deploy flow.
 // Returns true on success, false on failure (Claude path is preserved).
-func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded bool, state *shim.DeployState) bool {
-	port := opts.port
-
-	if opts.tokenOnly {
-		fmt.Println("[8/11] Skipping Codex setup (--token-only)")
-		fmt.Println("[9/11] Skipping (--token-only)")
-		fmt.Println("[10/11] Skipping (--token-only)")
-		fmt.Println("[11/11] Skipping (--token-only)")
-		return true
-	}
+func runConnectCodex(session *shim.SSHSession, remotePort int, stateDir string, binaryUploaded bool, force bool, state *shim.DeployState) bool {
+	codexStateDir := stateDir + "/codex"
 
 	// Step 8: Codex preflight
 	fmt.Println("[8/11] Codex preflight...")
@@ -1372,13 +1820,13 @@ func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded 
 	} else {
 		fmt.Println("      Xvfb available")
 	}
-	session.Exec(fmt.Sprintf("mkdir -p %s", codexStateDir))
+	session.Exec(fmt.Sprintf("mkdir -p %s", shimShellQuote(codexStateDir)))
 
 	// --force: tear down both bridge and Xvfb so they restart fresh.
 	// This handles port changes, display drift, and stale state.
-	if opts.force {
+	if force {
 		fmt.Println("      --force: stopping existing Codex runtime")
-		stopBridgeRemote(session)
+		stopBridgeRemote(session, codexStateDir)
 		xvfb.StopRemote(session, codexStateDir)
 	}
 
@@ -1395,19 +1843,19 @@ func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded 
 	// Step 10: Start or reuse x11-bridge
 	fmt.Println("[10/11] Starting x11-bridge...")
 
-	// Unconditionally restart bridge if binary was uploaded or --force was used.
-	needsBridgeRestart := binaryUploaded || opts.force
+	// Restart the bridge whenever its effective runtime configuration changes.
+	needsBridgeRestart := binaryUploaded || force || !bridgeConfiguredForPort(session, codexStateDir, remotePort)
 	if needsBridgeRestart {
-		stopBridgeRemote(session)
+		stopBridgeRemote(session, codexStateDir)
 	}
 
-	if !needsBridgeRestart && isBridgeHealthy(session) {
+	if !needsBridgeRestart && isBridgeHealthy(session, codexStateDir) {
 		fmt.Println("      x11-bridge already running, reusing")
 	} else {
 		// Stop any existing bridge first.
-		stopBridgeRemote(session)
+		stopBridgeRemote(session, codexStateDir)
 
-		if err := startBridgeRemote(session, xvfbState.Display, port); err != nil {
+		if err := startBridgeRemote(session, xvfbState.Display, remotePort, stateDir); err != nil {
 			fmt.Printf("      x11-bridge start failed: %v\n", err)
 			dumpRemoteLog(session, codexStateDir+"/bridge.log")
 			return false
@@ -1417,18 +1865,18 @@ func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded 
 
 	// Step 11: Inject DISPLAY marker + update state
 	fmt.Println("[11/11] Injecting DISPLAY marker...")
-	displayFixed := false
 	if err := shim.FixDisplaySession(session); err != nil {
 		fmt.Printf("      DISPLAY marker injection failed: %v\n", err)
 		return false
 	}
-	displayFixed = true
 	fmt.Println("      DISPLAY marker injected")
 
-	state.Codex = &shim.CodexDeployState{
-		Enabled:      true,
-		Mode:         "x11-bridge",
-		DisplayFixed: displayFixed,
+	if state != nil {
+		state.Codex = &shim.CodexDeployState{
+			Enabled:      true,
+			Mode:         "x11-bridge",
+			DisplayFixed: true,
+		}
 	}
 
 	fmt.Println()
@@ -1437,14 +1885,20 @@ func runConnectCodex(session *shim.SSHSession, opts connectOpts, binaryUploaded 
 }
 
 // startBridgeRemote starts the x11-bridge daemon on the remote.
-func startBridgeRemote(session *shim.SSHSession, display string, port int) error {
+func startBridgeRemote(session remoteExecutor, display string, port int, stateDir string) error {
+	codexStateDir := stateDir + "/codex"
 	startScript := fmt.Sprintf(
-		`nohup env DISPLAY=":%s" ~/.local/bin/cc-clip x11-bridge --display ":%s" --port %d > %s/bridge.log 2>&1 < /dev/null &
-echo $! > %s/bridge.pid
+		`nohup env DISPLAY=":%s" CC_CLIP_STATE_DIR=%s ~/.local/bin/cc-clip x11-bridge --display ":%s" --port %d > %s 2>&1 < /dev/null &
+echo $! > %s
+printf '%d\n' > %s
 sleep 0.3
-kill -0 $(cat %s/bridge.pid 2>/dev/null) 2>/dev/null && echo 'bridge:ok' || echo 'bridge:fail'`,
-		display, display, port,
-		codexStateDir, codexStateDir, codexStateDir,
+kill -0 $(cat %s 2>/dev/null) 2>/dev/null && echo 'bridge:ok' || echo 'bridge:fail'`,
+		display, shimShellQuote(stateDir), display, port,
+		shimShellQuote(codexStateDir+"/bridge.log"),
+		shimShellQuote(codexStateDir+"/bridge.pid"),
+		port,
+		shimShellQuote(codexStateDir+"/bridge.port"),
+		shimShellQuote(codexStateDir+"/bridge.pid"),
 	)
 	out, err := session.Exec(startScript)
 	if err != nil {
@@ -1457,31 +1911,45 @@ kill -0 $(cat %s/bridge.pid 2>/dev/null) 2>/dev/null && echo 'bridge:ok' || echo
 }
 
 // stopBridgeRemote stops the x11-bridge on the remote (safe: verifies command).
-func stopBridgeRemote(session *shim.SSHSession) {
+func stopBridgeRemote(session remoteExecutor, codexStateDir string) {
 	stopScript := fmt.Sprintf(
-		`pid=$(cat %s/bridge.pid 2>/dev/null) && \
+		`pid=$(cat %s 2>/dev/null) && \
 [ -n "$pid" ] && \
 ps -p "$pid" -o args= 2>/dev/null | grep -q 'cc-clip x11-bridge' && \
 kill "$pid" 2>/dev/null && \
 sleep 0.5 && \
 kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null; \
-rm -f %s/bridge.pid; true`,
-		codexStateDir, codexStateDir,
+ rm -f %s %s; true`,
+		shimShellQuote(codexStateDir+"/bridge.pid"),
+		shimShellQuote(codexStateDir+"/bridge.pid"),
+		shimShellQuote(codexStateDir+"/bridge.port"),
 	)
 	session.Exec(stopScript)
+}
+
+func bridgeConfiguredForPort(session remoteExecutor, codexStateDir string, port int) bool {
+	out, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", shimShellQuote(codexStateDir+"/bridge.port")))
+	if err != nil {
+		return false
+	}
+	got, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return false
+	}
+	return got == port
 }
 
 // isBridgeHealthy checks if x11-bridge is running on the remote.
 // Verifies both PID liveness and command name to avoid false positives
 // from stale PID files whose PID was reused by an unrelated process.
-func isBridgeHealthy(session *shim.SSHSession) bool {
+func isBridgeHealthy(session remoteExecutor, codexStateDir string) bool {
 	checkScript := fmt.Sprintf(
-		`pid=$(cat %s/bridge.pid 2>/dev/null) && \
+		`pid=$(cat %s 2>/dev/null) && \
 [ -n "$pid" ] && \
 kill -0 "$pid" 2>/dev/null && \
 ps -p "$pid" -o args= 2>/dev/null | grep -q 'cc-clip x11-bridge' && \
 echo 'ok' || echo 'no'`,
-		codexStateDir,
+		shimShellQuote(codexStateDir+"/bridge.pid"),
 	)
 	out, _ := session.Exec(checkScript)
 	return strings.TrimSpace(out) == "ok"
@@ -1489,7 +1957,7 @@ echo 'ok' || echo 'no'`,
 
 // dumpRemoteLog prints the last 20 lines of a remote log file.
 func dumpRemoteLog(session *shim.SSHSession, logPath string) {
-	out, err := session.Exec(fmt.Sprintf("tail -20 %s 2>/dev/null", logPath))
+	out, err := session.Exec(fmt.Sprintf("tail -20 %s 2>/dev/null", shimShellQuote(logPath)))
 	if err == nil && out != "" {
 		fmt.Println("      --- log ---")
 		for _, line := range strings.Split(out, "\n") {
@@ -1565,12 +2033,12 @@ func parseCodexNotifyPayload(payload string) (daemon.GenericMessagePayload, erro
 // postGenericNotification sends a generic notification to the local cc-clip daemon.
 // It reads the notification nonce from ~/.cache/cc-clip/notify.nonce for auth.
 func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
-	home, err := os.UserHomeDir()
+	tokenDir, err := token.TokenDir()
 	if err != nil {
-		return fmt.Errorf("cannot determine home directory: %w", err)
+		return fmt.Errorf("cannot determine token dir: %w", err)
 	}
 
-	nonceFile := filepath.Join(home, ".cache", "cc-clip", "notify.nonce")
+	nonceFile := filepath.Join(tokenDir, "notify.nonce")
 	nonceBytes, err := os.ReadFile(nonceFile)
 	if err != nil {
 		return fmt.Errorf("cannot read nonce file %s: %w", nonceFile, err)
@@ -1615,14 +2083,63 @@ func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
 	return nil
 }
 
+func cmdPeer() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: cc-clip peer <reserve|release|show> [flags]")
+	}
+
+	subcmd := os.Args[2]
+	fs := flag.NewFlagSet("peer", flag.ExitOnError)
+	peerID := fs.String("peer-id", "", "stable local peer id")
+	label := fs.String("label", "", "peer label")
+	rangeStart := fs.Int("range-start", peer.DefaultRangeStart, "registry port range start")
+	rangeEnd := fs.Int("range-end", peer.DefaultRangeEnd, "registry port range end")
+	_ = fs.Parse(os.Args[3:])
+
+	if *peerID == "" {
+		log.Fatal("peer failed: --peer-id is required")
+	}
+
+	baseDir, err := peer.BaseDir()
+	if err != nil {
+		log.Fatalf("peer failed: %v", err)
+	}
+
+	var reg peer.Registration
+	switch subcmd {
+	case "reserve":
+		if strings.TrimSpace(*label) == "" {
+			log.Fatal("peer reserve failed: --label is required")
+		}
+		reg, err = peer.ReservePort(baseDir, *peerID, *label, *rangeStart, *rangeEnd)
+	case "release":
+		reg, err = peer.ReleasePort(baseDir, *peerID)
+	case "show":
+		reg, err = peer.Lookup(baseDir, *peerID)
+	default:
+		log.Fatalf("unknown peer subcommand: %s", subcmd)
+	}
+	if err != nil {
+		log.Fatalf("peer %s failed: %v", subcmd, err)
+	}
+
+	data, err := json.Marshal(reg)
+	if err != nil {
+		log.Fatalf("peer %s failed: %v", subcmd, err)
+	}
+	fmt.Println(string(data))
+}
+
 // cmdX11Bridge runs the X11 clipboard bridge daemon (internal command).
 func cmdX11Bridge() {
 	display := getFlag("display", os.Getenv("DISPLAY"))
 	port := getPort()
 
-	home, _ := os.UserHomeDir()
-	tokenDir := filepath.Join(home, ".cache", "cc-clip")
-	tokenFile := tokenDir + "/session.token"
+	tokenDir, err := token.TokenDir()
+	if err != nil {
+		log.Fatalf("x11-bridge: cannot determine token dir: %v", err)
+	}
+	tokenFile := filepath.Join(tokenDir, "session.token")
 
 	if display == "" {
 		log.Fatal("x11-bridge: --display or DISPLAY env required")

@@ -119,6 +119,12 @@ func TokenDir() (string, error) {
 	if TokenDirOverride != "" {
 		return TokenDirOverride, os.MkdirAll(TokenDirOverride, 0700)
 	}
+	// CC_CLIP_STATE_DIR is set by the shell entry script on the remote so that
+	// peer-scoped processes (x11-bridge, cc-clip notify) resolve tokens from
+	// their own state directory. It is never set on the local machine.
+	if env := os.Getenv("CC_CLIP_STATE_DIR"); env != "" {
+		return env, os.MkdirAll(env, 0700)
+	}
 	if env := os.Getenv("CC_CLIP_TOKEN_DIR"); env != "" {
 		return env, os.MkdirAll(env, 0700)
 	}

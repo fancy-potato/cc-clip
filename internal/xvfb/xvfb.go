@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/shunmei/cc-clip/internal/shellutil"
 )
 
 // RemoteExecutor is the interface for running commands on a remote host.
@@ -61,7 +63,7 @@ func IsHealthy(session RemoteExecutor, stateDir string) (*State, bool) {
 	displayFile := stateDir + "/display"
 
 	// Read PID
-	pidStr, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", pidFile))
+	pidStr, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", shellQuote(pidFile)))
 	if err != nil {
 		return nil, false
 	}
@@ -76,7 +78,7 @@ func IsHealthy(session RemoteExecutor, stateDir string) (*State, bool) {
 	}
 
 	// Read display number
-	displayStr, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", displayFile))
+	displayStr, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", shellQuote(displayFile)))
 	if err != nil {
 		return nil, false
 	}
@@ -93,7 +95,7 @@ func IsHealthy(session RemoteExecutor, stateDir string) (*State, bool) {
 
 	// Check X socket exists
 	socketPath := SocketPath(display)
-	_, err = session.Exec(fmt.Sprintf("test -S %s", socketPath))
+	_, err = session.Exec(fmt.Sprintf("test -S %s", shellQuote(socketPath)))
 	if err != nil {
 		return nil, false
 	}
@@ -105,8 +107,10 @@ func IsHealthy(session RemoteExecutor, stateDir string) (*State, bool) {
 // It is idempotent: missing files do not cause errors.
 func CleanStale(session RemoteExecutor, stateDir string) error {
 	_, err := session.Exec(fmt.Sprintf(
-		"rm -f %s/xvfb.pid %s/display %s/xvfb.log",
-		stateDir, stateDir, stateDir,
+		"rm -f %s %s %s",
+		shellQuote(stateDir+"/xvfb.pid"),
+		shellQuote(stateDir+"/display"),
+		shellQuote(stateDir+"/xvfb.log"),
 	))
 	if err != nil {
 		return fmt.Errorf("failed to clean stale Xvfb state in %s: %w", stateDir, err)
@@ -194,23 +198,23 @@ func StartRemote(session RemoteExecutor, stateDir string) (*State, error) {
 
 	// Step 4: Start Xvfb via nohup + -displayfd
 	startScript := fmt.Sprintf(`mkdir -p %s
-rm -f %s/display
+rm -f %s
 nohup Xvfb -displayfd 1 -screen 0 1x1x24 -listen tcp \
-  > %s/display \
-  2> %s/xvfb.log \
+  > %s \
+  2> %s \
   < /dev/null &
-echo $! > %s/xvfb.pid
+echo $! > %s
 for i in 1 2 3 4 5; do
-  [ -s %s/display ] && break
+  [ -s %s ] && break
   sleep 0.2
 done
-cat %s/display`,
-		stateDir,
-		stateDir,
-		stateDir, stateDir,
-		stateDir,
-		stateDir,
-		stateDir,
+cat %s`,
+		shellQuote(stateDir),
+		shellQuote(stateDir+"/display"),
+		shellQuote(stateDir+"/display"), shellQuote(stateDir+"/xvfb.log"),
+		shellQuote(stateDir+"/xvfb.pid"),
+		shellQuote(stateDir+"/display"),
+		shellQuote(stateDir+"/display"),
 	)
 
 	displayOut, err := session.Exec(startScript)
@@ -225,7 +229,7 @@ cat %s/display`,
 	}
 
 	// Read PID
-	pidStr, err := session.Exec(fmt.Sprintf("cat %s/xvfb.pid", stateDir))
+	pidStr, err := session.Exec(fmt.Sprintf("cat %s", shellQuote(stateDir+"/xvfb.pid")))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Xvfb PID: %w", err)
 	}
@@ -238,7 +242,7 @@ cat %s/display`,
 	socketPath := SocketPath(display)
 	var socketErr error
 	for i := 0; i < 5; i++ {
-		_, socketErr = session.Exec(fmt.Sprintf("test -S %s", socketPath))
+		_, socketErr = session.Exec(fmt.Sprintf("test -S %s", shellQuote(socketPath)))
 		if socketErr == nil {
 			break
 		}
@@ -259,7 +263,7 @@ func StopRemote(session RemoteExecutor, stateDir string) error {
 	pidFile := stateDir + "/xvfb.pid"
 
 	// Step 1: Read PID
-	pidStr, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", pidFile))
+	pidStr, err := session.Exec(fmt.Sprintf("cat %s 2>/dev/null", shellQuote(pidFile)))
 	if err != nil {
 		// No PID file: nothing to stop, just clean up
 		return CleanStale(session, stateDir)
@@ -307,4 +311,8 @@ func StopRemote(session RemoteExecutor, stateDir string) error {
 
 	// Step 4: Clean state files
 	return CleanStale(session, stateDir)
+}
+
+func shellQuote(s string) string {
+	return shellutil.RemoteShellPath(s)
 }

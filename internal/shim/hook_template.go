@@ -9,9 +9,10 @@ const hookTemplate = `#!/usr/bin/env bash
 set -euo pipefail
 
 _CC_CLIP_PORT="${CC_CLIP_PORT:-%d}"
-_CC_CLIP_NONCE_FILE="${HOME}/.cache/cc-clip/notify.nonce"
+_CC_CLIP_STATE_DIR="${CC_CLIP_STATE_DIR:-${HOME}/.cache/cc-clip}"
+_CC_CLIP_NONCE_FILE="${_CC_CLIP_STATE_DIR}/notify.nonce"
 _CC_CLIP_HOST_ALIAS="${CC_CLIP_HOST_ALIAS:-$(hostname -s)}"
-_CC_CLIP_HEALTH_FILE="${HOME}/.cache/cc-clip/notify-health.log"
+_CC_CLIP_HEALTH_FILE="${_CC_CLIP_STATE_DIR}/notify-health.log"
 
 _nonce=""
 if [ -f "$_CC_CLIP_NONCE_FILE" ]; then

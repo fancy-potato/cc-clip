@@ -397,7 +397,10 @@ func TestDisplayBlockContainsDISPLAYLogic(t *testing.T) {
 
 	expectedSnippets := []string{
 		`DISPLAY`,
-		`$HOME/.cache/cc-clip/codex/display`,
+		`CC_CLIP_STATE_DIR`,
+		`$HOME/.cache/cc-clip`,
+		`_cc_clip_display_file`,
+		`/codex/display`,
 		`_cc_clip_display`,
 		`_cc_clip_num`,
 		`export DISPLAY="127.0.0.1:${_cc_clip_num}"`,
@@ -413,6 +416,14 @@ func TestDisplayBlockContainsDISPLAYLogic(t *testing.T) {
 	// Verify Unix socket check is NOT present (we use TCP now)
 	if strings.Contains(block, `/tmp/.X11-unix/X`) {
 		t.Error("displayBlock should not check Unix socket path; TCP loopback is used for Codex sandbox compatibility")
+	}
+}
+
+func TestDisplayBlockDoesNotScanPeerDisplaysWithoutStateDir(t *testing.T) {
+	block := displayBlock()
+
+	if strings.Contains(block, `"$HOME"/.cache/cc-clip/peers/*/codex/display`) {
+		t.Fatalf("displayBlock should not scan peer display files without an explicit state dir, got %q", block)
 	}
 }
 

@@ -27,11 +27,11 @@ func TestParseUnameOutput(t *testing.T) {
 	// Test the arch detection parsing logic that DetectRemoteArchViaSession uses.
 	// We extract the parsing to verify it handles various uname outputs correctly.
 	tests := []struct {
-		name       string
-		output     string
-		wantOS     string
-		wantArch   string
-		wantErr    bool
+		name     string
+		output   string
+		wantOS   string
+		wantArch string
+		wantErr  bool
 	}{
 		{
 			name:     "linux amd64",
@@ -116,14 +116,15 @@ func TestConnArgsWithControlPath(t *testing.T) {
 		controlPath: "/tmp/cc-clip-ssh-test",
 	}
 	args := s.connArgs()
-	if len(args) != 2 {
-		t.Fatalf("expected 2 args, got %d: %v", len(args), args)
-	}
-	if args[0] != "-o" {
-		t.Errorf("args[0] = %q, want '-o'", args[0])
-	}
-	if args[1] != "ControlPath=/tmp/cc-clip-ssh-test" {
-		t.Errorf("args[1] = %q, want ControlPath=...", args[1])
+	for _, want := range []string{
+		"RemoteCommand=none",
+		"RequestTTY=no",
+		"ClearAllForwardings=yes",
+		"ControlPath=/tmp/cc-clip-ssh-test",
+	} {
+		if !contains(args, want) {
+			t.Fatalf("expected conn args to contain %q, got %v", want, args)
+		}
 	}
 }
 
@@ -134,14 +135,14 @@ func TestConnArgsWithoutControlPath(t *testing.T) {
 		controlPath: "",
 	}
 	args := s.connArgs()
-	if len(args) != 2 {
-		t.Fatalf("expected 2 args, got %d: %v", len(args), args)
-	}
-	if args[0] != "-o" {
-		t.Errorf("args[0] = %q, want '-o'", args[0])
-	}
-	if args[1] != "ClearAllForwardings=yes" {
-		t.Errorf("args[1] = %q, want 'ClearAllForwardings=yes'", args[1])
+	for _, want := range []string{
+		"RemoteCommand=none",
+		"RequestTTY=no",
+		"ClearAllForwardings=yes",
+	} {
+		if !contains(args, want) {
+			t.Fatalf("expected conn args to contain %q, got %v", want, args)
+		}
 	}
 }
 
@@ -201,11 +202,46 @@ func TestCodexNotifyManagedBlockUsesConfigArray(t *testing.T) {
 	}
 }
 
-func TestCodexNotifyManagedBlockNonDefaultPort(t *testing.T) {
-	block := codexNotifyManagedBlock("start", "end", 9999)
-	if !strings.Contains(block, "CC_CLIP_PORT=9999") {
-		t.Fatalf("expected CC_CLIP_PORT=9999 for non-default port, got %q", block)
+func TestCodexNotifyManagedBlockOverridesNonDefaultPort(t *testing.T) {
+	block := codexNotifyManagedBlock("start", "end", 18340)
+	if !strings.Contains(block, `notify = ["env", "CC_CLIP_PORT=18340", "cc-clip", "notify", "--from-codex-stdin"]`) {
+		t.Fatalf("expected non-default port override, got %q", block)
 	}
+}
+
+func TestRemoteShellPathExpandsHomeRelativePaths(t *testing.T) {
+	got := remoteShellPath("~/.local/bin/cc-clip")
+	if got != `"$HOME/.local/bin/cc-clip"` {
+		t.Fatalf("unexpected home-relative path expression: %q", got)
+	}
+}
+
+func TestRemoteShellPathQuotesAbsolutePaths(t *testing.T) {
+	got := remoteShellPath("/tmp/cc clip/cc-clip")
+	if got != `'/tmp/cc clip/cc-clip'` {
+		t.Fatalf("unexpected absolute path expression: %q", got)
+	}
+}
+
+func TestUniqueUploadTempPathUsesDistinctSuffixes(t *testing.T) {
+	first := uniqueUploadTempPath("~/.local/bin/cc-clip")
+	second := uniqueUploadTempPath("~/.local/bin/cc-clip")
+
+	if first == second {
+		t.Fatalf("expected distinct temp paths, got %q", first)
+	}
+	if !strings.HasPrefix(first, "~/.local/bin/cc-clip.cc-clip-upload-") {
+		t.Fatalf("unexpected temp path prefix %q", first)
+	}
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 // parseUnameOutput is a testable extraction of the uname parsing logic.
