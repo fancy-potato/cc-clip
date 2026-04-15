@@ -50,7 +50,7 @@ exit
 
 ## Step 1: Install `cc-clip.exe`
 
-1. Download the latest Windows release from [GitHub Releases](https://github.com/ShunmeiCho/cc-clip/releases)
+1. Download the latest Windows release from [GitHub Releases](https://github.com/fancy-potato/cc-clip/releases)
 2. Pick the correct archive:
    - `cc-clip_<version>_windows_amd64.zip`
    - `cc-clip_<version>_windows_arm64.zip`

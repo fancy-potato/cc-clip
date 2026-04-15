@@ -5,7 +5,7 @@ Thanks for your interest in contributing to cc-clip!
 ## Getting Started
 
 ```bash
-git clone https://github.com/ShunmeiCho/cc-clip.git
+git clone https://github.com/fancy-potato/cc-clip.git
 cd cc-clip
 make build
 make test
@@ -40,7 +40,7 @@ make release-local  # Cross-compile for local testing only (NOT for GitHub relea
 
 ### Bug Reports
 
-Open an [issue](https://github.com/ShunmeiCho/cc-clip/issues) with:
+Open an [issue](https://github.com/fancy-potato/cc-clip/issues) with:
 - cc-clip version (`cc-clip version`)
 - Local OS and remote OS/arch
 - Steps to reproduce

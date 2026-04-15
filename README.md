@@ -6,10 +6,10 @@
   <b>Paste images &amp; receive notifications across SSH — remote Claude Code &amp; Codex CLI feel local.</b>
 </p>
 <p align="center">
-  <a href="https://github.com/ShunmeiCho/cc-clip/releases"><img src="https://img.shields.io/github/v/release/ShunmeiCho/cc-clip?color=D97706" alt="Release"></a>
+  <a href="https://github.com/fancy-potato/cc-clip/releases"><img src="https://img.shields.io/github/v/release/fancy-potato/cc-clip?color=D97706" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
   <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.25+-00ADD8.svg" alt="Go"></a>
-  <a href="https://github.com/ShunmeiCho/cc-clip/stargazers"><img src="https://img.shields.io/github/stars/ShunmeiCho/cc-clip?style=social" alt="Stars"></a>
+  <a href="https://github.com/fancy-potato/cc-clip/stargazers"><img src="https://img.shields.io/github/stars/fancy-potato/cc-clip?style=social" alt="Stars"></a>
 </p>
 
 <p align="center">
@@ -711,12 +711,12 @@ See [Troubleshooting Guide](docs/troubleshooting.md) for detailed diagnostics, o
 
 ## Contributing
 
-Contributions welcome! For bug reports and feature requests, [open an issue](https://github.com/ShunmeiCho/cc-clip/issues).
+Contributions welcome! For bug reports and feature requests, [open an issue](https://github.com/fancy-potato/cc-clip/issues).
 
 For code contributions:
 
 ```bash
-git clone https://github.com/ShunmeiCho/cc-clip.git
+git clone https://github.com/fancy-potato/cc-clip.git
 cd cc-clip
 make build && make test
 ```
