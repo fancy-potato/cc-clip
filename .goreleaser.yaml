@@ -31,7 +31,7 @@ checksum:
 
 release:
   github:
-    owner: ShunmeiCho
+    owner: fancy-potato
     name: cc-clip
   draft: false
   prerelease: auto
