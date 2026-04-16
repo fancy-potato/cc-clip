@@ -3,13 +3,9 @@ package setup
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"github.com/shunmei/cc-clip/internal/peer"
 )
 
 // SSHConfigChange describes a modification made to ~/.ssh/config.
@@ -18,21 +14,11 @@ type SSHConfigChange struct {
 	Detail string
 }
 
-type ManagedAliasSpec struct {
-	BaseHost   string
-	Alias      string
+type ManagedHostSpec struct {
+	Host       string
 	RemotePort int
 	LocalPort  int
-	PeerID     string
-	PeerLabel  string
 }
-
-const (
-	managedMarkerPrefix = "# >>> cc-clip managed:"
-	managedMarkerSuffix = ">>>"
-)
-
-var resolveManagedAliasDirectives = resolveManagedAliasDirectivesWithSSH
 
 // EnsureSSHConfig ensures ~/.ssh/config has required directives for cc-clip:
 //   - RemoteForward <port> 127.0.0.1:<port>
@@ -53,7 +39,7 @@ func EnsureSSHConfig(host string, port int) ([]SSHConfigChange, error) {
 	return ensureSSHConfigAt(filepath.Join(sshDir, "config"), host, port)
 }
 
-func EnsureManagedAliasConfig(spec ManagedAliasSpec) ([]SSHConfigChange, error) {
+func EnsureManagedHostConfig(spec ManagedHostSpec) ([]SSHConfigChange, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine home directory: %w", err)
@@ -62,15 +48,15 @@ func EnsureManagedAliasConfig(spec ManagedAliasSpec) ([]SSHConfigChange, error) 
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		return nil, fmt.Errorf("cannot create ~/.ssh: %w", err)
 	}
-	return ensureManagedAliasConfigAt(filepath.Join(sshDir, "config"), spec)
+	return ensureManagedHostConfigAt(filepath.Join(sshDir, "config"), spec)
 }
 
-func RemoveManagedAliasConfig(alias string) error {
+func RemoveManagedHostConfig(host string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	return removeManagedAliasConfigAt(filepath.Join(home, ".ssh", "config"), alias)
+	return removeManagedHostConfigAt(filepath.Join(home, ".ssh", "config"), host)
 }
 
 func ensureSSHConfigAt(configPath string, host string, port int) ([]SSHConfigChange, error) {
@@ -146,53 +132,53 @@ func ensureSSHConfigAt(configPath string, host string, port int) ([]SSHConfigCha
 	return changes, nil
 }
 
-func ensureManagedAliasConfigAt(configPath string, spec ManagedAliasSpec) ([]SSHConfigChange, error) {
+func ensureManagedHostConfigAt(configPath string, spec ManagedHostSpec) ([]SSHConfigChange, error) {
 	content, err := os.ReadFile(configPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("cannot read %s: %w", configPath, err)
 	}
 
 	lines := strings.Split(string(content), "\n")
-	aliasBlock := managedAliasBlock(lines, configPath, spec)
-	startMarker, endMarker := managedAliasMarkers(spec.Alias)
-
-	var (
-		baseLines []string
-		changes   []SSHConfigChange
-	)
-
-	if start, end, found := findManagedAliasRange(lines, startMarker, endMarker); found {
-		if hostLine, ok := findHostLineOutsideRange(lines, spec.Alias, start, end); ok {
-			return nil, fmt.Errorf("refusing to manage alias %s: existing unmanaged Host entry at line %d", spec.Alias, hostLine+1)
-		}
-		baseLines = append([]string{}, lines[:start]...)
-		baseLines = append(baseLines, lines[end:]...)
-		changes = append(changes, SSHConfigChange{Action: "updated", Detail: fmt.Sprintf("managed alias %s", spec.Alias)})
-	} else {
-		if hostLine, ok := findHostLineOutsideRange(lines, spec.Alias, -1, -1); ok {
-			return nil, fmt.Errorf("refusing to manage alias %s: existing unmanaged Host entry at line %d", spec.Alias, hostLine+1)
-		}
-		baseLines = append([]string{}, lines...)
-		changes = append(changes, SSHConfigChange{Action: "created", Detail: fmt.Sprintf("managed alias %s", spec.Alias)})
+	block := findHostBlock(lines, spec.Host)
+	if block == nil {
+		return nil, fmt.Errorf("ssh config missing exact Host %s block; define an explicit alias in ~/.ssh/config first", spec.Host)
 	}
 
-	lines = insertManagedAliasBlock(baseLines, aliasBlock, findManagedAliasInsertLine(baseLines, spec.Alias))
-	if strings.Join(lines, "\n") == string(content) {
-		return []SSHConfigChange{{Action: "ok", Detail: fmt.Sprintf("managed alias %s", spec.Alias)}}, nil
+	startMarker, endMarker := managedHostMarkers(spec.Host)
+	start, end, found := findManagedRangeInBlock(lines, block, startMarker, endMarker)
+	if err := validateManagedHostConflicts(lines, block, spec, start, end, found); err != nil {
+		return nil, err
+	}
+
+	fragment := managedHostFragment(spec)
+	var updated []string
+	var change SSHConfigChange
+	switch {
+	case found:
+		updated = replaceManagedRange(lines, start, end, fragment)
+		change = SSHConfigChange{Action: "updated", Detail: fmt.Sprintf("managed Host %s", spec.Host)}
+	default:
+		insertAt := managedHostInsertLine(lines, block)
+		updated = insertLinesAt(lines, insertAt, fragment)
+		change = SSHConfigChange{Action: "created", Detail: fmt.Sprintf("managed Host %s", spec.Host)}
+	}
+
+	if strings.Join(updated, "\n") == string(content) {
+		return []SSHConfigChange{{Action: "ok", Detail: fmt.Sprintf("managed Host %s", spec.Host)}}, nil
 	}
 
 	if len(content) > 0 {
 		backupPath := configPath + ".cc-clip-backup"
 		_ = os.WriteFile(backupPath, content, 0600)
 	}
-	if err := os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(strings.Join(updated, "\n")), 0644); err != nil {
 		return nil, fmt.Errorf("cannot write %s: %w", configPath, err)
 	}
 
-	return changes, nil
+	return []SSHConfigChange{change}, nil
 }
 
-func removeManagedAliasConfigAt(configPath, alias string) error {
+func removeManagedHostConfigAt(configPath, host string) error {
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -201,13 +187,16 @@ func removeManagedAliasConfigAt(configPath, alias string) error {
 		return fmt.Errorf("cannot read %s: %w", configPath, err)
 	}
 	lines := strings.Split(string(content), "\n")
-	startMarker, endMarker := managedAliasMarkers(alias)
-	start, end, found := findManagedAliasRange(lines, startMarker, endMarker)
+	block := findHostBlock(lines, host)
+	if block == nil {
+		return nil
+	}
+	startMarker, endMarker := managedHostMarkers(host)
+	start, end, found := findManagedRangeInBlock(lines, block, startMarker, endMarker)
 	if !found {
 		return nil
 	}
-	result := append([]string{}, lines[:start]...)
-	result = append(result, lines[end:]...)
+	result := replaceManagedRange(lines, start, end, nil)
 	return os.WriteFile(configPath, []byte(strings.Join(result, "\n")), 0644)
 }
 
@@ -259,200 +248,15 @@ func findHostBlock(lines []string, host string) *sshBlock {
 	return block
 }
 
-func managedAliasBlock(lines []string, configPath string, spec ManagedAliasSpec) []string {
-	startMarker, endMarker := managedAliasMarkers(spec.Alias)
-	block := []string{startMarker}
-	block = append(block, fmt.Sprintf("Host %s", spec.Alias))
-
-	directives := copyableDirectives(resolveAliasDirectives(configPath, lines, spec.BaseHost), spec)
-	if !hasDirectiveKey(directives, "hostname") {
-		_, host := splitSSHDestination(spec.BaseHost)
-		block = append(block, fmt.Sprintf("    HostName %s", host))
-	}
-	if !hasDirectiveKey(directives, "user") {
-		if user, _ := splitSSHDestination(spec.BaseHost); user != "" {
-			block = append(block, fmt.Sprintf("    User %s", user))
-		}
-	}
-	for _, d := range directives {
-		block = append(block, fmt.Sprintf("    %s %s", displayDirectiveKey(d.key), d.value))
-	}
-
-	block = append(block,
+func managedHostFragment(spec ManagedHostSpec) []string {
+	startMarker, endMarker := managedHostMarkers(spec.Host)
+	return []string{
+		"    " + startMarker,
 		fmt.Sprintf("    RemoteForward %d 127.0.0.1:%d", spec.RemotePort, spec.LocalPort),
 		"    ControlMaster no",
 		"    ControlPath none",
-		"    RequestTTY yes",
-		fmt.Sprintf("    RemoteCommand test -x ~/.local/bin/cc-clip-shell-enter && exec ~/.local/bin/cc-clip-shell-enter %s %d %s || exec \"${SHELL:-/bin/bash}\" -i", spec.PeerID, spec.RemotePort, spec.PeerLabel),
-		endMarker,
-		"",
-	)
-	return block
-}
-
-func resolveAliasDirectives(configPath string, lines []string, host string) []sshDirective {
-	if directives, err := resolveManagedAliasDirectives(configPath, host); err == nil && len(directives) > 0 {
-		return directives
+		"    " + endMarker,
 	}
-	return effectiveDirectives(lines, host)
-}
-
-func resolveManagedAliasDirectivesWithSSH(configPath, host string) ([]sshDirective, error) {
-	cmd := exec.Command("ssh", "-G", "-F", configPath, host)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-
-	allow := map[string]bool{
-		"batchmode":                    true,
-		"certificatefile":              true,
-		"forwardagent":                 true,
-		"globalknownhostsfile":         true,
-		"hostkeyalias":                 true,
-		"hostname":                     true,
-		"identitiesonly":               true,
-		"identityagent":                true,
-		"identityfile":                 true,
-		"kbdinteractiveauthentication": true,
-		"localforward":                 true,
-		"passwordauthentication":       true,
-		"port":                         true,
-		"preferredauthentications":     true,
-		"proxycommand":                 true,
-		"proxyjump":                    true,
-		"pubkeyauthentication":         true,
-		"remoteforward":                true,
-		"serveraliveinterval":          true,
-		"stricthostkeychecking":        true,
-		"user":                         true,
-		"userknownhostsfile":           true,
-	}
-	var directives []sshDirective
-	for _, line := range strings.Split(string(out), "\n") {
-		key, value := parseSSHDirective(line)
-		if key == "" {
-			continue
-		}
-		key = strings.ToLower(key)
-		if !allow[key] {
-			continue
-		}
-		directives = append(directives, sshDirective{key: key, value: value})
-	}
-	return directives, nil
-}
-
-func effectiveDirectives(lines []string, host string) []sshDirective {
-	var (
-		matched bool
-		seen    = map[string]bool{}
-		eff     []sshDirective
-	)
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if isAnyHostLine(trimmed) {
-			matched = hostMatchesPattern(trimmed, host)
-			continue
-		}
-		if !matched {
-			continue
-		}
-		key, val := parseSSHDirective(trimmed)
-		if key == "" {
-			continue
-		}
-		key = strings.ToLower(key)
-		if key == "identityfile" || key == "localforward" {
-			eff = append(eff, sshDirective{key: key, value: val})
-			continue
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		eff = append(eff, sshDirective{key: key, value: val})
-	}
-	return eff
-}
-
-func copyableDirectives(dirs []sshDirective, spec ManagedAliasSpec) []sshDirective {
-	seen := map[string]bool{}
-	var kept []sshDirective
-	for _, d := range dirs {
-		if isManagedAliasOverrideDirective(d, spec) {
-			continue
-		}
-		// Keep repeated directives such as IdentityFile, LocalForward, and
-		// unrelated RemoteForward entries from the base host.
-		if d.key != "identityfile" && d.key != "localforward" && d.key != "remoteforward" && seen[d.key] {
-			continue
-		}
-		seen[d.key] = true
-		kept = append(kept, d)
-	}
-	return kept
-}
-
-func isManagedAliasOverrideDirective(d sshDirective, spec ManagedAliasSpec) bool {
-	switch d.key {
-	case "controlmaster", "controlpath", "requesttty", "remotecommand":
-		return true
-	case "remoteforward":
-		return remoteForwardUsesListenPort(d.value, spec.RemotePort) ||
-			isLegacyCCClipRemoteForward(d.value)
-	default:
-		return false
-	}
-}
-
-func isLegacyCCClipRemoteForward(value string) bool {
-	listenPort, targetHost, _, ok := parseRemoteForward(value)
-	if !ok {
-		return false
-	}
-	if listenPort < peer.DefaultRangeStart || listenPort > peer.DefaultRangeEnd {
-		return false
-	}
-	switch targetHost {
-	case "127.0.0.1", "localhost":
-		return true
-	default:
-		return false
-	}
-}
-
-func parseRemoteForward(value string) (int, string, int, bool) {
-	fields := strings.Fields(strings.TrimSpace(value))
-	if len(fields) < 2 {
-		return 0, "", 0, false
-	}
-	listenPort, ok := parseRemoteForwardListenPort(fields[0])
-	if !ok {
-		return 0, "", 0, false
-	}
-	targetHost, targetPort, ok := parseHostPort(fields[len(fields)-1])
-	if !ok {
-		return 0, "", 0, false
-	}
-	return listenPort, targetHost, targetPort, true
-}
-
-func parseHostPort(token string) (string, int, bool) {
-	token = strings.TrimSpace(token)
-	i := strings.LastIndex(token, ":")
-	if i <= 0 || i >= len(token)-1 {
-		return "", 0, false
-	}
-	port, err := strconv.Atoi(token[i+1:])
-	if err != nil {
-		return "", 0, false
-	}
-	host := strings.Trim(token[:i], "[]")
-	if host == "" {
-		return "", 0, false
-	}
-	return host, port, true
 }
 
 func remoteForwardUsesListenPort(value string, listenPort int) bool {
@@ -478,15 +282,6 @@ func parseRemoteForwardListenPort(token string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-func hasDirectiveKey(dirs []sshDirective, key string) bool {
-	for _, d := range dirs {
-		if d.key == key {
-			return true
-		}
-	}
-	return false
 }
 
 func displayDirectiveKey(key string) string {
@@ -533,6 +328,14 @@ func displayDirectiveKey(key string) string {
 		return "LocalForward"
 	case "remoteforward":
 		return "RemoteForward"
+	case "remotecommand":
+		return "RemoteCommand"
+	case "requesttty":
+		return "RequestTTY"
+	case "controlmaster":
+		return "ControlMaster"
+	case "controlpath":
+		return "ControlPath"
 	case "userknownhostsfile":
 		return "UserKnownHostsFile"
 	default:
@@ -543,69 +346,70 @@ func displayDirectiveKey(key string) string {
 	}
 }
 
-func managedAliasMarkers(alias string) (string, string) {
-	start := fmt.Sprintf("%s %s %s", managedMarkerPrefix, alias, managedMarkerSuffix)
-	end := fmt.Sprintf("# <<< cc-clip managed: %s <<<", alias)
+func managedHostMarkers(host string) (string, string) {
+	start := fmt.Sprintf("# >>> cc-clip managed host: %s >>>", host)
+	end := fmt.Sprintf("# <<< cc-clip managed host: %s <<<", host)
 	return start, end
 }
 
-func findManagedAliasRange(lines []string, startMarker, endMarker string) (int, int, bool) {
+func findManagedRangeInBlock(lines []string, block *sshBlock, startMarker, endMarker string) (int, int, bool) {
 	start := -1
-	for i, line := range lines {
-		if strings.TrimSpace(line) == startMarker {
+	for i := block.startLine + 1; i < block.endLine; i++ {
+		if strings.TrimSpace(lines[i]) == startMarker {
 			start = i
 			continue
 		}
-		if start >= 0 && strings.TrimSpace(line) == endMarker {
-			end := i + 1
-			if end < len(lines) && strings.TrimSpace(lines[end]) == "" {
-				end++
-			}
-			return start, end, true
+		if start >= 0 && strings.TrimSpace(lines[i]) == endMarker {
+			return start, i + 1, true
 		}
 	}
 	return 0, 0, false
 }
 
-func findHostLineOutsideRange(lines []string, host string, skipStart, skipEnd int) (int, bool) {
-	for i, line := range lines {
-		if skipStart >= 0 && i >= skipStart && i < skipEnd {
+func insertLinesAt(lines []string, insertAt int, extra []string) []string {
+	result := make([]string, 0, len(lines)+len(extra))
+	result = append(result, lines[:insertAt]...)
+	result = append(result, extra...)
+	result = append(result, lines[insertAt:]...)
+	return result
+}
+
+func replaceManagedRange(lines []string, start, end int, replacement []string) []string {
+	result := make([]string, 0, len(lines)-end+start+len(replacement))
+	result = append(result, lines[:start]...)
+	result = append(result, replacement...)
+	result = append(result, lines[end:]...)
+	return result
+}
+
+func managedHostInsertLine(lines []string, block *sshBlock) int {
+	insertAt := block.endLine
+	for insertAt > block.startLine+1 && strings.TrimSpace(lines[insertAt-1]) == "" {
+		insertAt--
+	}
+	return insertAt
+}
+
+func validateManagedHostConflicts(lines []string, block *sshBlock, spec ManagedHostSpec, managedStart, managedEnd int, hasManaged bool) error {
+	for i := block.startLine + 1; i < block.endLine; i++ {
+		if hasManaged && i >= managedStart && i < managedEnd {
 			continue
 		}
-		if matchesHost(strings.TrimSpace(line), host) {
-			return i, true
+		key, value := parseSSHDirective(lines[i])
+		if key == "" {
+			continue
+		}
+		lowerKey := strings.ToLower(key)
+		switch lowerKey {
+		case "controlmaster", "controlpath":
+			return fmt.Errorf("refusing to manage Host %s: existing %s directive at line %d conflicts with cc-clip-managed SSH behavior", spec.Host, displayDirectiveKey(lowerKey), i+1)
+		case "remoteforward":
+			if remoteForwardUsesListenPort(value, spec.RemotePort) {
+				return fmt.Errorf("refusing to manage Host %s: existing RemoteForward on port %d at line %d conflicts with cc-clip-managed SSH behavior", spec.Host, spec.RemotePort, i+1)
+			}
 		}
 	}
-	return 0, false
-}
-
-func findManagedAliasInsertLine(lines []string, alias string) int {
-	for i, line := range lines {
-		if hostMatchesPattern(strings.TrimSpace(line), alias) {
-			return i
-		}
-	}
-	return -1
-}
-
-func insertManagedAliasBlock(lines, aliasBlock []string, insertAt int) []string {
-	if insertAt >= 0 {
-		result := make([]string, 0, len(lines)+len(aliasBlock))
-		result = append(result, lines[:insertAt]...)
-		if len(result) > 0 && strings.TrimSpace(result[len(result)-1]) != "" {
-			result = append(result, "")
-		}
-		result = append(result, aliasBlock...)
-		result = append(result, lines[insertAt:]...)
-		return result
-	}
-
-	result := append([]string{}, lines...)
-	if len(result) > 0 && strings.TrimSpace(result[len(result)-1]) != "" {
-		result = append(result, "")
-	}
-	result = append(result, aliasBlock...)
-	return result
+	return nil
 }
 
 func matchesHost(trimmed, host string) bool {
@@ -622,36 +426,6 @@ func matchesHost(trimmed, host string) bool {
 
 func isAnyHostLine(trimmed string) bool {
 	return strings.HasPrefix(trimmed, "Host ") || strings.HasPrefix(trimmed, "Host\t")
-}
-
-func hostMatchesPattern(trimmed, host string) bool {
-	if !isAnyHostLine(trimmed) {
-		return false
-	}
-	matched := false
-	for _, pattern := range strings.Fields(trimmed)[1:] {
-		negated := strings.HasPrefix(pattern, "!")
-		pattern = strings.TrimPrefix(pattern, "!")
-		ok, err := path.Match(pattern, host)
-		if err != nil {
-			ok = pattern == host
-		}
-		if !ok {
-			continue
-		}
-		if negated {
-			return false
-		}
-		matched = true
-	}
-	return matched
-}
-
-func splitSSHDestination(target string) (string, string) {
-	if i := strings.LastIndex(target, "@"); i > 0 && i < len(target)-1 {
-		return target[:i], target[i+1:]
-	}
-	return "", target
 }
 
 func findHostStarLine(lines []string) int {

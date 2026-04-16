@@ -8,7 +8,6 @@ import (
 	"strings"
 )
 
-
 type Target string
 
 const (
@@ -18,10 +17,10 @@ const (
 )
 
 type InstallResult struct {
-	Target       Target
-	ShimPath     string
-	RealBinPath  string
-	InstallDir   string
+	Target      Target
+	ShimPath    string
+	RealBinPath string
+	InstallDir  string
 }
 
 func DetectTarget() Target {
@@ -138,10 +137,13 @@ func Install(target Target, installDir string, port int) (InstallResult, error) 
 }
 
 func Uninstall(target Target, installDir string) error {
-	resolved := resolveTarget(target)
-
 	if installDir == "" {
 		installDir = defaultInstallDir()
+	}
+
+	resolved, err := resolveUninstallTarget(target, installDir)
+	if err != nil {
+		return err
 	}
 
 	binName := string(resolved)
@@ -156,6 +158,28 @@ func Uninstall(target Target, installDir string) error {
 	}
 
 	return nil
+}
+
+func resolveUninstallTarget(target Target, installDir string) (Target, error) {
+	if target != TargetAuto {
+		return target, nil
+	}
+
+	var installed []Target
+	for _, candidate := range []Target{TargetXclip, TargetWlPaste} {
+		if isOurShim(filepath.Join(installDir, string(candidate))) {
+			installed = append(installed, candidate)
+		}
+	}
+
+	switch len(installed) {
+	case 1:
+		return installed[0], nil
+	case 0:
+		return "", fmt.Errorf("no cc-clip shim found in %s; specify --target if you want to remove a non-default install", installDir)
+	default:
+		return "", fmt.Errorf("multiple cc-clip shims found in %s; specify --target", installDir)
+	}
 }
 
 func isOurShim(path string) bool {

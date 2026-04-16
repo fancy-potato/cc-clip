@@ -74,7 +74,87 @@ func TestCheckAliasPortSkipsWithoutPeerReservation(t *testing.T) {
 	if len(got) != 1 || !got[0].OK {
 		t.Fatalf("expected alias check skip success, got %#v", got)
 	}
-	if got[0].Message != "peer alias not configured; skipping alias port check" {
+	if got[0].Message != "peer SSH forwarding not configured; skipping SSH config port check" {
 		t.Fatalf("unexpected alias skip message: %#v", got)
+	}
+}
+
+func TestCheckAliasPortPrefersBaseHostConfig(t *testing.T) {
+	oldQuery := sshConfigQuery
+	t.Cleanup(func() { sshConfigQuery = oldQuery })
+
+	var seen []string
+	sshConfigQuery = func(candidate string) (string, error) {
+		seen = append(seen, candidate)
+		if candidate == "myserver" {
+			return "remoteforward 18340 127.0.0.1:18339\n", nil
+		}
+		return "", fmt.Errorf("unexpected fallback")
+	}
+
+	got := checkAliasPort("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
+	if len(got) != 1 || !got[0].OK {
+		t.Fatalf("expected success, got %#v", got)
+	}
+	if got[0].Message != "myserver forwards 18340 127.0.0.1:18339" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if len(seen) != 1 || seen[0] != "myserver" {
+		t.Fatalf("expected only base host query, got %v", seen)
+	}
+}
+
+func TestCheckAliasPortSurfacesSSHQueryError(t *testing.T) {
+	oldQuery := sshConfigQuery
+	t.Cleanup(func() { sshConfigQuery = oldQuery })
+
+	sshConfigQuery = func(candidate string) (string, error) {
+		return "", fmt.Errorf("ssh config parse error")
+	}
+
+	got := checkAliasPort("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected failure, got %#v", got)
+	}
+	if got[0].Message != "ssh -G myserver failed: ssh config parse error; cannot verify RemoteForward" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+}
+
+func TestCheckAliasPortFailsWhenForwardMissing(t *testing.T) {
+	oldQuery := sshConfigQuery
+	t.Cleanup(func() { sshConfigQuery = oldQuery })
+
+	sshConfigQuery = func(candidate string) (string, error) {
+		return "hostname 10.0.0.1\nuser admin\n", nil
+	}
+
+	got := checkAliasPort("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected failure, got %#v", got)
+	}
+	if got[0].Message != "ssh config missing RemoteForward 18340 127.0.0.1:18339" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+}
+
+func TestMatchesRemoteForwardAcceptsBracketedLoopback(t *testing.T) {
+	line := "remoteforward 18340 [127.0.0.1]:18339"
+	if !matchesRemoteForward(line, 18340, "127.0.0.1", 18339) {
+		t.Fatalf("expected bracketed loopback RemoteForward to match: %q", line)
+	}
+}
+
+func TestMatchesRemoteForwardAcceptsPlainLoopback(t *testing.T) {
+	line := "remoteforward 18340 127.0.0.1:18339"
+	if !matchesRemoteForward(line, 18340, "127.0.0.1", 18339) {
+		t.Fatalf("expected plain loopback RemoteForward to match: %q", line)
+	}
+}
+
+func TestMatchesRemoteForwardRejectsWrongTarget(t *testing.T) {
+	line := "remoteforward 18340 [127.0.0.1]:9999"
+	if matchesRemoteForward(line, 18340, "127.0.0.1", 18339) {
+		t.Fatalf("expected mismatched RemoteForward to be rejected: %q", line)
 	}
 }

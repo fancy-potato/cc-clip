@@ -104,8 +104,10 @@ Remote:
     --target         auto|xclip|wl-paste (default: auto)
     --path           Install directory (default: ~/.local/bin)
   uninstall          Remove shim
-    --host           Also clean up PATH marker on remote host
-    --peer           Remove the managed peer alias; with --host also releases the remote peer lease
+    --target         auto|xclip|wl-paste (default: auto; auto removes the installed shim when exactly one exists)
+    --path           Install directory (default: ~/.local/bin)
+    --host           Clean up PATH marker on remote host instead of local shim
+    --peer           Remove cc-clip SSH config; with --host also releases the remote peer lease
   paste              Fetch clipboard image and output path
     --out-dir        Output directory (env: CC_CLIP_OUT_DIR)
   send [<host>]      Upload local clipboard image to remote file path
@@ -124,11 +126,11 @@ Remote:
     --status         Show hotkey process status
 
 One-command setup:
-  setup <host>       Full setup: deps, SSH config, daemon, deploy
+  setup <host>       Full setup: deps, update exact SSH Host block, daemon, deploy
     --port           Tunnel port (default: 18339)
 
 Deploy (local -> remote):
-  connect <host>     Deploy cc-clip to remote and establish session
+  connect <host>     Deploy cc-clip to remote and update exact SSH Host block
     --port           Tunnel port (default: 18339)
     --local-bin      Path to pre-downloaded remote binary
     --force          Ignore remote state, full redeploy
@@ -391,20 +393,36 @@ func cmdUninstall() {
 		log.Fatalf("unsupported target: %s", targetStr)
 	}
 
-	if err := shim.Uninstall(target, installPath); err != nil {
+	if err := runShimUninstall(target, installPath, host, uninstallOps{
+		uninstallLocalShim: shim.Uninstall,
+		removeRemotePath:   shim.RemoveRemotePath,
+	}); err != nil {
 		log.Fatalf("uninstall failed: %v", err)
 	}
+}
 
-	fmt.Println("Shim removed successfully.")
+type uninstallOps struct {
+	uninstallLocalShim func(shim.Target, string) error
+	removeRemotePath   func(string) error
+}
 
+func runShimUninstall(target shim.Target, installPath, host string, ops uninstallOps) error {
 	if host != "" {
 		fmt.Printf("Removing PATH marker from remote %s...\n", host)
-		if err := shim.RemoveRemotePath(host); err != nil {
+		if err := ops.removeRemotePath(host); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to remove PATH marker: %v\n", err)
 		} else {
 			fmt.Println("PATH marker removed from remote shell rc file.")
 		}
+		return nil
 	}
+
+	if err := ops.uninstallLocalShim(target, installPath); err != nil {
+		return err
+	}
+
+	fmt.Println("Shim removed successfully.")
+	return nil
 }
 
 func cmdUninstallPeer(host, peerArg string) {
@@ -413,17 +431,9 @@ func cmdUninstallPeer(host, peerArg string) {
 		log.Fatalf("uninstall peer failed: %v", err)
 	}
 
-	peerID, alias, err := resolveUninstallPeerTarget(host, peerArg, ident)
+	peerID, managedHost, err := resolveUninstallPeerTarget(host, peerArg, ident)
 	if err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
-	}
-
-	if host == "" {
-		if err := setup.RemoveManagedAliasConfig(alias); err != nil {
-			log.Fatalf("uninstall peer failed to remove managed alias: %v", err)
-		}
-		fmt.Printf("Removed managed alias %s from ~/.ssh/config\n", alias)
-		return
 	}
 
 	session, err := shim.NewSSHSession(host)
@@ -432,7 +442,7 @@ func cmdUninstallPeer(host, peerArg string) {
 	}
 	defer session.Close()
 
-	if err := uninstallPeerRemoteAndAlias(alias, func() (*peer.Registration, error) {
+	if err := uninstallPeerRemoteAndConfig(managedHost, func() (*peer.Registration, error) {
 		return cleanupAndReleasePeer(session, "~/.local/bin/cc-clip", peerID)
 	}); err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
@@ -440,42 +450,36 @@ func cmdUninstallPeer(host, peerArg string) {
 }
 
 func resolveUninstallPeerTarget(host, peerArg string, ident peer.Identity) (string, string, error) {
-	if strings.Contains(peerArg, "-cc-clip-") {
-		if host != "" {
-			return "", "", fmt.Errorf("--peer alias cannot be used with --host; pass the peer ID for remote cleanup, or omit --host to remove only the local alias")
-		}
-		return ident.ID, peerArg, nil
-	}
 	if host == "" {
-		return "", "", fmt.Errorf("--host is required when --peer is not an alias")
+		return "", "", fmt.Errorf("--host is required; managed aliases are no longer created — use --peer <id> --host <host> to clean up the remote peer lease and SSH config")
 	}
 	if peerArg == ident.ID {
-		return peerArg, peer.AliasForHost(host, ident.Label), nil
+		return peerArg, host, nil
 	}
 	return peerArg, "", nil
 }
 
-func uninstallPeerRemoteAndAlias(alias string, remoteCleanup func() (*peer.Registration, error)) error {
+func uninstallPeerRemoteAndConfig(managedHost string, remoteCleanup func() (*peer.Registration, error)) error {
 	reg, remoteErr := remoteCleanup()
-	var aliasErr error
-	if alias != "" {
-		aliasErr = setup.RemoveManagedAliasConfig(alias)
+	var hostErr error
+	if managedHost != "" {
+		hostErr = setup.RemoveManagedHostConfig(managedHost)
 	}
 
 	if remoteErr == nil && reg != nil {
 		fmt.Printf("Released peer %s on remote port %d\n", reg.Label, reg.ReservedPort)
 	}
-	if alias != "" && aliasErr == nil {
-		fmt.Printf("Removed managed alias %s from ~/.ssh/config\n", alias)
+	if managedHost != "" && hostErr == nil {
+		fmt.Printf("Removed cc-clip SSH config from Host %s in ~/.ssh/config\n", managedHost)
 	}
 
 	switch {
-	case remoteErr != nil && alias != "" && aliasErr != nil:
-		return fmt.Errorf("%v; additionally failed to remove managed alias: %w", remoteErr, aliasErr)
+	case remoteErr != nil && managedHost != "" && hostErr != nil:
+		return fmt.Errorf("%v; additionally failed to remove Host %s cc-clip config: %w", remoteErr, managedHost, hostErr)
 	case remoteErr != nil:
 		return remoteErr
-	case alias != "" && aliasErr != nil:
-		return fmt.Errorf("failed to remove managed alias: %w", aliasErr)
+	case managedHost != "" && hostErr != nil:
+		return fmt.Errorf("failed to remove Host %s cc-clip config: %w", managedHost, hostErr)
 	default:
 		return nil
 	}
@@ -707,7 +711,7 @@ func runConnect(opts connectOpts) {
 		}
 	}
 
-	fmt.Printf("[5/8] Reserving peer port and updating alias...\n")
+	fmt.Printf("[5/8] Reserving peer port and updating SSH config...\n")
 	if existingReg, err := lookupPeerReservation(session, remoteBin, ident.ID); err != nil {
 		log.Printf("      warning: could not check existing peer reservation: %v", err)
 	} else if existingReg != nil {
@@ -717,27 +721,19 @@ func runConnect(opts connectOpts) {
 	if err != nil {
 		log.Fatalf("      failed to reserve peer port: %v", err)
 	}
-	if err := shim.InstallRemoteShellEntryScript(session); err != nil {
-		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
-		log.Fatalf("      failed to install shell entry script: %v", err)
-	}
-	alias := peer.AliasForHost(host, ident.Label)
-	changes, err := setup.EnsureManagedAliasConfig(setup.ManagedAliasSpec{
-		BaseHost:   host,
-		Alias:      alias,
+	changes, err := setup.EnsureManagedHostConfig(setup.ManagedHostSpec{
+		Host:       host,
 		RemotePort: reg.ReservedPort,
 		LocalPort:  localPort,
-		PeerID:     ident.ID,
-		PeerLabel:  ident.Label,
 	})
 	if err != nil {
 		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
-		log.Fatalf("      failed to write managed SSH alias: %v", err)
+		log.Fatalf("      failed to update Host %s in ~/.ssh/config: %v", host, err)
 	}
 	for _, c := range changes {
 		fmt.Printf("      %s: %s\n", c.Action, c.Detail)
 	}
-	fmt.Printf("      alias: %s\n", alias)
+	fmt.Printf("      host: %s\n", host)
 	fmt.Printf("      remote port: %d\n", reg.ReservedPort)
 	fmt.Printf("      state dir: %s\n", reg.StateDir)
 
@@ -752,7 +748,7 @@ func runConnect(opts connectOpts) {
 		if sid != "" {
 			fmt.Printf("      session ID: %s\n", sid[:16])
 		}
-		connectVerifyTunnel(session, reg.ReservedPort, alias)
+		connectVerifyTunnel(session, reg.ReservedPort, host)
 		return
 	}
 
@@ -844,7 +840,7 @@ func runConnect(opts connectOpts) {
 	}
 
 	// Step 8: Verify tunnel
-	connectVerifyTunnel(session, reg.ReservedPort, alias)
+	connectVerifyTunnel(session, reg.ReservedPort, host)
 
 	// Notification bridge setup (unless --no-notify)
 	if opts.noNotify {
@@ -1146,8 +1142,8 @@ func cmdSetup() {
 		log.Fatal("      daemon not running. Start it first: cc-clip serve")
 	}
 
-	// Step 3: Deploy to remote and create managed alias
-	fmt.Printf("\n[3/4] Deploying to %s and creating peer alias...\n", host)
+	// Step 3: Deploy to remote and update the existing SSH host entry
+	fmt.Printf("\n[3/4] Deploying to %s and updating SSH host config...\n", host)
 	runConnect(connectOpts{
 		host:  host,
 		port:  localPort,
@@ -1156,7 +1152,7 @@ func cmdSetup() {
 }
 
 // connectVerifyTunnel verifies the SSH tunnel from the remote side.
-func connectVerifyTunnel(session *shim.SSHSession, port int, alias string) {
+func connectVerifyTunnel(session *shim.SSHSession, port int, host string) {
 	remoteBin := "~/.local/bin/cc-clip"
 
 	fmt.Printf("[8/8] Verifying tunnel from remote...\n")
@@ -1170,7 +1166,7 @@ func connectVerifyTunnel(session *shim.SSHSession, port int, alias string) {
 	} else {
 		fmt.Println("      tunnel not detected (this is normal if no interactive SSH session is open)")
 		fmt.Println("      The tunnel is provided by your SSH connection, not by 'cc-clip connect'.")
-		fmt.Printf("      Open your managed alias to activate it: ssh %s\n", alias)
+		fmt.Printf("      Open your SSH host to activate it: ssh %s\n", host)
 	}
 
 	// Verify remote binary is functional
@@ -1185,7 +1181,7 @@ func connectVerifyTunnel(session *shim.SSHSession, port int, alias string) {
 	fmt.Printf("      %s\n", shimOut)
 
 	fmt.Println()
-	fmt.Printf("Setup complete. Open the managed alias with: ssh %s\n", alias)
+	fmt.Printf("Setup complete. Open it with: ssh %s\n", host)
 }
 
 // prepareBinaryLocal resolves the local binary path without performing remote operations.

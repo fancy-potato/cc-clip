@@ -1,5 +1,6 @@
 # Go
 .gocache/
+/.cache/
 /cc-clip
 *.exe
 

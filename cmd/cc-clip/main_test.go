@@ -16,6 +16,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/daemon"
 	"github.com/shunmei/cc-clip/internal/peer"
 	"github.com/shunmei/cc-clip/internal/session"
+	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
 )
 
@@ -207,6 +208,62 @@ func TestRunNotificationHealthProbeFailsWithBadNonce(t *testing.T) {
 	}
 }
 
+func TestRunShimUninstallWithHostSkipsLocalShim(t *testing.T) {
+	localCalled := false
+	remoteHost := ""
+
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "dev-success-cc-clip-wavehi-local", uninstallOps{
+		uninstallLocalShim: func(target shim.Target, installPath string) error {
+			localCalled = true
+			return nil
+		},
+		removeRemotePath: func(host string) error {
+			remoteHost = host
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if localCalled {
+		t.Fatal("expected local shim uninstall to be skipped when --host is set")
+	}
+	if remoteHost != "dev-success-cc-clip-wavehi-local" {
+		t.Fatalf("expected remote cleanup host to be used, got %q", remoteHost)
+	}
+}
+
+func TestRunShimUninstallWithoutHostRemovesLocalShim(t *testing.T) {
+	localCalled := false
+	remoteCalled := false
+
+	err := runShimUninstall(shim.TargetWlPaste, "/tmp/local-bin", "", uninstallOps{
+		uninstallLocalShim: func(target shim.Target, installPath string) error {
+			localCalled = true
+			if target != shim.TargetWlPaste {
+				t.Fatalf("unexpected target: %v", target)
+			}
+			if installPath != "/tmp/local-bin" {
+				t.Fatalf("unexpected install path: %q", installPath)
+			}
+			return nil
+		},
+		removeRemotePath: func(host string) error {
+			remoteCalled = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if !localCalled {
+		t.Fatal("expected local shim uninstall to run when --host is not set")
+	}
+	if remoteCalled {
+		t.Fatal("expected remote PATH cleanup to be skipped without --host")
+	}
+}
+
 func TestPostGenericNotificationDeliversExpectedPayload(t *testing.T) {
 	tm := token.NewManager(time.Hour)
 	_, err := tm.Generate()
@@ -284,41 +341,26 @@ func TestClaudeHookConfigJSONIncludesNotificationAndStop(t *testing.T) {
 func TestResolveUninstallPeerTargetUsesExplicitPeerID(t *testing.T) {
 	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
 
-	peerID, alias, err := resolveUninstallPeerTarget("myserver", "other-peer", ident)
+	peerID, managedHost, err := resolveUninstallPeerTarget("myserver", "other-peer", ident)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if peerID != "other-peer" {
 		t.Fatalf("expected explicit peer ID to be preserved, got %q", peerID)
 	}
-	if alias != "" {
-		t.Fatalf("expected explicit peer ID cleanup to skip alias removal, got %q", alias)
+	if managedHost != "" {
+		t.Fatalf("expected explicit peer ID cleanup to skip local SSH cleanup, got host=%q", managedHost)
 	}
 }
 
-func TestResolveUninstallPeerTargetAcceptsManagedAliasWithoutHost(t *testing.T) {
+func TestResolveUninstallPeerTargetRequiresHost(t *testing.T) {
 	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
 
-	peerID, alias, err := resolveUninstallPeerTarget("", "myserver-cc-clip-macbook", ident)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if peerID != "local-peer" {
-		t.Fatalf("expected local peer ID for alias removal, got %q", peerID)
-	}
-	if alias != "myserver-cc-clip-macbook" {
-		t.Fatalf("unexpected alias %q", alias)
-	}
-}
-
-func TestResolveUninstallPeerTargetRejectsManagedAliasWithHost(t *testing.T) {
-	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
-
-	_, _, err := resolveUninstallPeerTarget("myserver", "myserver-cc-clip-macbook", ident)
+	_, _, err := resolveUninstallPeerTarget("", "local-peer", ident)
 	if err == nil {
-		t.Fatal("expected alias + host to be rejected")
+		t.Fatal("expected missing host to be rejected")
 	}
-	if !strings.Contains(err.Error(), "cannot be used with --host") {
+	if !strings.Contains(err.Error(), "--host is required") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -326,15 +368,15 @@ func TestResolveUninstallPeerTargetRejectsManagedAliasWithHost(t *testing.T) {
 func TestResolveUninstallPeerTargetUsesAliasForLocalPeerID(t *testing.T) {
 	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
 
-	peerID, alias, err := resolveUninstallPeerTarget("myserver", "local-peer", ident)
+	peerID, managedHost, err := resolveUninstallPeerTarget("myserver", "local-peer", ident)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if peerID != "local-peer" {
 		t.Fatalf("expected local peer ID to be preserved, got %q", peerID)
 	}
-	if alias != "myserver-cc-clip-macbook" {
-		t.Fatalf("unexpected alias %q", alias)
+	if managedHost != "myserver" {
+		t.Fatalf("unexpected managed host %q", managedHost)
 	}
 }
 
@@ -645,7 +687,7 @@ func TestConnectNotifyDisableLeavesUserClaudeWrapperUntouched(t *testing.T) {
 	}
 }
 
-func TestUninstallPeerRemoteAndAliasRemovesAliasWhenRemoteReleaseFails(t *testing.T) {
+func TestUninstallPeerRemoteAndConfigRemovesHostFragmentWhenRemoteReleaseFails(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0700); err != nil {
@@ -657,17 +699,18 @@ func TestUninstallPeerRemoteAndAliasRemovesAliasWhenRemoteReleaseFails(t *testin
 
 	configPath := filepath.Join(home, ".ssh", "config")
 	config := strings.Join([]string{
-		"# >>> cc-clip managed: myserver-cc-clip-macbook >>>",
-		"Host myserver-cc-clip-macbook",
+		"Host myserver",
 		"    HostName myserver",
-		"# <<< cc-clip managed: myserver-cc-clip-macbook <<<",
+		"    # >>> cc-clip managed host: myserver >>>",
+		"    RemoteForward 18340 127.0.0.1:18339",
+		"    # <<< cc-clip managed host: myserver <<<",
 		"",
 	}, "\n")
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	err := uninstallPeerRemoteAndAlias("myserver-cc-clip-macbook", func() (*peer.Registration, error) {
+	err := uninstallPeerRemoteAndConfig("myserver", func() (*peer.Registration, error) {
 		return nil, fmt.Errorf("peer peer-a not found")
 	})
 	if err == nil {
@@ -678,12 +721,15 @@ func TestUninstallPeerRemoteAndAliasRemovesAliasWhenRemoteReleaseFails(t *testin
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if strings.Contains(string(content), "myserver-cc-clip-macbook") {
-		t.Fatalf("expected managed alias to be removed, got:\n%s", string(content))
+	if strings.Contains(string(content), "cc-clip managed host: myserver") {
+		t.Fatalf("expected managed host fragment to be removed, got:\n%s", string(content))
+	}
+	if !strings.Contains(string(content), "Host myserver") {
+		t.Fatalf("expected Host block to remain, got:\n%s", string(content))
 	}
 }
 
-func TestUninstallPeerRemoteAndAliasSkipsAliasRemovalWhenAliasEmpty(t *testing.T) {
+func TestUninstallPeerRemoteAndConfigSkipsLocalCleanupWhenTargetsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0700); err != nil {
@@ -695,17 +741,15 @@ func TestUninstallPeerRemoteAndAliasSkipsAliasRemovalWhenAliasEmpty(t *testing.T
 
 	configPath := filepath.Join(home, ".ssh", "config")
 	config := strings.Join([]string{
-		"# >>> cc-clip managed: myserver-cc-clip-macbook >>>",
-		"Host myserver-cc-clip-macbook",
+		"Host myserver",
 		"    HostName myserver",
-		"# <<< cc-clip managed: myserver-cc-clip-macbook <<<",
 		"",
 	}, "\n")
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := uninstallPeerRemoteAndAlias("", func() (*peer.Registration, error) {
+	if err := uninstallPeerRemoteAndConfig("", func() (*peer.Registration, error) {
 		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
 	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -715,8 +759,8 @@ func TestUninstallPeerRemoteAndAliasSkipsAliasRemovalWhenAliasEmpty(t *testing.T
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if !strings.Contains(string(content), "myserver-cc-clip-macbook") {
-		t.Fatalf("expected managed alias to remain untouched, got:\n%s", string(content))
+	if !strings.Contains(string(content), "Host myserver") {
+		t.Fatalf("expected Host block to remain untouched, got:\n%s", string(content))
 	}
 }
 

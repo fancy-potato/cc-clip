@@ -75,6 +75,69 @@ func TestUninstallNonShim(t *testing.T) {
 	}
 }
 
+func TestUninstallAutoRemovesInstalledXclipShim(t *testing.T) {
+	dir := t.TempDir()
+
+	result, err := Install(TargetXclip, dir, 18339)
+	if err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	if err := Uninstall(TargetAuto, dir); err != nil {
+		t.Fatalf("Uninstall(TargetAuto) failed: %v", err)
+	}
+	if _, err := os.Stat(result.ShimPath); !os.IsNotExist(err) {
+		t.Fatal("xclip shim should be removed by auto uninstall")
+	}
+}
+
+func TestUninstallAutoRemovesInstalledWlPasteShim(t *testing.T) {
+	dir := t.TempDir()
+
+	result, err := Install(TargetWlPaste, dir, 18339)
+	if err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	if err := Uninstall(TargetAuto, dir); err != nil {
+		t.Fatalf("Uninstall(TargetAuto) failed: %v", err)
+	}
+	if _, err := os.Stat(result.ShimPath); !os.IsNotExist(err) {
+		t.Fatal("wl-paste shim should be removed by auto uninstall")
+	}
+}
+
+func TestUninstallAutoErrorsWhenNoShimInstalled(t *testing.T) {
+	dir := t.TempDir()
+
+	err := Uninstall(TargetAuto, dir)
+	if err == nil {
+		t.Fatal("expected auto uninstall to fail when no shim exists")
+	}
+	if !strings.Contains(err.Error(), "no cc-clip shim found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUninstallAutoErrorsWhenMultipleShimsInstalled(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := Install(TargetXclip, dir, 18339); err != nil {
+		t.Fatalf("Install xclip failed: %v", err)
+	}
+	if _, err := Install(TargetWlPaste, dir, 18339); err != nil {
+		t.Fatalf("Install wl-paste failed: %v", err)
+	}
+
+	err := Uninstall(TargetAuto, dir)
+	if err == nil {
+		t.Fatal("expected auto uninstall to fail when multiple shims exist")
+	}
+	if !strings.Contains(err.Error(), "multiple cc-clip shims found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestInstallWlPaste(t *testing.T) {
 	dir := t.TempDir()
 

@@ -68,7 +68,7 @@ One tool. No changes to Claude Code or Codex. Clipboard and notifications both w
 
 - **Local machine:** macOS 13+ or Windows 10/11
 - **Remote server:** Linux (amd64 or arm64) accessible via SSH
-- **SSH config:** You must have a Host entry in `~/.ssh/config` for your remote server
+- **SSH config:** You must have an exact `Host <alias>` entry in `~/.ssh/config` for your remote server
 
 If you don't have an SSH config entry yet, add one:
 
@@ -79,6 +79,10 @@ Host myserver
     User your-username
     IdentityFile ~/.ssh/id_rsa  # optional, if using key auth
 ```
+
+Use a stable alias such as `myserver` for all `cc-clip` commands. Do not run `cc-clip setup`, `cc-clip connect`, or `cc-clip doctor --host` against a raw `user@host` destination such as `alice@example.com`; define a `Host myserver` entry first, then use `myserver` consistently.
+
+If your SSH config also has broad stanzas such as `Host *` or `Host *.corp`, keep the exact `Host myserver` block in the file and avoid setting conflicting `RemoteForward`, `ControlMaster`, or `ControlPath` values for that alias earlier in the match order.
 
 If you are on Windows and want the SSH/Claude Code workflow, use the dedicated guide:
 
@@ -126,9 +130,16 @@ cc-clip setup myserver
 
 This single command handles everything:
 1. Installs local dependencies (`pngpaste`)
-2. Configures SSH (`RemoteForward`, `ControlMaster no`)
+2. Updates your existing SSH host entry (`RemoteForward`, `ControlMaster no`, `ControlPath none`)
 3. Starts the local daemon (via macOS launchd)
 4. Deploys the binary and shim to the remote server
+
+`cc-clip setup` edits the exact `Host myserver` block you pass in. It does not patch wildcard-only entries such as `Host *` or `Host *.corp`.
+
+Before you run setup, make sure:
+- You pass the SSH alias from `~/.ssh/config`, not `user@host`.
+- The alias has its own exact `Host myserver` block.
+- Earlier wildcard blocks do not already force conflicting `RemoteForward`, `ControlMaster`, or `ControlPath` values for that host.
 
 <details>
 <summary>See it in action (macOS)</summary>
@@ -178,6 +189,10 @@ ssh myserver
 Then use Claude Code or Codex CLI as normal — `Ctrl+V` now pastes images from your Mac clipboard.
 
 > **Important:** The image paste works through the SSH tunnel. You must connect via `ssh myserver` (the host you set up). The tunnel is established on each SSH connection.
+>
+> If `which xclip` still points to `/usr/bin/xclip` or `DISPLAY` is still empty after reconnecting, your login shell may not source `~/.bashrc` or `~/.zshrc` automatically. Run `source ~/.bashrc` or `source ~/.zshrc`, then see [Troubleshooting Guide](docs/troubleshooting.md) for a persistent fix.
+>
+> If your usual habit is `ssh alice@example.com`, create an alias such as `Host myserver` in `~/.ssh/config` and use `ssh myserver` for both setup and daily use with `cc-clip`.
 
 ### Verify it works
 
@@ -413,6 +428,8 @@ The Windows workflow uses a dedicated remote-paste hotkey (default: `Alt+Shift+V
 | `cc-clip service uninstall` | Remove launchd service |
 | `cc-clip send [<host>] --paste` | Windows: upload clipboard image and paste remote path |
 | `cc-clip hotkey [<host>]` | Windows: register the remote upload/paste hotkey |
+| `cc-clip install --target <target>` | Install a local `xclip` or `wl-paste` shim |
+| `cc-clip uninstall --target <target>` | Remove a local shim; `auto` works when exactly one cc-clip shim is installed |
 
 <details>
 <summary>All commands</summary>
@@ -443,7 +460,10 @@ The Windows workflow uses a dedicated remote-paste hotkey (default: `Alt+Shift+V
 | `cc-clip doctor` | Local health check |
 | `cc-clip doctor --host <host>` | End-to-end health check |
 | `cc-clip status` | Show component status |
-| `cc-clip uninstall` | Remove xclip shim from remote |
+| `cc-clip install --target <target>` | Install a local `xclip` or `wl-paste` shim |
+| `cc-clip uninstall` | Remove a local shim; `auto` removes the installed shim when exactly one exists |
+| `cc-clip uninstall --target <target>` | Remove the specified local shim explicitly |
+| `cc-clip uninstall --host <host>` | Remove the managed PATH marker from the remote host |
 | `cc-clip uninstall --codex` | Remove Codex support (local) |
 | `cc-clip uninstall --codex --host <host>` | Remove Codex support from remote |
 
@@ -562,7 +582,7 @@ ssh myserver 'CC_CLIP_DEBUG=1 xclip -selection clipboard -t TARGETS -o'
 
 If step 2 fails, you need to open a **new** SSH connection (the tunnel is established on connect).
 
-If step 3 fails, the PATH fix didn't take effect. Log out and back in, or run: `source ~/.bashrc`
+If step 3 fails, the PATH fix didn't take effect. Open a fresh SSH session, or run `source ~/.bashrc` / `source ~/.zshrc`. See [Troubleshooting Guide](docs/troubleshooting.md) if your login shell does not load that file automatically.
 
 </details>
 
@@ -597,7 +617,7 @@ ssh -o ClearAllForwardings=yes myserver "ss -tln | grep 18339 || true"
 # 1. Is DISPLAY set?
 echo $DISPLAY
 # Expected: 127.0.0.1:0 (or 127.0.0.1:1, etc.)
-# If empty → open a NEW SSH session, or run: source ~/.bashrc
+# If empty → open a NEW SSH session, or run: source ~/.bashrc / source ~/.zshrc
 
 # 2. Is the SSH tunnel working?
 curl -s http://127.0.0.1:18339/health
@@ -627,12 +647,37 @@ xclip -selection clipboard -t TARGETS -o
 
 | Step fails | Fix |
 |-----------|-----|
-| Step 1 (DISPLAY empty) | Open a **new** SSH session. If still empty: `source ~/.bashrc` |
+| Step 1 (DISPLAY empty) | Open a **new** SSH session. If still empty: `source ~/.bashrc` or `source ~/.zshrc` |
 | Step 2 (tunnel down) | Open a **new** SSH connection — tunnel is per-connection |
 | Steps 3-4 (processes missing) | `cc-clip connect myserver --codex --force` from local |
 | Step 6 (no image/png) | Copy an image on Mac first: `Cmd+Shift+Ctrl+4` |
 
 > **Note:** DISPLAY uses TCP loopback format (`127.0.0.1:N`) instead of Unix socket format (`:N`) because Codex CLI's sandbox blocks access to `/tmp/.X11-unix/`. If you previously set up cc-clip with an older version, re-run `cc-clip connect myserver --codex --force` to update.
+
+</details>
+
+<details>
+<summary><b>Fresh SSH session still misses PATH or DISPLAY</b></summary>
+
+**Symptom:** You reconnect with `ssh myserver`, but `which xclip` still resolves to `/usr/bin/xclip`, or `echo $DISPLAY` is still empty.
+
+**Cause:** `cc-clip` writes its PATH and DISPLAY markers into `~/.bashrc` or `~/.zshrc`. Some login-shell setups do not source those files automatically on SSH login.
+
+**Quick fix for the current shell:**
+
+```bash
+source ~/.bashrc
+# or
+source ~/.zshrc
+```
+
+**Persistent fix for bash login shells:**
+
+```bash
+printf '\n[ -f ~/.bashrc ] && . ~/.bashrc\n' >> ~/.bash_profile
+```
+
+If your system uses `~/.profile` instead of `~/.bash_profile`, add the same line there. Then open a new SSH session and re-check `which xclip` or `echo $DISPLAY`.
 
 </details>
 
@@ -649,6 +694,56 @@ xclip -selection clipboard -t TARGETS -o
 Host myserver
     ControlMaster no
     ControlPath none
+```
+
+</details>
+
+<details>
+<summary><b>Setup fails because you passed <code>user@host</code> instead of a Host alias</b></summary>
+
+**Symptom:** `cc-clip setup alice@example.com` or `cc-clip connect alice@example.com` fails to update SSH config, or `doctor --host` reports that the exact host block is missing.
+
+**Cause:** `cc-clip` updates an exact `Host <alias>` block in `~/.ssh/config`. It does not manage raw `user@host` destinations directly.
+
+**Fix:** Define an alias first, then use that alias everywhere:
+
+```sshconfig
+Host myserver
+    HostName example.com
+    User alice
+```
+
+Then run:
+
+```bash
+cc-clip setup myserver
+ssh myserver
+```
+
+</details>
+
+<details>
+<summary><b>Earlier <code>Host *</code> or wildcard stanzas override the managed host</b></summary>
+
+**Symptom:** `cc-clip setup myserver` succeeds, but the SSH session still behaves as if your global SSH defaults won. Common signs are the tunnel not appearing, or `ssh -G myserver` showing unexpected `ControlMaster`, `ControlPath`, or `RemoteForward` values.
+
+**Cause:** OpenSSH uses the first value it obtains for most settings. An earlier `Host *` or `Host *.corp` stanza can override the exact host before `cc-clip`'s managed settings are reached.
+
+**Fix:** Keep your exact host entry and move conflicting wildcard settings after it, or remove the conflicting directives for that host path. A safe structure looks like:
+
+```sshconfig
+Host myserver
+    HostName example.com
+    User alice
+
+Host *
+    ServerAliveInterval 30
+```
+
+If you need to inspect the effective config, run:
+
+```bash
+ssh -G myserver | grep -E '^(hostname|user|remoteforward|controlmaster|controlpath) '
 ```
 
 </details>

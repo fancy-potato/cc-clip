@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/shunmei/cc-clip/internal/peer"
@@ -11,6 +12,13 @@ import (
 	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
 )
+
+var sshConfigQuery = func(candidate string) (string, error) {
+	cmd := exec.Command("ssh", "-G", candidate)
+	hideConsoleWindow(cmd)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
 
 func RunRemote(host string, port int) []CheckResult {
 	var results []CheckResult
@@ -300,31 +308,60 @@ func isLegacyPeerLookupError(err error) bool {
 
 func checkAliasPort(host string, reg *peer.Registration, localPort int) []CheckResult {
 	if reg == nil || reg.ReservedPort == 0 {
-		return []CheckResult{{"ssh-alias", true, "peer alias not configured; skipping alias port check"}}
+		return []CheckResult{{"ssh-alias", true, "peer SSH forwarding not configured; skipping SSH config port check"}}
 	}
 
-	want := fmt.Sprintf("%d 127.0.0.1:%d", reg.ReservedPort, localPort)
-
-	candidates := []string{host}
-	derivedAlias := peer.AliasForHost(host, reg.Label)
-	if derivedAlias != host {
-		candidates = append(candidates, derivedAlias)
+	out, err := sshConfigQuery(host)
+	if err != nil {
+		return []CheckResult{{"ssh-alias", false, fmt.Sprintf("ssh -G %s failed: %v; cannot verify RemoteForward", host, err)}}
 	}
-	for _, candidate := range candidates {
-		cmd := exec.Command("ssh", "-G", candidate)
-		hideConsoleWindow(cmd)
-		out, err := cmd.CombinedOutput()
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if matchesRemoteForward(line, reg.ReservedPort, "127.0.0.1", localPort) {
+			return []CheckResult{{"ssh-alias", true, fmt.Sprintf("%s forwards %d 127.0.0.1:%d", host, reg.ReservedPort, localPort)}}
+		}
+	}
+	return []CheckResult{{"ssh-alias", false, fmt.Sprintf("ssh config missing RemoteForward %d 127.0.0.1:%d", reg.ReservedPort, localPort)}}
+}
+
+func matchesRemoteForward(line string, listenPort int, targetHost string, targetPort int) bool {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 3 || fields[0] != "remoteforward" {
+		return false
+	}
+
+	if fields[1] != fmt.Sprintf("%d", listenPort) {
+		return false
+	}
+
+	host, port, ok := parseForwardTarget(fields[2])
+	return ok && host == targetHost && port == targetPort
+}
+
+func parseForwardTarget(s string) (string, int, bool) {
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end == -1 || end+2 > len(s) || s[end+1] != ':' {
+			return "", 0, false
+		}
+		host := s[1:end]
+		port, err := strconv.Atoi(s[end+2:])
 		if err != nil {
-			continue
+			return "", 0, false
 		}
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "remoteforward ") && strings.Contains(line, want) {
-				return []CheckResult{{"ssh-alias", true, fmt.Sprintf("%s forwards %s", candidate, want)}}
-			}
-		}
+		return host, port, true
 	}
-	return []CheckResult{{"ssh-alias", false, fmt.Sprintf("ssh config missing RemoteForward %s", want)}}
+
+	idx := strings.LastIndex(s, ":")
+	if idx <= 0 || idx+1 >= len(s) {
+		return "", 0, false
+	}
+	host := s[:idx]
+	port, err := strconv.Atoi(s[idx+1:])
+	if err != nil {
+		return "", 0, false
+	}
+	return host, port, true
 }
 
 func shellQuote(s string) string {

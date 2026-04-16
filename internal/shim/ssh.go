@@ -273,18 +273,6 @@ func InstallRemoteHookScript(session *SSHSession, port int) error {
 	return nil
 }
 
-func InstallRemoteShellEntryScript(session *SSHSession) error {
-	script := ShellEntryScript()
-	args := append(session.connArgs(), session.host,
-		"mkdir -p ~/.local/bin && cat > ~/.local/bin/cc-clip-shell-enter && chmod +x ~/.local/bin/cc-clip-shell-enter")
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = strings.NewReader(script)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to install remote shell entry script: %s: %w", strings.TrimSpace(string(out)), err)
-	}
-	return nil
-}
-
 // InstallRemoteClaudeWrapper installs the claude wrapper script to
 // ~/.local/bin/claude on the remote. The wrapper auto-injects notification
 // hooks via --settings when the cc-clip tunnel is alive, and transparently

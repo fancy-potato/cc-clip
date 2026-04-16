@@ -30,6 +30,91 @@ ssh myserver 'CC_CLIP_DEBUG=1 xclip -selection clipboard -t TARGETS -o'
 
 ---
 
+## Fresh SSH Session Still Misses PATH or DISPLAY
+
+**Symptom:** You reconnect with `ssh myserver`, but `which xclip` still shows `/usr/bin/xclip`, or `echo $DISPLAY` is still empty.
+
+**Cause:** `cc-clip` prepends its PATH and DISPLAY markers to `~/.bashrc` or `~/.zshrc`. Some SSH login-shell setups do not source those files automatically.
+
+**Quick fix for the current shell:**
+
+```bash
+source ~/.bashrc
+# or
+source ~/.zshrc
+```
+
+Then re-check:
+
+```bash
+which xclip
+echo $DISPLAY
+```
+
+**Persistent fix for bash login shells:**
+
+```bash
+printf '\n[ -f ~/.bashrc ] && . ~/.bashrc\n' >> ~/.bash_profile
+```
+
+If your environment uses `~/.profile` instead of `~/.bash_profile`, add the same line there instead. After that, open a new SSH session and verify the PATH or DISPLAY again.
+
+---
+
+## Exact Host Alias Is Required
+
+**Symptom:** `cc-clip setup alice@example.com`, `cc-clip connect alice@example.com`, or `cc-clip doctor --host alice@example.com` fails with an error about a missing exact host block, or no SSH config changes are applied.
+
+**Cause:** `cc-clip` manages an exact `Host <alias>` block in `~/.ssh/config`. It does not rewrite a raw `user@host` destination.
+
+**Fix:** Create an alias first:
+
+```sshconfig
+Host myserver
+    HostName example.com
+    User alice
+```
+
+Then use the alias consistently:
+
+```bash
+cc-clip setup myserver
+cc-clip connect myserver
+cc-clip doctor --host myserver
+ssh myserver
+```
+
+---
+
+## Earlier Wildcard Stanzas Override the Managed Host
+
+**Symptom:** `cc-clip setup myserver` completes, but the resulting SSH session still uses unexpected SSH settings, or the tunnel does not behave as expected.
+
+**Cause:** OpenSSH uses the first matching value for most options. If an earlier `Host *` or `Host *.corp` stanza sets `RemoteForward`, `ControlMaster`, or `ControlPath`, that value can win before the exact host entry is reached.
+
+**Diagnosis:**
+
+```bash
+ssh -G myserver | grep -E '^(hostname|user|remoteforward|controlmaster|controlpath) '
+```
+
+Check whether the output matches the alias you intend `cc-clip` to manage.
+
+**Fix:** Keep your exact host block in `~/.ssh/config` and place conflicting wildcard directives after it, or remove those directives from the earlier wildcard stanza for this host path.
+
+Recommended structure:
+
+```sshconfig
+Host myserver
+    HostName example.com
+    User alice
+
+Host *
+    ServerAliveInterval 30
+```
+
+---
+
 ## SSH ControlMaster Breaks RemoteForward
 
 **Symptom:** `cc-clip connect` reports "tunnel verified", but the tunnel doesn't work in your interactive SSH session. `curl -s http://127.0.0.1:18339/health` hangs on the remote.
