@@ -14,6 +14,11 @@ func TestClaudeWrapperContainsHookInjection(t *testing.T) {
 		"cc-clip-hook",
 		"CC_CLIP_PORT:-18339",
 		"exec \"$_REAL_CLAUDE\"",
+		// Current Claude Code hook schema wraps command entries in a
+		// {"hooks":[...]} parent object; guard against regression to the
+		// legacy flat form.
+		`"Stop": [{"hooks":[{"type":"command","command":"cc-clip-hook"}]}]`,
+		`"Notification": [{"hooks":[{"type":"command","command":"cc-clip-hook"}]}]`,
 	} {
 		if !strings.Contains(got, needle) {
 			t.Errorf("expected wrapper to contain %q", needle)

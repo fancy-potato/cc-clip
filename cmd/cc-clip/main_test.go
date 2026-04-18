@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -378,6 +379,30 @@ func TestClaudeHookConfigJSONIncludesNotificationAndStop(t *testing.T) {
 	}
 	if strings.Count(cfg, `"command": "cc-clip-hook"`) != 2 {
 		t.Fatalf("expected hook command to appear twice, got %q", cfg)
+	}
+
+	// Each event entry must use the current matcher-wrapped schema
+	// ({"hooks":[{type:command,...}]}), not the legacy flat form
+	// ({type:command,...}) that older Claude Code versions accepted.
+	var parsed struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &parsed); err != nil {
+		t.Fatalf("claudeHookConfigJSON not valid JSON: %v\n%s", err, cfg)
+	}
+	for _, event := range []string{"Stop", "Notification"} {
+		entries, ok := parsed.Hooks[event]
+		if !ok || len(entries) == 0 {
+			t.Fatalf("%s missing from hooks: %q", event, cfg)
+		}
+		if len(entries[0].Hooks) == 0 || entries[0].Hooks[0].Command != "cc-clip-hook" {
+			t.Fatalf("%s entry not matcher-wrapped with cc-clip-hook command: %q", event, cfg)
+		}
 	}
 }
 
