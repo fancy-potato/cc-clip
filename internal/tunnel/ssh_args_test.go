@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -281,6 +282,15 @@ func TestSSHTunnelArgsRequiresResolvedConfig(t *testing.T) {
 	}
 	if stubCalls != 0 {
 		t.Fatalf("stubCalls = %d, want 0", stubCalls)
+	}
+}
+
+func TestRequireTrustedSSHBinaryPrefixAcceptsWindowsSystemSSH(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only path policy")
+	}
+	if err := requireTrustedSSHBinaryPrefix(`C:\Windows\System32\OpenSSH\ssh.exe`); err != nil {
+		t.Fatalf("requireTrustedSSHBinaryPrefix: %v", err)
 	}
 }
 

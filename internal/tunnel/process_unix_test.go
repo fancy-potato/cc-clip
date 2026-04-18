@@ -93,3 +93,21 @@ func TestSignalTunnelProcessGroupTargetsProcessGroup(t *testing.T) {
 		t.Fatalf("sig = %v, want %v", gotSig, syscall.SIGTERM)
 	}
 }
+
+func TestShouldSignalTunnelProcessSkipsOnInspectError(t *testing.T) {
+	if shouldSignalTunnelProcess(4321, "SIGTERM", false, errors.New("ps failed")) {
+		t.Fatal("shouldSignalTunnelProcess returned true on inspect error, want false")
+	}
+}
+
+func TestShouldSignalTunnelProcessSkipsOnMismatch(t *testing.T) {
+	if shouldSignalTunnelProcess(4321, "SIGKILL", false, nil) {
+		t.Fatal("shouldSignalTunnelProcess returned true on mismatch, want false")
+	}
+}
+
+func TestShouldSignalTunnelProcessAllowsMatchedTunnel(t *testing.T) {
+	if !shouldSignalTunnelProcess(4321, "SIGTERM", true, nil) {
+		t.Fatal("shouldSignalTunnelProcess returned false on matching tunnel, want true")
+	}
+}

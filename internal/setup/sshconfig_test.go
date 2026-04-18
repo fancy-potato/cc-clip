@@ -935,6 +935,30 @@ func TestEnsureManagedHostConfigAtRejectsConflictingRemoteForwardWithoutPartialW
 	}
 }
 
+func TestEnsureSSHConfigAtRejectsConflictingRemoteForwardWithoutPartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	initial := strings.Join([]string{
+		"Host myserver",
+		"    HostName 10.0.0.1",
+		"    RemoteForward 18339 127.0.0.1:22",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(initial), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := ensureSSHConfigAt(configPath, "myserver", 18339)
+	if err == nil || !strings.Contains(err.Error(), "RemoteForward on port 18339") {
+		t.Fatalf("expected conflicting RemoteForward error, got %v", err)
+	}
+
+	content, _ := os.ReadFile(configPath)
+	if string(content) != initial {
+		t.Fatalf("expected no partial write on conflict, got:\n%s", string(content))
+	}
+}
+
 func TestEnsureManagedHostConfigAtRejectsIncompleteManagedFragment(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config")
@@ -1509,7 +1533,7 @@ func TestEnsureSSHConfigAtRewritesLocalhostRemoteForwardTargetWithInlineComment(
 	}
 }
 
-func TestEnsureSSHConfigAtRewritesRemoteForwardWithWildcardListenAddress(t *testing.T) {
+func TestEnsureSSHConfigAtRejectsRemoteForwardWithWildcardListenAddress(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config")
 	initial := strings.Join([]string{
@@ -1523,21 +1547,14 @@ func TestEnsureSSHConfigAtRewritesRemoteForwardWithWildcardListenAddress(t *test
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	changes, err := ensureSSHConfigAt(configPath, "myserver", 18339)
-	if err != nil {
-		t.Fatalf("ensureSSHConfigAt: %v", err)
+	_, err := ensureSSHConfigAt(configPath, "myserver", 18339)
+	if err == nil || !strings.Contains(err.Error(), "RemoteForward on port 18339") {
+		t.Fatalf("expected conflicting RemoteForward error, got %v", err)
 	}
 
 	content, _ := os.ReadFile(configPath)
-	s := string(content)
-	if strings.Contains(s, "0.0.0.0:18339") {
-		t.Fatalf("expected wildcard listen address to be removed, got:\n%s", s)
-	}
-	if strings.Count(s, "RemoteForward") != 1 {
-		t.Fatalf("RemoteForward count = %d, want 1; config:\n%s", strings.Count(s, "RemoteForward"), s)
-	}
-	if changes[0].Action != "updated" {
-		t.Fatalf("changes[0].Action = %q, want %q", changes[0].Action, "updated")
+	if string(content) != initial {
+		t.Fatalf("expected no partial write on wildcard conflict, got:\n%s", string(content))
 	}
 }
 

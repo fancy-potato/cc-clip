@@ -71,7 +71,7 @@ goreleaser config: `.goreleaser.yaml`. Release is published automatically (not d
 15. **deliver** (`internal/daemon/deliver.go`) — `DeliveryChain` tries adapters in priority order (cmux → platform-native). First success stops the chain. `BuildDeliveryChain()` constructs the default chain. Also implements `Notifier` interface for backward compat.
 16. **deliver_cmux** (`internal/daemon/deliver_cmux.go`) — Cross-platform tmux `display-message` adapter. Falls through if not in tmux.
 17. **notify_darwin** (`internal/daemon/notify_darwin.go`) — macOS-specific: terminal-notifier or osascript fallback.
-18. **claude wrapper** (`internal/shim/claude_wrapper.go`) — Bash script installed to `~/.local/bin/claude` on remote. Auto-injects `--settings` with Stop and Notification hooks when tunnel is alive. Falls through to real claude binary when tunnel is down.
+18. **clipcc wrapper** (`internal/shim/claude_wrapper.go`) — Bash script installed to `~/.local/bin/clipcc` on remote. Auto-injects `--settings` with Stop and Notification hooks when tunnel is alive, then delegates to the official `claude` launcher. Falls through to real claude binary when the tunnel is down.
 19. **cc-clip-hook** (`internal/shim/hook_template.go`) — Bash script installed to `~/.local/bin/cc-clip-hook` on remote. Reads hook JSON from stdin, injects hostname, POSTs to `/notify` endpoint with nonce auth. Logs failures to `~/.cache/cc-clip/notify-health.log`.
 
 ### Persistent Tunnel Manager

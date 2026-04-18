@@ -208,6 +208,11 @@ func ensureSSHConfigAt(configPath string, host string, port int) ([]SSHConfigCha
 				if line := block.directiveLine("remoteforward", func(value string) bool {
 					return remoteForwardUsesListenPort(value, port)
 				}); line >= 0 {
+					_, existingValue := parseSSHDirective(lines[line])
+					existingValue = strings.TrimSpace(existingValue)
+					if !ensureSSHConfigCanRewriteRemoteForward(existingValue, port) {
+						return nil, fmt.Errorf("refusing to manage Host %s: existing RemoteForward on port %d at line %d conflicts with cc-clip-managed SSH behavior", host, port, line+1)
+					}
 					lines[line] = fmt.Sprintf("    %s %s", d.key, d.value)
 					changes = append(changes, SSHConfigChange{"updated", fmt.Sprintf("%s %s", d.key, d.value)})
 					modified = true
@@ -892,6 +897,22 @@ func remoteForwardUsesListenPort(value string, listenPort int) bool {
 	}
 	got, ok := parseRemoteForwardListenPort(stripSSHQuotes(fields[0]))
 	return ok && got == listenPort
+}
+
+func ensureSSHConfigCanRewriteRemoteForward(value string, port int) bool {
+	listen, target, ok := parseRemoteForwardSpec(value)
+	if !ok || listen.port != port || target.port != port {
+		return false
+	}
+	if listen.hasHost && !isLoopbackListenHost(listen.host) {
+		return false
+	}
+	switch normalizeForwardHost(target.host) {
+	case "127.0.0.1", "localhost":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseRemoteForwardListenPort(token string) (int, bool) {

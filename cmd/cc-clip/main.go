@@ -1233,7 +1233,7 @@ func runConnect(opts connectOpts) {
 // 1. Generate nonce and register with local daemon
 // 2. Write nonce to remote
 // 3. Install hook script on remote
-// 4. Print Claude Code hook config
+// 4. Install clipcc wrapper or print Claude Code hook config
 // 5. Detect and configure Codex notify (if ~/.codex exists)
 // 6. Run health probe
 func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, stateDir string) *shim.NotifyDeployState {
@@ -1278,10 +1278,10 @@ func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, sta
 
 	hookInstalled := true
 
-	// Step N4: Install claude wrapper (auto-injects hooks via --settings)
-	fmt.Println("  [N4] Installing claude wrapper...")
-	if err := shim.InstallRemoteClaudeWrapper(session, remotePort); err != nil {
-		log.Printf("      warning: failed to install claude wrapper: %v", err)
+	// Step N4: Install clipcc wrapper (auto-injects hooks via --settings)
+	fmt.Println("  [N4] Installing clipcc wrapper...")
+	if err := shim.InstallRemoteClipCCWrapper(session, remotePort); err != nil {
+		log.Printf("      warning: failed to install clipcc wrapper: %v", err)
 		fmt.Println("      Falling back to manual hook config:")
 		fmt.Println()
 		for _, line := range strings.Split(claudeHookConfigJSON(), "\n") {
@@ -1289,8 +1289,9 @@ func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, sta
 		}
 		fmt.Println()
 	} else {
-		fmt.Println("      claude wrapper installed to ~/.local/bin/claude")
-		fmt.Println("      Hooks will be auto-injected when tunnel is alive")
+		fmt.Println("      clipcc wrapper installed to ~/.local/bin/clipcc")
+		fmt.Println("      Run 'clipcc' for Claude with auto-injected hooks")
+		fmt.Println("      Plain 'claude' remains unchanged for upstream auto-updates")
 	}
 
 	// Step N5: Detect and configure Codex notify
@@ -1348,10 +1349,10 @@ func connectNotifyDisable(session remoteExecutor, stateDir string) error {
 			},
 		},
 		{
-			label:   "Restoring Claude wrapper",
-			success: "Claude wrapper restored",
+			label:   "Removing clipcc wrapper",
+			success: "clipcc wrapper removed",
 			fn: func() error {
-				return restoreRemoteClaudeBinary(session)
+				return removeRemoteManagedClipCCWrapper(session)
 			},
 		},
 		{
@@ -2105,7 +2106,7 @@ func removeRemoteNotifyState(session remoteExecutor, stateDir string) error {
 		}
 	}
 
-	// Notifications are host-scoped because the hook script, Claude wrapper,
+	// Notifications are host-scoped because the hook script, clipcc wrapper,
 	// and Codex config are shared. Remove any peer-scoped leftovers as well.
 	if _, err := session.Exec(`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 \( -name 'notify.nonce' -o -name 'notify-health.log' \) -delete 2>/dev/null || true`); err != nil {
 		errs = append(errs, fmt.Errorf("remove peer notify state: %w", err))
@@ -2128,21 +2129,16 @@ func removeRemoteManagedHookScript(session remoteExecutor) error {
 	return nil
 }
 
-func restoreRemoteClaudeBinary(session remoteExecutor) error {
-	out, err := session.Exec("head -5 ~/.local/bin/claude 2>/dev/null || true")
+func removeRemoteManagedClipCCWrapper(session remoteExecutor) error {
+	out, err := session.Exec("head -5 ~/.local/bin/clipcc 2>/dev/null || true")
 	if err != nil {
-		return fmt.Errorf("inspect Claude wrapper: %w", err)
+		return fmt.Errorf("inspect clipcc wrapper: %w", err)
 	}
-	if !strings.Contains(out, "cc-clip claude wrapper") {
+	if !strings.Contains(out, "cc-clip clipcc wrapper") {
 		return nil
 	}
-
-	wrapperPath := shimShellQuote("~/.local/bin/claude")
-	backupPath := shimShellQuote("~/.local/bin/claude.cc-clip-bak")
-	restoreCmd := fmt.Sprintf("if [ -f %s ]; then mv -f %s %s; else rm -f %s; fi",
-		backupPath, backupPath, wrapperPath, wrapperPath)
-	if _, err := session.Exec(restoreCmd); err != nil {
-		return fmt.Errorf("restore Claude wrapper: %w", err)
+	if _, err := session.Exec(fmt.Sprintf("rm -f %s", shimShellQuote("~/.local/bin/clipcc"))); err != nil {
+		return fmt.Errorf("remove clipcc wrapper: %w", err)
 	}
 	return nil
 }

@@ -273,28 +273,27 @@ func InstallRemoteHookScript(session *SSHSession, port int) error {
 	return nil
 }
 
-// InstallRemoteClaudeWrapper installs the claude wrapper script to
-// ~/.local/bin/claude on the remote. The wrapper auto-injects notification
+// InstallRemoteClipCCWrapper installs the clipcc wrapper script to
+// ~/.local/bin/clipcc on the remote. The wrapper auto-injects notification
 // hooks via --settings when the cc-clip tunnel is alive, and transparently
 // passes through to the real claude binary when the tunnel is down.
 //
-// If an existing file at ~/.local/bin/claude is found that is NOT a cc-clip
-// wrapper, it is backed up to ~/.local/bin/claude.cc-clip-bak before overwriting.
-// The backup can be restored by cc-clip uninstall or manually.
-func InstallRemoteClaudeWrapper(session *SSHSession, port int) error {
-	// Check if an existing non-cc-clip wrapper exists and back it up.
-	out, _ := session.Exec("head -5 ~/.local/bin/claude 2>/dev/null || true")
-	if out != "" && !strings.Contains(out, "cc-clip claude wrapper") {
-		session.Exec("cp ~/.local/bin/claude ~/.local/bin/claude.cc-clip-bak 2>/dev/null || true")
+// Existing user-managed clipcc binaries are left untouched and cause install
+// to fail rather than being overwritten. The setup path intentionally does
+// not modify ~/.local/bin/claude.
+func InstallRemoteClipCCWrapper(session *SSHSession, port int) error {
+	out, _ := session.Exec("head -5 ~/.local/bin/clipcc 2>/dev/null || true")
+	if out != "" && !strings.Contains(out, "cc-clip clipcc wrapper") {
+		return fmt.Errorf("existing ~/.local/bin/clipcc is not managed by cc-clip")
 	}
 
-	script := ClaudeWrapperScript(port)
+	script := ClipCCWrapperScript(port)
 	args := append(session.connArgs(), session.host,
-		"mkdir -p ~/.local/bin && cat > ~/.local/bin/claude && chmod +x ~/.local/bin/claude")
+		"mkdir -p ~/.local/bin && cat > ~/.local/bin/clipcc && chmod +x ~/.local/bin/clipcc")
 	cmd := exec.Command("ssh", args...)
 	cmd.Stdin = strings.NewReader(script)
 	if outErr, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to install remote claude wrapper: %s: %w", strings.TrimSpace(string(outErr)), err)
+		return fmt.Errorf("failed to install remote clipcc wrapper: %s: %w", strings.TrimSpace(string(outErr)), err)
 	}
 	return nil
 }

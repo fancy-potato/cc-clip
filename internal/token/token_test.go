@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -274,6 +275,25 @@ func TestLoadOrGenerateTunnelControlTokenRegeneratesInvalidFile(t *testing.T) {
 	}
 	if len(tok) != 64 {
 		t.Fatalf("token length = %d, want 64", len(tok))
+	}
+}
+
+func TestLoadOrGenerateTunnelControlTokenRejectsSymlinkedTokenDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	realDir := filepath.Join(home, "real-cache")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	linkDir := filepath.Join(home, "linked-cache")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("cannot create symlink on this platform: %v", err)
+	}
+	TokenDirOverride = linkDir
+	defer func() { TokenDirOverride = "" }()
+
+	if _, _, err := LoadOrGenerateTunnelControlToken(); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("LoadOrGenerateTunnelControlToken error = %v, want symlink rejection", err)
 	}
 }
 

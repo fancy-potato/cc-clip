@@ -815,8 +815,8 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 			"head -5 ~/.local/bin/cc-clip-hook 2>/dev/null || true": {
 				out: "#!/usr/bin/env bash\n# cc-clip-hook — Claude Code hook bridge\n",
 			},
-			"head -5 ~/.local/bin/claude 2>/dev/null || true": {
-				out: "#!/usr/bin/env bash\n# cc-clip claude wrapper — auto-inject notification hooks\n",
+			"head -5 ~/.local/bin/clipcc 2>/dev/null || true": {
+				out: "#!/usr/bin/env bash\n# cc-clip clipcc wrapper — auto-inject notification hooks\n",
 			},
 		},
 	}
@@ -830,7 +830,7 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 		`rm -f "$HOME/.cache/cc-clip/notify.nonce" "$HOME/.cache/cc-clip/notify-health.log"`,
 		`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 \( -name 'notify.nonce' -o -name 'notify-health.log' \) -delete 2>/dev/null || true`,
 		`rm -f "$HOME/.local/bin/cc-clip-hook"`,
-		`if [ -f "$HOME/.local/bin/claude.cc-clip-bak" ]; then mv -f "$HOME/.local/bin/claude.cc-clip-bak" "$HOME/.local/bin/claude"; else rm -f "$HOME/.local/bin/claude"; fi`,
+		`rm -f "$HOME/.local/bin/clipcc"`,
 		`sed -i.cc-clip-bak '/# >>> cc-clip notify \(do not edit\) >>>/,/# <<< cc-clip notify \(do not edit\) <<</d' ~/.codex/config.toml 2>/dev/null || true; rm -f ~/.codex/config.toml.cc-clip-bak`,
 	} {
 		if session.indexOfCommandContaining(needle) < 0 {
@@ -839,13 +839,13 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 	}
 }
 
-func TestConnectNotifyDisableLeavesUserClaudeWrapperUntouched(t *testing.T) {
+func TestConnectNotifyDisableLeavesUserClipCCWrapperUntouched(t *testing.T) {
 	session := &recordingRemoteExecutor{
 		responses: map[string]remoteExecResponse{
 			"head -5 ~/.local/bin/cc-clip-hook 2>/dev/null || true": {
 				out: "#!/usr/bin/env bash\n# cc-clip-hook — Claude Code hook bridge\n",
 			},
-			"head -5 ~/.local/bin/claude 2>/dev/null || true": {
+			"head -5 ~/.local/bin/clipcc 2>/dev/null || true": {
 				out: "#!/usr/bin/env bash\n# user-managed wrapper\n",
 			},
 		},
@@ -854,8 +854,27 @@ func TestConnectNotifyDisableLeavesUserClaudeWrapperUntouched(t *testing.T) {
 	if err := connectNotifyDisable(session, "~/.cache/cc-clip/peers/peer-a"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if session.indexOfCommandContaining("claude.cc-clip-bak") >= 0 {
-		t.Fatalf("expected user-managed Claude wrapper to be left alone, got %v", session.commands)
+	if session.indexOfCommandContaining(`rm -f "$HOME/.local/bin/clipcc"`) >= 0 {
+		t.Fatalf("expected user-managed clipcc wrapper to be left alone, got %v", session.commands)
+	}
+}
+
+func TestConnectNotifyDisableDoesNotTouchClaudeBinary(t *testing.T) {
+	session := &recordingRemoteExecutor{
+		responses: map[string]remoteExecResponse{
+			"head -5 ~/.local/bin/cc-clip-hook 2>/dev/null || true": {
+				out: "#!/usr/bin/env bash\n# cc-clip-hook — Claude Code hook bridge\n",
+			},
+		},
+	}
+
+	if err := connectNotifyDisable(session, "~/.cache/cc-clip/peers/peer-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, cmd := range session.commands {
+		if strings.Contains(cmd, "~/.local/bin/claude") {
+			t.Fatalf("expected teardown to leave claude untouched, got %v", session.commands)
+		}
 	}
 }
 

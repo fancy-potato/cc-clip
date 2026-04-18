@@ -81,8 +81,33 @@ func requireTrustedSSHBinaryPrefix(abs string) error {
 	if home, err := os.UserHomeDir(); err == nil {
 		allowed = append(allowed, filepath.Join(home, ".local", "bin")+string(filepath.Separator), filepath.Join(home, "bin")+string(filepath.Separator))
 	}
+	if runtime.GOOS == "windows" {
+		allowed = append(allowed,
+			`C:\Windows\System32\OpenSSH\`,
+			`C:\Program Files\Git\usr\bin\`,
+			`C:\Program Files (x86)\Git\usr\bin\`,
+			`C:\ProgramData\chocolatey\bin\`,
+		)
+		if home, err := os.UserHomeDir(); err == nil {
+			allowed = append(allowed,
+				filepath.Join(home, "scoop", "shims")+string(filepath.Separator),
+				filepath.Join(home, "scoop", "apps")+string(filepath.Separator),
+			)
+		}
+	}
+	candidate := abs
+	if runtime.GOOS == "windows" {
+		candidate = strings.ToLower(filepath.Clean(abs))
+	}
 	for _, prefix := range allowed {
-		if strings.HasPrefix(abs, prefix) {
+		checkPrefix := prefix
+		if runtime.GOOS == "windows" {
+			checkPrefix = strings.ToLower(filepath.Clean(prefix))
+			if !strings.HasSuffix(checkPrefix, `\`) {
+				checkPrefix += `\`
+			}
+		}
+		if strings.HasPrefix(candidate, checkPrefix) {
 			return nil
 		}
 	}

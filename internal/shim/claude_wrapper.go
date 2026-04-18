@@ -3,18 +3,22 @@ package shim
 import "fmt"
 
 const claudeWrapperTemplate = `#!/usr/bin/env bash
-# cc-clip claude wrapper — auto-inject notification hooks
+# cc-clip clipcc wrapper — auto-inject notification hooks
 # Installed by: cc-clip connect
-# Remove with:  rm ~/.local/bin/claude
+# Remove with:  rm ~/.local/bin/clipcc
 
-# Find the real claude binary (skip our own directory)
+# Prefer the official claude launcher in the same directory so background
+# upgrades that update ~/.local/bin/claude keep working.
 _REAL_CLAUDE=""
 _SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-IFS=: read -ra _PATH_DIRS <<< "$PATH"
-for _dir in "${_PATH_DIRS[@]}"; do
-    [ "$_dir" = "$_SELF_DIR" ] && continue
-    [ -x "$_dir/claude" ] && _REAL_CLAUDE="$_dir/claude" && break
-done
+_LOCAL_CLAUDE="$_SELF_DIR/claude"
+
+if [ -x "$_LOCAL_CLAUDE" ]; then
+    _REAL_CLAUDE="$_LOCAL_CLAUDE"
+else
+    # No sibling claude in our own bin dir — fall back to a PATH lookup.
+    _REAL_CLAUDE="$(command -v claude || true)"
+fi
 
 if [ -z "$_REAL_CLAUDE" ]; then
     echo "cc-clip: real claude binary not found in PATH" >&2
@@ -35,12 +39,11 @@ else
 fi
 `
 
-// ClaudeWrapperScript returns the claude wrapper bash script with the
-// given port baked in. This script is installed to ~/.local/bin/claude
+// ClipCCWrapperScript returns the clipcc wrapper bash script with the
+// given port baked in. This script is installed to ~/.local/bin/clipcc
 // on the remote. When the cc-clip tunnel is alive, it injects Stop and
-// Notification hooks via --settings so users don't need to manually
-// configure hooks in ~/.claude/settings.json. When the tunnel is down,
-// it transparently passes through to the real claude binary.
-func ClaudeWrapperScript(port int) string {
+// Notification hooks via --settings. When the tunnel is down, it
+// transparently passes through to the real claude binary.
+func ClipCCWrapperScript(port int) string {
 	return fmt.Sprintf(claudeWrapperTemplate, port)
 }

@@ -33,27 +33,24 @@ func isTunnelSessionLeader(cmd *exec.Cmd) bool {
 // live cmdline. A bare "is it ssh -N -R"? check would be far too permissive
 // and would happily kill an unrelated `ssh -N -R` owned by the same user
 // after PID recycling.
-func pidStillMatchesTunnelCmd(cmd *exec.Cmd) bool {
+func pidStillMatchesTunnelCmd(cmd *exec.Cmd) (bool, error) {
 	if cmd == nil || cmd.Process == nil {
-		return false
+		return false, nil
 	}
 	forward, host, ok := tunnelCommandSignature(cmd)
 	if !ok {
-		return false
+		return false, nil
 	}
 	pid := cmd.Process.Pid
 	cmdline, err := tunnelProcessCommandLine(pid)
 	if err != nil {
 		if errors.Is(err, errTunnelProcessNotRunning) {
-			return false
+			return false, nil
 		}
-		// Inspect failure is ambiguous. Log and skip rather than risk
-		// signalling a recycled pid that may own an unrelated process.
-		log.Printf("tunnel-manager: pid %d inspect failed before signal: %v", pid, err)
-		return false
+		return false, err
 	}
 	return liveCommandLineContainsToken(cmdline, forward) &&
-		liveCommandLineContainsToken(cmdline, host)
+		liveCommandLineContainsToken(cmdline, host), nil
 }
 
 // tunnelCommandSignature extracts the `-R <spec>` value and the trailing host
@@ -94,12 +91,24 @@ func liveCommandLineContainsToken(live, token string) bool {
 	return false
 }
 
+func shouldSignalTunnelProcess(pid int, sigName string, matches bool, err error) bool {
+	if err != nil {
+		log.Printf("tunnel-manager: pid %d inspect failed before %s: %v; skipping signal", pid, sigName, err)
+		return false
+	}
+	if !matches {
+		log.Printf("tunnel-manager: skipping %s to pid %d (no longer a cc-clip ssh tunnel)", sigName, pid)
+		return false
+	}
+	return true
+}
+
 func stopTunnelProcess(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	if !pidStillMatchesTunnelCmd(cmd) {
-		log.Printf("tunnel-manager: skipping SIGTERM to pid %d (no longer a cc-clip ssh tunnel)", cmd.Process.Pid)
+	matches, err := pidStillMatchesTunnelCmd(cmd)
+	if !shouldSignalTunnelProcess(cmd.Process.Pid, "SIGTERM", matches, err) {
 		return nil
 	}
 	if isTunnelSessionLeader(cmd) {
@@ -117,8 +126,8 @@ func forceKillTunnelCommand(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	if !pidStillMatchesTunnelCmd(cmd) {
-		log.Printf("tunnel-manager: skipping SIGKILL to pid %d (no longer a cc-clip ssh tunnel)", cmd.Process.Pid)
+	matches, err := pidStillMatchesTunnelCmd(cmd)
+	if !shouldSignalTunnelProcess(cmd.Process.Pid, "SIGKILL", matches, err) {
 		return nil
 	}
 	if isTunnelSessionLeader(cmd) {
