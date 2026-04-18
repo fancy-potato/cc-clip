@@ -32,6 +32,7 @@
 - [SSH Notifications](#ssh-notifications)
 - [Security](#security)
 - [Daily Usage](#daily-usage)
+- [Persistent Tunnels & SwiftBar](#persistent-tunnels--swiftbar)
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [Platform Support](#platform-support)
@@ -80,9 +81,16 @@ Host myserver
     IdentityFile ~/.ssh/id_rsa  # optional, if using key auth
 ```
 
-Use a stable alias such as `myserver` for all `cc-clip` commands. Do not run `cc-clip setup`, `cc-clip connect`, or `cc-clip doctor --host` against a raw `user@host` destination such as `alice@example.com`; define a `Host myserver` entry first, then use `myserver` consistently.
+Use a stable alias such as `myserver` for the config-managing commands (`cc-clip setup`, `cc-clip connect`, `cc-clip tunnel up`). Those commands manage or auto-detect the `cc-clip` SSH block by alias. `cc-clip doctor --host` is read-only, but using the same alias gives you the most useful SSH-config diagnostics.
 
-If your SSH config also has broad stanzas such as `Host *` or `Host *.corp`, keep the exact `Host myserver` block in the file and avoid setting conflicting `RemoteForward`, `ControlMaster`, or `ControlPath` values for that alias earlier in the match order.
+`cc-clip` requires a dedicated exact `Host <alias>` stanza for the alias it manages. Shared multi-pattern stanzas such as `Host prod staging` are not supported; split them into separate `Host prod` / `Host staging` entries first.
+
+If your SSH config also has broad stanzas such as `Host *` or `Host *.corp`, `cc-clip` is currently safe in these cases:
+
+- `Host myserver` already exists as its own exact block, and it appears before wildcard stanzas that set `RemoteForward`, `ControlMaster`, or `ControlPath`
+- Earlier wildcard stanzas do not set those three directives for this host path
+
+`cc-clip` does **not** rewrite or reorder wildcard blocks for you. If an earlier wildcard stanza already wins for `RemoteForward`, `ControlMaster`, or `ControlPath`, move the exact `Host myserver` block above that wildcard stanza or remove the conflicting directive from the wildcard block.
 
 If you are on Windows and want the SSH/Claude Code workflow, use the dedicated guide:
 
@@ -134,12 +142,29 @@ This single command handles everything:
 3. Starts the local daemon (via macOS launchd)
 4. Deploys the binary and shim to the remote server
 
-`cc-clip setup` edits the exact `Host myserver` block you pass in. It does not patch wildcard-only entries such as `Host *` or `Host *.corp`.
+`cc-clip setup` edits the exact `Host myserver` block you pass in. It does not patch wildcard-only entries such as `Host *` or `Host *.corp`, it does not reorder earlier wildcard blocks, and it does not manage shared stanzas such as `Host prod staging`.
 
 Before you run setup, make sure:
 - You pass the SSH alias from `~/.ssh/config`, not `user@host`.
 - The alias has its own exact `Host myserver` block.
-- Earlier wildcard blocks do not already force conflicting `RemoteForward`, `ControlMaster`, or `ControlPath` values for that host.
+- The alias is not grouped with another alias in a shared stanza such as `Host prod staging`.
+- Earlier wildcard blocks do not already force conflicting `RemoteForward`, `ControlMaster`, or `ControlPath` values for that host, or your exact host block is placed before those wildcard blocks.
+- `~/.ssh/config` is owned by your user, and if it is a symlink or reparse-point-backed path you understand that cc-clip rewrites the resolved target file in place.
+- If `~/.ssh/config` uses `Include`, keep the exact host block you want cc-clip to manage in the main file. cc-clip does not rewrite included files.
+- You are not editing `~/.ssh/config` in another editor while `cc-clip setup`, `cc-clip connect`, or `cc-clip uninstall --host` is running. Those commands do a read → rewrite → atomic rename without taking an advisory lock, so a concurrent `vim :w` can silently lose your edit. `cc-clip tunnel up` only reads the managed block to discover ports, and `cc-clip doctor` only checks and reports.
+
+If `ssh -G myserver` still shows wildcard-derived `remoteforward`, `controlmaster`, or `controlpath` values after setup, manually reorder `~/.ssh/config` so the exact host block comes first, then re-run `cc-clip setup myserver`.
+
+`cc-clip` creates a one-time `~/.ssh/config.cc-clip-backup` on the first rewrite and preserves it across subsequent runs. If you need to restore the pristine file, copy that backup over `~/.ssh/config` and re-run `cc-clip setup`.
+
+### SSH config rewrite caveats
+
+When `cc-clip` rewrites `~/.ssh/config`, it normalizes a few details that some hand-edited configs rely on. These are documented behaviors, not bugs — plan around them or keep the settings outside the exact host block cc-clip manages:
+
+- **Line endings are picked by majority vote.** If your file's CRLF count strictly exceeds its LF count, cc-clip writes CRLF; otherwise it writes LF. A file with balanced or roughly-equal endings will come out all-LF.
+- **Quoted `Host` tokens lose their quotes.** `Host "myserver"` is rewritten as `Host myserver`. The alias still works — ssh does not require quoting for simple tokens — but if you rely on the literal quotes they will not come back.
+- **The managed marker strings are reserved.** Do not paste `# >>> cc-clip managed host: … >>>` anywhere in `~/.ssh/config` as free-form commentary; cc-clip treats that exact line as the start of a managed block.
+- **`~/.ssh/config` is rewritten in place via tmp-file + rename.** Keep the file on the same filesystem as its parent directory (default on every platform unless you've symlinked the whole `~/.ssh` tree across volumes).
 
 <details>
 <summary>See it in action (macOS)</summary>
@@ -180,15 +205,21 @@ Then re-run `cc-clip setup myserver --codex`.
 
 ### Step 3: Connect and use
 
-Open a **new** SSH session to your server (the tunnel activates on SSH connection):
+Use one of these workflows:
 
 ```bash
+# Default per-session tunnel — the reverse forward comes up with your SSH session.
 ssh myserver
+
+# Optional persistent tunnel — the daemon owns the forward, open SSH sessions
+# independently of the tunnel lifecycle.
+cc-clip tunnel up myserver
+ssh myserver    # still how you get a shell; the forward is already alive
 ```
 
 Then use Claude Code or Codex CLI as normal — `Ctrl+V` now pastes images from your Mac clipboard.
 
-> **Important:** The image paste works through the SSH tunnel. You must connect via `ssh myserver` (the host you set up). The tunnel is established on each SSH connection.
+> **Important:** The image paste works through the SSH tunnel. You must connect via `ssh myserver` (the host you set up). Without a persistent tunnel, the forward comes up with each SSH session. With `cc-clip tunnel up myserver`, the daemon keeps the forward alive in the background.
 >
 > If `which xclip` still points to `/usr/bin/xclip` or `DISPLAY` is still empty after reconnecting, your login shell may not source `~/.bashrc` or `~/.zshrc` automatically. Run `source ~/.bashrc` or `source ~/.zshrc`, then see [Troubleshooting Guide](docs/troubleshooting.md) for a persistent fix.
 >
@@ -366,7 +397,7 @@ cat ~/.cache/cc-clip/notify-health.log
 
 | Problem | Fix |
 |---------|-----|
-| Tunnel down (step 1 fails) | Kill stale sshd: `sudo kill $(sudo lsof -ti :18339)`, then reconnect SSH |
+| Tunnel down (step 1 fails) | Kill the stale sshd that holds the managed remote port: find it with `ssh -G myserver \| awk '$1 == "remoteforward" {print $2; exit}'`, then inspect/kill that port on remote and reconnect SSH |
 | Old hook script (step 2 empty) | Reinstall: `cc-clip connect myserver` or manually copy the script |
 | Missing nonce (step 3 fails) | Register nonce (see Step 4 above) |
 | Daemon running old binary | Rebuild (`make build`) and restart (`cc-clip serve`) |
@@ -399,7 +430,7 @@ codex           # Codex CLI
 # 3. Ctrl+V pastes images from your Mac clipboard
 ```
 
-The local daemon runs as a macOS launchd service and starts automatically on login. No need to re-run setup.
+On macOS, the local daemon runs as a launchd service and starts automatically on login — no need to re-run setup. On Linux, there is no bundled auto-start integration; either run `cc-clip serve` manually in a terminal multiplexer, or wire it up with systemd/supervisord as you prefer.
 
 ### Windows workflow
 
@@ -411,6 +442,108 @@ For first-time setup and day-to-day usage, use:
 
 The Windows workflow uses a dedicated remote-paste hotkey (default: `Alt+Shift+V`) so it does not collide with local Claude Code's native `Alt+V`.
 
+## Persistent Tunnels & SwiftBar
+
+By default the SSH tunnel only lives while your `ssh myserver` session is open. **Persistent tunnels** keep the port forwarding alive in the background with auto-reconnect, so clipboard and notifications work even when you don't have an interactive SSH session.
+
+### Managing persistent tunnels (CLI)
+
+```bash
+# Start a persistent tunnel for a host
+cc-clip tunnel up myserver
+
+# List all tunnels and their status
+cc-clip tunnel list
+
+# Stop the tunnel on the current daemon (default port 18339).
+# For multi-daemon setups, pass --port (or CC_CLIP_PORT) to select another daemon.
+cc-clip tunnel down myserver
+
+# Forget a tunnel entirely (stops it, then deletes its saved state file)
+cc-clip tunnel remove myserver
+```
+
+`tunnel up` auto-detects the remote listen port from your `~/.ssh/config` managed block. Tunnels survive daemon restarts — the daemon re-establishes saved tunnels on startup.
+
+**Picking up `~/.ssh/config` changes.** When you first run `cc-clip tunnel up <host>`, cc-clip runs `ssh -G <host>` to expand your SSH config (HostName, User, IdentityFile, ProxyCommand, …) and caches the result in the tunnel's state file. The reconnect loop and daemon-startup adoption re-use that cached snapshot; they do **not** re-read `~/.ssh/config` on every reconnect. This is deliberate: it keeps the options you approved at `tunnel up` time from being silently replaced on the next network flap. If you later edit `~/.ssh/config` (e.g. you updated `HostName`, rotated an `IdentityFile`, or added a `ProxyCommand`), re-run `cc-clip tunnel up <host>` to refresh the cache — that is the canonical "tell cc-clip about my new SSH config" command. Editing the config alone is not enough; `tunnel down && tunnel up` also works but `tunnel up` is sufficient.
+
+Port source model:
+
+- `cc-clip connect` reserves the remote listen port in the remote peer registry, then writes that reservation into the local managed `RemoteForward` block.
+- The allocation source of truth is the remote peer registry.
+- The runtime source used by `cc-clip tunnel up` is the local managed block in `~/.ssh/config`. `tunnel up` does not SSH back to the remote just to look up the port.
+- `cc-clip doctor --host` compares the remote peer registry with the local managed block, then checks the effective SSH config from `ssh -G`.
+
+Daemon/port model:
+
+- The local daemon port defaults to `18339`. Override per-command with `--port`, or globally with `CC_CLIP_PORT`.
+- A persistent tunnel's `local_port` (the endpoint of `ssh -R <remote>:127.0.0.1:<local_port>`) is always equal to the owning daemon's HTTP port — the reverse forward is only useful if it lands on a port where a daemon is actually listening. A daemon only manages tunnels whose `local_port` matches its own listening port.
+- `tunnel up` / `down` / `remove` accept a single `--port` flag that selects the daemon to talk to. `tunnel up` will also adopt the daemon port recorded in the managed block (or the only saved tunnel for the host) when `--port` is not given, so `cc-clip tunnel up <host>` routes to the right daemon automatically in single-daemon setups.
+- To act on a specific daemon's tunnel in a multi-daemon setup, point `--port` (or `CC_CLIP_PORT`) at that daemon.
+
+> **Requirement:** Persistent tunnels use `BatchMode=yes` (no interactive prompts). Your SSH key must be in `ssh-agent` or passwordless. Run `ssh-add` if needed.
+>
+> If you upgraded from an older `cc-clip` while the local daemon was already running, restart the local daemon/service once before using `cc-clip tunnel ...` so the `/tunnels` routes are registered.
+>
+> **Token rotation:** The tunnel-control token at `~/.cache/cc-clip/tunnel-control.token` is local-only (never synced to the remote). Rotate it with `cc-clip serve --rotate-tunnel-token`; the SwiftBar plugin and `cc-clip tunnel ...` CLI read the fresh token on next invocation.
+
+### SwiftBar menu bar plugin (macOS)
+
+[SwiftBar](https://github.com/swiftbar/SwiftBar) is a macOS menu bar app that runs shell scripts and displays their output. The included plugin shows tunnel status at a glance and lets you start/stop already-saved tunnels from the menu bar.
+
+<p align="center">
+  <code>● 2/3</code> — 2 of 3 tunnels connected
+</p>
+
+**Prerequisites:**
+
+- [SwiftBar](https://github.com/swiftbar/SwiftBar) installed (`brew install --cask swiftbar`)
+- `jq` installed (`brew install jq`)
+- `cc-clip` in PATH
+
+**Install the plugin:**
+
+Symlink the script into SwiftBar's plugin directory. Use an absolute path so
+the link keeps working when you move your shell elsewhere:
+
+```bash
+ln -s /absolute/path/to/cc-clip/scripts/cc-clip-tunnels.30s.sh \
+    ~/Library/Application\ Support/SwiftBar/Plugins/
+```
+
+If you are currently `cd`'d into the repo root, `$(pwd)/scripts/...` expands
+to the same absolute path.
+
+The `30s` in the filename means SwiftBar refreshes every 30 seconds.
+
+Create the first tunnel from the CLI with `cc-clip tunnel up myserver`. After that, SwiftBar can manage the saved tunnel.
+
+If you keep multiple daemon instances on different ports for the same host, select which one to act against with `--port` (or `CC_CLIP_PORT`):
+
+```bash
+cc-clip tunnel down myserver --port 18444
+# or
+CC_CLIP_PORT=18444 cc-clip tunnel down myserver
+```
+
+See the [Daemon/port model](#managing-persistent-tunnels-cli) above for why `--port` is the only selector needed.
+
+**What you'll see:**
+
+| Menu bar | Meaning |
+|----------|---------|
+| `● 2/2` (green) | All tunnels connected |
+| `● 1/2` (orange) | Some tunnels disconnected |
+| `⊘ 0/2` (gray) | All tunnels down |
+| `⊘` | No tunnels configured |
+
+Click the menu bar icon to see per-host details:
+
+- Status (connected / connecting / disconnected)
+- Port mapping (remote:port -> local:port)
+- PID, reconnect count, last error
+- **Start** / **Stop** button for each tunnel, sent to that tunnel's recorded local daemon port
+
 ## Commands
 
 | Command | Description |
@@ -420,6 +553,10 @@ The Windows workflow uses a dedicated remote-paste hotkey (default: `Alt+Shift+V
 | `cc-clip connect <host>` | Deploy to remote (incremental) |
 | `cc-clip connect <host> --token-only` | Sync token only (fast) |
 | `cc-clip connect <host> --force` | Full redeploy ignoring cache |
+| `cc-clip tunnel list` | List persistent tunnels and their status |
+| `cc-clip tunnel up <host>` | Start a persistent tunnel to a host |
+| `cc-clip tunnel down <host>` | Stop a persistent tunnel owned by this daemon (select with `--port` / `CC_CLIP_PORT` if you run several) |
+| `cc-clip tunnel remove <host>` | Stop and delete a persistent tunnel's saved state (select daemon with `--port`) |
 | `cc-clip notify --title T --body B` | Send a notification through the tunnel |
 | `cc-clip notify --from-codex-stdin` | Read Codex JSON from stdin and notify |
 | `cc-clip doctor --host <host>` | End-to-end health check |
@@ -442,8 +579,13 @@ The Windows workflow uses a dedicated remote-paste hotkey (default: `Alt+Shift+V
 | `cc-clip connect <host> --codex` | Deploy with Codex support (Xvfb + x11-bridge) |
 | `cc-clip connect <host> --token-only` | Sync token only (fast) |
 | `cc-clip connect <host> --force` | Full redeploy ignoring cache |
+| `cc-clip tunnel list [--json]` | List persistent tunnels |
+| `cc-clip tunnel up <host> [--remote-port N]` | Start a persistent tunnel |
+| `cc-clip tunnel down <host>` | Stop the tunnel owned by the current daemon (select with `--port` / `CC_CLIP_PORT`) |
+| `cc-clip tunnel remove <host>` | Stop and delete the tunnel's saved state (select daemon with `--port`) |
 | `cc-clip serve` | Start daemon in foreground |
-| `cc-clip serve --rotate-token` | Start daemon with forced new token |
+| `cc-clip serve --rotate-token` | Start daemon with forced new clipboard session token |
+| `cc-clip serve --rotate-tunnel-token` | Start daemon with forced new tunnel-control token |
 | `cc-clip service install` | Install macOS launchd service |
 | `cc-clip service uninstall` | Remove launchd service |
 | `cc-clip service status` | Show service status |
@@ -471,11 +613,11 @@ The Windows workflow uses a dedicated remote-paste hotkey (default: `Alt+Shift+V
 
 ## Configuration
 
-All settings have sensible defaults. Override via environment variables:
+All settings have sensible defaults. The local daemon port defaults to `18339`. Override it with `CC_CLIP_PORT`, or with command-specific `--port` flags where supported:
 
 | Setting | Default | Env Var |
 |---------|---------|---------|
-| Port | 18339 | `CC_CLIP_PORT` |
+| Local daemon port | 18339 | `CC_CLIP_PORT` |
 | Token TTL | 30d | `CC_CLIP_TOKEN_TTL` |
 | Debug logs | off | `CC_CLIP_DEBUG=1` |
 
@@ -484,7 +626,7 @@ All settings have sensible defaults. Override via environment variables:
 
 | Setting | Default | Env Var |
 |---------|---------|---------|
-| Port | 18339 | `CC_CLIP_PORT` |
+| Local daemon port | 18339 | `CC_CLIP_PORT` |
 | Token TTL | 30d | `CC_CLIP_TOKEN_TTL` |
 | Output dir | `$XDG_RUNTIME_DIR/claude-images` | `CC_CLIP_OUT_DIR` |
 | Probe timeout | 500ms | `CC_CLIP_PROBE_TIMEOUT_MS` |
@@ -562,12 +704,16 @@ Replace `~/.zshrc` with `~/.bashrc` if you use bash.
 **Step-by-step verification:**
 
 ```bash
+# Replace <local-daemon-port> with your current local daemon port
+# (default 18339, or your CC_CLIP_PORT / --port value).
+
 # 1. Local: Is the daemon running?
-curl -s http://127.0.0.1:18339/health
+curl -s http://127.0.0.1:<local-daemon-port>/health
 # Expected: {"status":"ok"}
 
 # 2. Remote: Is the tunnel forwarding?
-ssh myserver "curl -s http://127.0.0.1:18339/health"
+# Replace <remote-port> with the managed RemoteForward listen port.
+ssh myserver "curl -s http://127.0.0.1:<remote-port>/health"
 # Expected: {"status":"ok"}
 
 # 3. Remote: Is the shim taking priority?
@@ -580,29 +726,33 @@ ssh myserver 'CC_CLIP_DEBUG=1 xclip -selection clipboard -t TARGETS -o'
 # Expected: image/png
 ```
 
-If step 2 fails, you need to open a **new** SSH connection (the tunnel is established on connect).
+If step 2 fails, either start the persistent tunnel locally with `cc-clip tunnel up myserver`, or open a **new** SSH connection if you are using the per-session tunnel flow.
 
 If step 3 fails, the PATH fix didn't take effect. Open a fresh SSH session, or run `source ~/.bashrc` / `source ~/.zshrc`. See [Troubleshooting Guide](docs/troubleshooting.md) if your login shell does not load that file automatically.
 
 </details>
 
 <details>
-<summary><b>New SSH tab says "remote port forwarding failed for listen port 18339"</b></summary>
+<summary><b>New SSH tab says "remote port forwarding failed for listen port ..."</b></summary>
 
-**Symptom:** A newly opened SSH tab warns `remote port forwarding failed for listen port 18339`, and image paste in that tab does nothing.
+**Symptom:** A newly opened SSH tab warns `remote port forwarding failed for listen port <remote-port>`.
 
-**Cause:** `cc-clip` uses a fixed remote port (`18339`) for the reverse tunnel. If another SSH session to the same host already owns that port, or a stale `sshd` child is still holding it, the new tab cannot establish its own tunnel.
+**Cause:** `cc-clip tunnel up myserver` does not hardcode a remote port. It reads the alias's managed `RemoteForward` and reuses that remote listen port. If another SSH session to the same host already owns that port, or a stale `sshd` child is still holding it, the new tab cannot establish its own tunnel. If you are using `cc-clip tunnel up myserver`, that persistent tunnel already owns the port on purpose, so the warning on extra SSH tabs is expected.
 
 **Fix:**
 
 ```bash
-# Inspect the remote port without opening another forward:
-ssh -o ClearAllForwardings=yes myserver "ss -tln | grep 18339 || true"
+# Show the managed RemoteForward mapping for this alias:
+ssh -G myserver | awk '$1 == "remoteforward" {print $2, $3; exit}'
+
+# Then inspect that remote listen port without opening another forward:
+ssh -o ClearAllForwardings=yes myserver "ss -tln | grep <remote-port> || true"
 ```
 
-- If another live SSH tab already owns the tunnel, use that tab/session, or close it before opening a new one.
-- If the port is stuck after a disconnect, follow the stale `sshd` cleanup steps below.
-- If you truly need multiple concurrent SSH sessions with image paste, give each host alias a different `cc-clip` port instead of sharing `18339`.
+- If `cc-clip tunnel list` shows a connected persistent tunnel for this host, you can ignore the warning. Clipboard and notifications continue to use the already-running persistent tunnel.
+- If you are not using persistent tunnels, another live SSH tab may already own the port. Use that tab/session, or close it before opening a new one.
+- If the port is stuck after a disconnect and no persistent tunnel is connected, follow the stale `sshd` cleanup steps below.
+- If you truly need multiple concurrent SSH sessions with image paste, give each host alias a different managed `RemoteForward` port instead of sharing the same one.
 
 </details>
 
@@ -620,9 +770,11 @@ echo $DISPLAY
 # If empty → open a NEW SSH session, or run: source ~/.bashrc / source ~/.zshrc
 
 # 2. Is the SSH tunnel working?
-curl -s http://127.0.0.1:18339/health
+# Replace <remote-port> with the managed RemoteForward listen port.
+curl -s http://127.0.0.1:<remote-port>/health
 # Expected: {"status":"ok"}
-# If fails → open a NEW SSH connection (tunnel activates on connect)
+# If fails → if you use persistent tunnels, run `cc-clip tunnel list` locally and restart it with
+# `cc-clip tunnel up myserver`; otherwise open a NEW SSH connection
 
 # 3. Is Xvfb running?
 ps aux | grep Xvfb | grep -v grep
@@ -648,7 +800,7 @@ xclip -selection clipboard -t TARGETS -o
 | Step fails | Fix |
 |-----------|-----|
 | Step 1 (DISPLAY empty) | Open a **new** SSH session. If still empty: `source ~/.bashrc` or `source ~/.zshrc` |
-| Step 2 (tunnel down) | Open a **new** SSH connection — tunnel is per-connection |
+| Step 2 (tunnel down) | If you use persistent tunnels, run `cc-clip tunnel list` locally and restart it with `cc-clip tunnel up myserver`; otherwise open a **new** SSH connection |
 | Steps 3-4 (processes missing) | `cc-clip connect myserver --codex --force` from local |
 | Step 6 (no image/png) | Copy an image on Mac first: `Cmd+Shift+Ctrl+4` |
 
@@ -684,7 +836,7 @@ If your system uses `~/.profile` instead of `~/.bash_profile`, add the same line
 <details>
 <summary><b>SSH ControlMaster breaks RemoteForward</b></summary>
 
-**Symptom:** Tunnel works during `connect`, but `curl http://127.0.0.1:18339/health` hangs in your SSH session.
+**Symptom:** Tunnel works during `connect`, but `curl http://127.0.0.1:<remote-port>/health` hangs in your SSH session.
 
 **Cause:** An existing SSH ControlMaster connection was reused without `RemoteForward`.
 
@@ -723,21 +875,64 @@ ssh myserver
 </details>
 
 <details>
+<summary><b>Setup fails because the alias lives in a shared <code>Host prod staging</code> stanza</b></summary>
+
+**Symptom:** `cc-clip setup staging`, `cc-clip connect staging`, or `cc-clip tunnel up staging` fails even though `staging` appears in `~/.ssh/config`.
+
+**Cause:** `cc-clip` only manages a dedicated exact `Host <alias>` block. Shared multi-pattern stanzas such as `Host prod staging` are unsupported.
+
+**Fix:** Split the shared stanza into separate exact aliases before using `cc-clip`:
+
+```sshconfig
+Host prod
+    HostName prod.example.com
+    User alice
+
+Host staging
+    HostName staging.example.com
+    User alice
+```
+
+Then run `cc-clip setup staging` (or the alias you want to manage).
+
+</details>
+
+<details>
 <summary><b>Earlier <code>Host *</code> or wildcard stanzas override the managed host</b></summary>
 
 **Symptom:** `cc-clip setup myserver` succeeds, but the SSH session still behaves as if your global SSH defaults won. Common signs are the tunnel not appearing, or `ssh -G myserver` showing unexpected `ControlMaster`, `ControlPath`, or `RemoteForward` values.
 
 **Cause:** OpenSSH uses the first value it obtains for most settings. An earlier `Host *` or `Host *.corp` stanza can override the exact host before `cc-clip`'s managed settings are reached.
 
-**Fix:** Keep your exact host entry and move conflicting wildcard settings after it, or remove the conflicting directives for that host path. A safe structure looks like:
+**What works today:**
+
+- A dedicated exact block such as `Host myserver`
+- Wildcard stanzas that appear later in the file
+- Earlier wildcard stanzas that do not set `RemoteForward`, `ControlMaster`, or `ControlPath`
+
+**What needs manual cleanup:**
+
+- A wildcard-only config with no exact `Host myserver` block
+- An earlier `Host *` / `Host *.corp` stanza that already sets `RemoteForward`, `ControlMaster`, or `ControlPath`
+- A config where `cc-clip` updated `Host myserver`, but that exact block still appears after the conflicting wildcard stanza
+
+**Fix:** Keep your exact host entry and move conflicting wildcard settings after it, or remove the conflicting directives for that host path. `cc-clip` does not reorder wildcard blocks for you. A safe structure looks like:
 
 ```sshconfig
 Host myserver
     HostName example.com
     User alice
+    # cc-clip-managed directives land here
 
 Host *
     ServerAliveInterval 30
+```
+
+If you keep a wildcard block for general SSH defaults, prefer leaving only non-conflicting options there. After editing the file, re-run:
+
+```bash
+cc-clip setup myserver
+ssh -G myserver | grep -E '^(hostname|user|remoteforward|controlmaster|controlpath) '
 ```
 
 If you need to inspect the effective config, run:
@@ -749,14 +944,14 @@ ssh -G myserver | grep -E '^(hostname|user|remoteforward|controlmaster|controlpa
 </details>
 
 <details>
-<summary><b>Stale sshd process blocks port 18339</b></summary>
+<summary><b>Stale sshd process blocks the managed remote port</b></summary>
 
-**Symptom:** `Warning: remote port forwarding failed for listen port 18339`
+**Symptom:** `Warning: remote port forwarding failed for listen port <remote-port>`, and `cc-clip tunnel list` does not show a connected persistent tunnel for that host.
 
-**Fix:** Kill the stale process on remote:
+**Fix:** Kill the stale process on remote only after confirming no persistent tunnel is already connected:
 
 ```bash
-sudo ss -tlnp | grep 18339     # find the PID
+sudo ss -tlnp | grep <remote-port>     # find the PID
 sudo kill <PID>                  # kill it
 ```
 
@@ -794,6 +989,61 @@ cc-clip service uninstall
 curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh
 cc-clip setup myserver
 ```
+
+</details>
+
+<details>
+<summary><b>My manual edit to <code>~/.ssh/config</code> disappeared after running cc-clip</b></summary>
+
+**Symptom:** You edited `~/.ssh/config` in an editor, saved, and a config-writing `cc-clip` command such as `setup`, `connect`, or `uninstall --host` that was running in parallel finished without error — but your edit is gone.
+
+**Cause:** `cc-clip` reads `~/.ssh/config`, builds the new contents in memory, writes a temp file, and `rename`s it over the original. It does not take an advisory file lock around that read-modify-write cycle. If your editor's save lands between cc-clip's read and rename, your change is on the version that gets overwritten.
+
+**Fix:** Restore from your own backup, or from `~/.ssh/config.cc-clip-backup` if that sidecar holds a version you can work from. Going forward, do not run config-writing cc-clip commands while an editor has `~/.ssh/config` open with unsaved changes. This is an explicit product boundary — cc-clip assumes a single user is the sole editor of `~/.ssh/config`.
+
+</details>
+
+<details>
+<summary><b>cc-clip reformatted my <code>~/.ssh/config</code> line endings</b></summary>
+
+**Symptom:** Your file used mixed CRLF/LF line endings before, and now every line uses the same ending.
+
+**Cause:** `cc-clip` picks one dominant line ending per rewrite. CRLF is used only if its count strictly exceeds LF; otherwise the file is written in LF. Balanced or mixed files collapse to LF.
+
+**Fix:** If you need CRLF, ensure your existing file is already majority-CRLF before cc-clip runs (most Windows editors default to CRLF, which preserves the format). There is no flag to force a specific ending.
+
+</details>
+
+<details>
+<summary><b>My <code>Host "alias"</code> lost its quotes after cc-clip ran</b></summary>
+
+**Symptom:** You wrote `Host "myserver"` in `~/.ssh/config`; after `cc-clip setup` it reads `Host myserver`.
+
+**Cause:** `cc-clip` strips surrounding quotes from `Host` tokens when parsing and writes them back without quoting. The alias still works — ssh does not require quoting for simple tokens — but if anything downstream relies on the literal quoted form, it will break.
+
+**Fix:** Keep the alias unquoted, or keep the quoted form in an entry cc-clip does not manage.
+
+</details>
+
+<details>
+<summary><b>The managed host lives behind an <code>Include</code> and does not get updated</b></summary>
+
+**Symptom:** `~/.ssh/config` contains `Include ...`, and the `Host myserver` stanza you expect `cc-clip` to manage lives only in one of those included files. `cc-clip setup` or `cc-clip connect` succeeds, but the included file is unchanged.
+
+**Cause:** `cc-clip` only rewrites the main `~/.ssh/config` file. It tolerates `Include` directives, but it does not chase them and mutate included files on your behalf.
+
+**Fix:** Keep the exact `Host myserver` block in the main `~/.ssh/config` when you want automatic management, or manage the included file yourself.
+
+</details>
+
+<details>
+<summary><b>Symlinked <code>~/.ssh/config</code> and Windows junctions</b></summary>
+
+cc-clip rewrites the resolved target file when `~/.ssh/config` is a symbolic link. The supported configuration is still a user-owned ssh config path you control:
+
+- On macOS/Linux, dotfiles-managed symlinks are supported; cc-clip updates the real file they point at.
+- On Windows, avoid junctions or reparse points that redirect across volumes or ACL boundaries you do not control. cc-clip rewrites the resolved target file.
+- Keep a copy of `~/.ssh/config` (and the `~/.ssh/config.cc-clip-backup` sidecar that cc-clip writes on the first successful rewrite) before running cc-clip.
 
 </details>
 

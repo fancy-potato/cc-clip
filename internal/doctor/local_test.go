@@ -1,6 +1,8 @@
 package doctor
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -79,5 +81,31 @@ func TestFormatDurationLocal(t *testing.T) {
 				t.Fatalf("formatDuration(%v) = %q, want %q", tt.d, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestRunLocalDoesNotRewriteSSHConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	configPath := filepath.Join(sshDir, "config")
+	original := "Host myserver\n    HostName example.com\n    User alice\n"
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	RunLocal(18339)
+
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != original {
+		t.Fatalf("RunLocal rewrote ssh config:\n got: %q\nwant: %q", string(got), original)
 	}
 }

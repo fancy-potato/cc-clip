@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg"
@@ -16,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/session"
@@ -43,6 +46,10 @@ type Server struct {
 	noncesMu     sync.RWMutex
 	addr         string
 	mux          *http.ServeMux
+	// served is set once Serve/ListenAndServe begins accepting connections.
+	// After that point, any call to Mux() panics because http.ServeMux is
+	// not safe for concurrent route registration while ServeHTTP is running.
+	served atomic.Bool
 }
 
 func NewServer(addr string, clipboard ClipboardReader, tokens *token.Manager, sessions *session.Store) *Server {
@@ -67,13 +74,24 @@ func NewServer(addr string, clipboard ClipboardReader, tokens *token.Manager, se
 
 // nonceEntry tracks metadata for a registered notification nonce.
 type nonceEntry struct {
-	Host       string
-	IssuedAt   time.Time
-	ExpiresAt  time.Time
+	Host      string
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+	Digest    [32]byte
 }
 
 // nonceTTL is the default lifetime for notification nonces.
 const nonceTTL = 7 * 24 * time.Hour // 7 days
+
+// maxNotificationNonces caps the in-memory nonce registry to bound
+// memory growth. A caller holding the clipboard bearer token could
+// otherwise register unlimited nonces with distinct or empty host
+// values (since the per-host revocation only fires when host matches
+// an existing entry), and `CleanupExpiredNonces` only runs on a 30
+// minute tick. When the cap is hit, the oldest entries are evicted
+// first; that preserves freshly-issued nonces at the expense of
+// stale ones that the scheduled cleanup would eventually have removed.
+const maxNotificationNonces = 4096
 
 // RegisterNotificationNonce adds a nonce to the dedicated notification
 // auth registry. Notification nonces are separate from clipboard bearer
@@ -94,6 +112,7 @@ func (s *Server) RegisterNotificationNonceForHost(nonce, host string) error {
 		return fmt.Errorf("refusing to register clipboard token as notification nonce")
 	}
 	now := time.Now()
+	digest := sha256.Sum256([]byte(nonce))
 	s.noncesMu.Lock()
 	defer s.noncesMu.Unlock()
 	// Revoke previous nonce for the same host.
@@ -108,19 +127,65 @@ func (s *Server) RegisterNotificationNonceForHost(nonce, host string) error {
 		Host:      host,
 		IssuedAt:  now,
 		ExpiresAt: now.Add(nonceTTL),
+		Digest:    digest,
 	}
+	s.evictOldestNonceIfNeeded()
 	return nil
 }
 
+// evictOldestNonceIfNeeded enforces the maxNotificationNonces cap by
+// removing the entry with the earliest IssuedAt timestamp when the map
+// grows beyond the limit. Must be called with s.noncesMu held.
+func (s *Server) evictOldestNonceIfNeeded() {
+	for len(s.notifyNonces) > maxNotificationNonces {
+		var oldestKey string
+		var oldestAt time.Time
+		first := true
+		for k, v := range s.notifyNonces {
+			if first || v.IssuedAt.Before(oldestAt) {
+				oldestKey = k
+				oldestAt = v.IssuedAt
+				first = false
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(s.notifyNonces, oldestKey)
+	}
+}
+
 // validNotificationNonce checks whether the given nonce is registered and not expired.
+//
+// The lookup intentionally iterates every registered nonce and compares
+// fixed-size SHA-256 digests instead of using the raw nonce as a map lookup.
+// The caller-supplied nonce is hashed once up front, then each stored digest
+// is compared in constant time so rejection cost stays O(len(header) + n)
+// rather than O(len(header) * n). /notify is the daemon's only endpoint
+// reachable from across the reverse tunnel, so it is the most exposed auth
+// check and deserves the same care as the clipboard bearer path.
+//
+// The fast-path check on empty nonce is still timing-sensitive against
+// "registered but empty" which RegisterNotificationNonceForHost refuses;
+// an empty nonce can never match any valid entry.
 func (s *Server) validNotificationNonce(nonce string) bool {
-	s.noncesMu.RLock()
-	defer s.noncesMu.RUnlock()
-	entry, ok := s.notifyNonces[nonce]
-	if !ok {
+	if nonce == "" {
 		return false
 	}
-	return time.Now().Before(entry.ExpiresAt)
+	nonceDigest := sha256.Sum256([]byte(nonce))
+	s.noncesMu.RLock()
+	defer s.noncesMu.RUnlock()
+	now := time.Now()
+	matched := false
+	for _, entry := range s.notifyNonces {
+		if subtle.ConstantTimeCompare(entry.Digest[:], nonceDigest[:]) == 1 && now.Before(entry.ExpiresAt) {
+			matched = true
+			// Do NOT break: keep iterating so timing does not leak the
+			// match position within the map. Compiler cannot trivially
+			// elide this because matched is returned.
+		}
+	}
+	return matched
 }
 
 // CleanupExpiredNonces removes nonces that have passed their TTL.
@@ -235,11 +300,43 @@ func envelopeToEvent(env NotifyEnvelope) NotifyEvent {
 // Handler returns the HTTP handler for this server.
 // Useful for testing with httptest.NewServer.
 func (s *Server) Handler() http.Handler {
+	s.served.Store(true)
+	return s.mux
+}
+
+// Mux returns the underlying ServeMux so callers can register additional
+// routes (e.g., tunnel management endpoints). Callers MUST register all
+// routes BEFORE calling Handler / Serve / ListenAndServe; http.ServeMux.HandleFunc
+// is not safe to call concurrently with ServeHTTP.
+//
+// The atomic `served` check below is best-effort detection for the common
+// misuse of calling Mux() from a separate goroutine after the server has
+// already started. It is NOT a synchronization primitive: there is still
+// no happens-before relationship between a caller registering a route
+// and a concurrent ServeHTTP reading the mux's internal entry map, so a
+// caller that races Mux()/HandleFunc against Serve() can still trigger the
+// exact data race this panic is meant to warn about. In practice,
+// registerTunnelRoutes is called synchronously on the same goroutine that
+// later calls Serve(), so the race is not triggered in-tree; treat this
+// gate as a tripwire for future callers, not a guarantee.
+//
+// WARNING: Routes registered via Mux() bypass the daemon's clipboard
+// Bearer-token middleware entirely. The caller is responsible for wiring
+// appropriate authentication (for example, the tunnel-control token for
+// tunnel management routes). The clipboard token is intentionally not
+// re-exported as a reusable wrapper — mixing auth domains across routes on
+// this mux would widen attack surface. If your new route needs auth, write
+// dedicated middleware in your own package.
+func (s *Server) Mux() *http.ServeMux {
+	if s.served.Load() {
+		panic("daemon.Server.Mux() called after Handler/Serve/ListenAndServe started: http.ServeMux is not safe for concurrent route registration once ServeHTTP may be running. Register all routes before calling Handler.")
+	}
 	return s.mux
 }
 
 // Serve accepts connections on the given listener and serves HTTP.
 func (s *Server) Serve(ln net.Listener) error {
+	s.served.Store(true)
 	return http.Serve(ln, s.mux)
 }
 
@@ -256,6 +353,7 @@ func (s *Server) ListenAndServe() error {
 	}
 
 	log.Printf("cc-clip daemon listening on %s", s.addr)
+	s.served.Store(true)
 	return http.Serve(listener, s.mux)
 }
 
@@ -276,7 +374,16 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		tok := strings.TrimPrefix(auth, "Bearer ")
 
 		if err := s.tokens.Validate(tok); err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
+			// Collapse all validation failures into a single opaque
+			// response rather than returning err.Error() verbatim. The
+			// internal error distinguishes "token expired" from "wrong
+			// token entirely", which turns the 401 into an oracle for an
+			// unauthenticated caller: a correct-but-expired token gets a
+			// different string than a random guess. The tunnel-control
+			// middleware already collapses both cases; mirror that here
+			// so neither auth path leaks internal state.
+			log.Printf("clipboard bearer auth: validation failed: %v", err)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -292,11 +399,30 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleRegisterNonce accepts a notification nonce from an authenticated
 // connect session. The request body is a JSON object with a "nonce" field.
 // Protected by authMiddleware (requires clipboard bearer token).
+//
+// The body is capped at 4 KiB and decoded with DisallowUnknownFields so a
+// compromised or buggy peer holding the clipboard token cannot force the
+// daemon to buffer an unbounded stream or silently accept extra fields as
+// a carrier for future payload expansion.
 func (s *Server) handleRegisterNonce(w http.ResponseWriter, r *http.Request) {
+	const maxBody = 4096
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 	var req struct {
 		Nonce string `json:"nonce"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			http.Error(w, fmt.Sprintf("request body exceeds %d bytes", maxBody), http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -388,7 +514,12 @@ func (s *Server) handleClipboardImage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	nonce := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if nonce == "" || !s.validNotificationNonce(nonce) {
-		http.Error(w, "invalid notification nonce", http.StatusUnauthorized)
+		// Opaque 401 text. authMiddleware collapses its error to
+		// "unauthorized" to avoid an oracle distinguishing "wrong token"
+		// from "expired token"; /notify is reachable across the reverse
+		// tunnel so it is the most exposed auth path and must not leak
+		// whether a nonce was recognised, expired, or simply missing.
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 

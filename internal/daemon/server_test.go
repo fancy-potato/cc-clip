@@ -407,6 +407,37 @@ func TestRegisterNonceEndpointRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestRegisterNonceEndpointRejectsTrailingJSON(t *testing.T) {
+	clip := &mockClipboard{}
+	tm := token.NewManager(time.Hour)
+	s, _ := tm.Generate()
+	store := session.NewStore(12 * time.Hour)
+	srv := NewServer("127.0.0.1:0", clip, tm, store)
+
+	body := strings.NewReader(`{"nonce":"nonce-trailing"}{"extra":1}`)
+	req := httptest.NewRequest("POST", "/register-nonce", body)
+	req.Header.Set("Authorization", "Bearer "+s.Token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for trailing JSON, got %d", w.Code)
+	}
+
+	notifyBody := strings.NewReader(`{"title":"test","body":"hello"}`)
+	notifyReq := httptest.NewRequest("POST", "/notify", notifyBody)
+	notifyReq.Header.Set("Authorization", "Bearer nonce-trailing")
+	notifyReq.Header.Set("Content-Type", "application/json")
+	notifyW := httptest.NewRecorder()
+	srv.mux.ServeHTTP(notifyW, notifyReq)
+
+	if notifyW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected trailing-json nonce to remain unregistered, got %d", notifyW.Code)
+	}
+}
+
 func TestDedupSuppressesRepeatedNotifyAtRuntime(t *testing.T) {
 	clip := &mockClipboard{}
 	tm := token.NewManager(time.Hour)
@@ -489,4 +520,56 @@ func TestDedupDoesNotSuppressCriticalPermissionPrompt(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("expected 2 critical envelopes, got %d", count)
 	}
+}
+
+// Mux() must panic once Serve() has begun. Registering routes after that
+// would race with ServeHTTP and silently corrupt the ServeMux.
+func TestMuxPanicsAfterServeStarted(t *testing.T) {
+	clip := &mockClipboard{}
+	srv, _ := newTestServer(clip)
+
+	if m := srv.Mux(); m == nil {
+		t.Fatal("expected Mux() to return a non-nil ServeMux before Serve")
+	}
+
+	srv.served.Store(true)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected Mux() to panic after served=true, got no panic")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("expected panic value to be a string, got %T: %v", r, r)
+		}
+		if !strings.Contains(msg, "Serve") || !strings.Contains(msg, "Mux") {
+			t.Fatalf("panic message does not clearly describe the constraint: %q", msg)
+		}
+	}()
+	_ = srv.Mux()
+}
+
+func TestMuxPanicsAfterHandlerRequested(t *testing.T) {
+	clip := &mockClipboard{}
+	srv, _ := newTestServer(clip)
+
+	if h := srv.Handler(); h == nil {
+		t.Fatal("expected Handler() to return a non-nil handler")
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected Mux() to panic after Handler(), got no panic")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("expected panic value to be a string, got %T: %v", r, r)
+		}
+		if !strings.Contains(msg, "Handler") || !strings.Contains(msg, "Mux") {
+			t.Fatalf("panic message does not clearly describe the constraint: %q", msg)
+		}
+	}()
+	_ = srv.Mux()
 }

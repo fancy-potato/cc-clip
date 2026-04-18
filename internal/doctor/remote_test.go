@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/shunmei/cc-clip/internal/peer"
+	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/shim"
 )
 
@@ -74,7 +75,7 @@ func TestCheckAliasPortSkipsWithoutPeerReservation(t *testing.T) {
 	if len(got) != 1 || !got[0].OK {
 		t.Fatalf("expected alias check skip success, got %#v", got)
 	}
-	if got[0].Message != "peer SSH forwarding not configured; skipping SSH config port check" {
+	if got[0].Message != "peer SSH forwarding not configured; skipping effective ssh config check" {
 		t.Fatalf("unexpected alias skip message: %#v", got)
 	}
 }
@@ -96,7 +97,7 @@ func TestCheckAliasPortPrefersBaseHostConfig(t *testing.T) {
 	if len(got) != 1 || !got[0].OK {
 		t.Fatalf("expected success, got %#v", got)
 	}
-	if got[0].Message != "myserver forwards 18340 127.0.0.1:18339" {
+	if got[0].Message != "effective ssh config forwards 18340 127.0.0.1:18339" {
 		t.Fatalf("unexpected message %#v", got[0])
 	}
 	if len(seen) != 1 || seen[0] != "myserver" {
@@ -116,7 +117,7 @@ func TestCheckAliasPortSurfacesSSHQueryError(t *testing.T) {
 	if len(got) != 1 || got[0].OK {
 		t.Fatalf("expected failure, got %#v", got)
 	}
-	if got[0].Message != "ssh -G myserver failed: ssh config parse error; cannot verify RemoteForward" {
+	if got[0].Message != "ssh -G myserver failed: ssh config parse error; cannot verify effective RemoteForward" {
 		t.Fatalf("unexpected message %#v", got[0])
 	}
 }
@@ -133,8 +134,64 @@ func TestCheckAliasPortFailsWhenForwardMissing(t *testing.T) {
 	if len(got) != 1 || got[0].OK {
 		t.Fatalf("expected failure, got %#v", got)
 	}
-	if got[0].Message != "ssh config missing RemoteForward 18340 127.0.0.1:18339" {
+	if got[0].Message != "effective ssh config missing RemoteForward 18340 127.0.0.1:18339" {
 		t.Fatalf("unexpected message %#v", got[0])
+	}
+}
+
+func TestCheckManagedPortAlignmentSkipsWithoutPeerReservation(t *testing.T) {
+	got, ports := checkManagedPortAlignment("myserver", nil)
+	if len(got) != 1 || !got[0].OK {
+		t.Fatalf("expected managed-block check skip success, got %#v", got)
+	}
+	if got[0].Message != "peer SSH forwarding not configured; skipping managed block check" {
+		t.Fatalf("unexpected managed-block skip message: %#v", got)
+	}
+	if ports != nil {
+		t.Fatalf("ports = %#v, want nil", ports)
+	}
+}
+
+func TestCheckManagedPortAlignmentReportsMatch(t *testing.T) {
+	oldRead := readManagedTunnelPorts
+	t.Cleanup(func() { readManagedTunnelPorts = oldRead })
+
+	readManagedTunnelPorts = func(host string) (setup.ManagedTunnelPorts, error) {
+		if host != "myserver" {
+			t.Fatalf("host = %q, want myserver", host)
+		}
+		return setup.ManagedTunnelPorts{RemotePort: 18340, LocalPort: 18339}, nil
+	}
+
+	got, ports := checkManagedPortAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340})
+	if len(got) != 1 || !got[0].OK {
+		t.Fatalf("expected match success, got %#v", got)
+	}
+	if got[0].Message != "remote register port 18340 matches managed block remote port 18340 (target 127.0.0.1:18339)" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if ports == nil || ports.RemotePort != 18340 || ports.LocalPort != 18339 {
+		t.Fatalf("ports = %#v, want 18340/18339", ports)
+	}
+}
+
+func TestCheckManagedPortAlignmentReportsMismatch(t *testing.T) {
+	oldRead := readManagedTunnelPorts
+	t.Cleanup(func() { readManagedTunnelPorts = oldRead })
+
+	readManagedTunnelPorts = func(host string) (setup.ManagedTunnelPorts, error) {
+		return setup.ManagedTunnelPorts{RemotePort: 19001, LocalPort: 18339}, nil
+	}
+
+	got, ports := checkManagedPortAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340})
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected mismatch failure, got %#v", got)
+	}
+	if got[0].Message != "remote register port 18340 != managed block remote port 19001; rerun `cc-clip connect myserver` to resync" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if ports == nil || ports.RemotePort != 19001 || ports.LocalPort != 18339 {
+		t.Fatalf("ports = %#v, want 19001/18339", ports)
 	}
 }
 

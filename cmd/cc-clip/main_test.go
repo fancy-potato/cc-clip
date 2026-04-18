@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -16,9 +19,38 @@ import (
 	"github.com/shunmei/cc-clip/internal/daemon"
 	"github.com/shunmei/cc-clip/internal/peer"
 	"github.com/shunmei/cc-clip/internal/session"
+	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
+	"github.com/shunmei/cc-clip/internal/tunnel"
 )
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	defer r.Close()
+
+	os.Stdout = w
+	defer func() {
+		os.Stdout = oldStdout
+	}()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	return string(out)
+}
 
 func TestStopLocalProcessDoesNotKillUnexpectedCommand(t *testing.T) {
 	cmd := helperSleepProcess(t)
@@ -45,7 +77,6 @@ func TestStopLocalProcessDoesNotKillUnexpectedCommand(t *testing.T) {
 	}
 
 	stopLocalProcess(pidFile, "Xvfb")
-	time.Sleep(100 * time.Millisecond)
 
 	waitDone := make(chan struct{}, 1)
 	go func() {
@@ -71,7 +102,11 @@ func TestHelperProcess(t *testing.T) {
 	if len(os.Args) < 3 || os.Args[len(os.Args)-1] != "sleep-helper" {
 		os.Exit(0)
 	}
-	time.Sleep(30 * time.Second)
+	// Block on stdin rather than a wall-clock sleep so the parent can
+	// terminate the helper deterministically by closing the pipe. Without
+	// this, a panic in the parent between setup and t.Cleanup would leave
+	// the helper running for the full timeout window.
+	_, _ = io.Copy(io.Discard, os.Stdin)
 	os.Exit(0)
 }
 
@@ -84,6 +119,14 @@ func helperSleepProcess(t *testing.T) *exec.Cmd {
 	if runtime.GOOS == "windows" {
 		cmd.Env = append(cmd.Env, "SystemRoot="+os.Getenv("SystemRoot"))
 	}
+	// Wire stdin to an anonymous pipe so the parent can force an immediate
+	// helper exit by closing it. The pipe is held for the lifetime of the
+	// cmd; closing it signals EOF to the helper's `io.Copy`.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	t.Cleanup(func() { _ = stdin.Close() })
 	return cmd
 }
 
@@ -435,6 +478,135 @@ func TestEnsureRemotePeerRegistrySupportRejectsLegacyBinary(t *testing.T) {
 	}
 }
 
+func TestResolveTokenOnlyPeerReservationReturnsExistingReservation(t *testing.T) {
+	reg, err := resolveTokenOnlyPeerReservation(&peer.Registration{
+		PeerID:       "peer-a",
+		ReservedPort: 19001,
+		StateDir:     "~/.cache/cc-clip/peers/peer-a",
+	}, nil)
+	if err != nil {
+		t.Fatalf("resolveTokenOnlyPeerReservation: %v", err)
+	}
+	if reg.ReservedPort != 19001 {
+		t.Fatalf("ReservedPort = %d, want 19001", reg.ReservedPort)
+	}
+	if reg.PeerID != "peer-a" {
+		t.Fatalf("PeerID = %q, want %q", reg.PeerID, "peer-a")
+	}
+	if reg.StateDir != "~/.cache/cc-clip/peers/peer-a" {
+		t.Fatalf("StateDir = %q, want %q", reg.StateDir, "~/.cache/cc-clip/peers/peer-a")
+	}
+}
+
+func TestResolveTokenOnlyPeerReservationFallsBackToLegacyStateDir(t *testing.T) {
+	reg, err := resolveTokenOnlyPeerReservation(&peer.Registration{
+		PeerID:       "peer-a",
+		ReservedPort: 19001,
+	}, nil)
+	if err != nil {
+		t.Fatalf("resolveTokenOnlyPeerReservation: %v", err)
+	}
+	if reg.StateDir != legacyPeerStateDir("peer-a") {
+		t.Fatalf("StateDir = %q, want %q", reg.StateDir, legacyPeerStateDir("peer-a"))
+	}
+}
+
+func TestResolveTokenOnlyPeerReservationRejectsMissingReservation(t *testing.T) {
+	_, err := resolveTokenOnlyPeerReservation(nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "re-run without --token-only") {
+		t.Fatalf("err = %v, want actionable missing-reservation error", err)
+	}
+}
+
+func TestResolveTokenOnlyPeerReservationRejectsLookupFailure(t *testing.T) {
+	_, err := resolveTokenOnlyPeerReservation(nil, errors.New("remote lookup failed"))
+	if err == nil || !strings.Contains(err.Error(), "look up existing peer reservation") {
+		t.Fatalf("err = %v, want lookup failure", err)
+	}
+}
+
+func TestEnsureManagedHostConfigForReservationUsesExistingReservation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	configPath := filepath.Join(sshDir, "config")
+	initial := strings.Join([]string{
+		"Host myserver",
+		"    HostName 10.0.0.1",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	changes, err := ensureManagedHostConfigForReservation("myserver", 18444, &peer.Registration{
+		PeerID:       "peer-a",
+		ReservedPort: 19001,
+		StateDir:     "~/.cache/cc-clip/peers/peer-a",
+	})
+	if err != nil {
+		t.Fatalf("ensureManagedHostConfigForReservation: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Action != "created" {
+		t.Fatalf("changes = %+v, want one created change", changes)
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	got := string(content)
+	if strings.Count(got, "Host myserver") != 1 {
+		t.Fatalf("expected config to reuse one Host myserver stanza, got:\n%s", got)
+	}
+	if strings.Count(got, "# >>> cc-clip managed host: myserver >>>") != 1 || strings.Count(got, "# <<< cc-clip managed host: myserver <<<") != 1 {
+		t.Fatalf("expected one managed host fragment, got:\n%s", got)
+	}
+	if !strings.Contains(got, "RemoteForward 19001 127.0.0.1:18444") {
+		t.Fatalf("expected managed RemoteForward to be updated, got:\n%s", got)
+	}
+}
+
+func TestCleanupCreatedTokenOnlyFallbackRemovesManagedConfigAndReleasesPeer(t *testing.T) {
+	calls := []string{}
+	err := cleanupCreatedTokenOnlyFallback("myserver", tokenOnlyFallbackCleanupOps{
+		removeManagedHostConfig: func(host string) error {
+			calls = append(calls, "config:"+host)
+			return nil
+		},
+		releasePeer: func() error {
+			calls = append(calls, "release")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("cleanupCreatedTokenOnlyFallback: %v", err)
+	}
+	if got, want := strings.Join(calls, ","), "config:myserver,release"; got != want {
+		t.Fatalf("calls = %q, want %q", got, want)
+	}
+}
+
+func TestCleanupCreatedTokenOnlyFallbackJoinsRollbackErrors(t *testing.T) {
+	err := cleanupCreatedTokenOnlyFallback("myserver", tokenOnlyFallbackCleanupOps{
+		removeManagedHostConfig: func(string) error { return errors.New("config cleanup failed") },
+		releasePeer:             func() error { return errors.New("release failed") },
+	})
+	if err == nil {
+		t.Fatal("expected rollback error")
+	}
+	if !strings.Contains(err.Error(), "config cleanup failed") {
+		t.Fatalf("err = %v, want config cleanup failure", err)
+	}
+	if !strings.Contains(err.Error(), "release failed") {
+		t.Fatalf("err = %v, want release failure", err)
+	}
+}
+
 func TestParseRemoteCodexStateDirsDeduplicatesAndSkipsBlankLines(t *testing.T) {
 	got := parseRemoteCodexStateDirs(strings.Join([]string{
 		"",
@@ -764,6 +936,425 @@ func TestUninstallPeerRemoteAndConfigSkipsLocalCleanupWhenTargetsEmpty(t *testin
 	}
 }
 
+func TestUninstallPeerRemoteAndConfigRemovesPersistentTunnelState(t *testing.T) {
+	calls := []string{}
+
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		readManagedTunnelPorts: func(host string) (setup.ManagedTunnelPorts, error) {
+			calls = append(calls, "ports:"+host)
+			return setup.ManagedTunnelPorts{RemotePort: 18340, LocalPort: 18339}, nil
+		},
+		removeManagedHostConfig: func(host string) error {
+			calls = append(calls, "config:"+host)
+			return nil
+		},
+		removePersistentTunnel: func(host string, localPort int) error {
+			calls = append(calls, fmt.Sprintf("tunnel:%s:%d", host, localPort))
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := strings.Join(calls, ","), "ports:myserver,tunnel:myserver:18339,config:myserver"; got != want {
+		t.Fatalf("cleanup order = %q, want %q", got, want)
+	}
+}
+
+func TestUninstallPeerRemoteAndConfigFallsBackToHostWideTunnelCleanupWhenManagedPortsInvalid(t *testing.T) {
+	calls := []string{}
+
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		readManagedTunnelPorts: func(host string) (setup.ManagedTunnelPorts, error) {
+			calls = append(calls, "ports:"+host)
+			return setup.ManagedTunnelPorts{}, fmt.Errorf("%w for %s: shared Host stanzas are not supported", setup.ErrManagedRemotePortInvalid, host)
+		},
+		removeManagedHostConfig: func(host string) error {
+			calls = append(calls, "config:"+host)
+			return nil
+		},
+		removePersistentTunnel: func(host string, localPort int) error {
+			calls = append(calls, fmt.Sprintf("tunnel:%s:%d", host, localPort))
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := strings.Join(calls, ","), "ports:myserver,tunnel:myserver:0,config:myserver"; got != want {
+		t.Fatalf("cleanup order = %q, want %q", got, want)
+	}
+}
+
+func TestUninstallPeerRemoteAndConfigFallsBackToHostWideTunnelCleanupWhenManagedPortsMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "config file missing", err: os.ErrNotExist},
+		{name: "host block missing", err: setup.ErrSSHHostBlockNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := []string{}
+
+			err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+				return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+			}, uninstallPeerCleanupOps{
+				readManagedTunnelPorts: func(host string) (setup.ManagedTunnelPorts, error) {
+					calls = append(calls, "ports:"+host)
+					return setup.ManagedTunnelPorts{}, tc.err
+				},
+				removeManagedHostConfig: func(host string) error {
+					calls = append(calls, "config:"+host)
+					return nil
+				},
+				removePersistentTunnel: func(host string, localPort int) error {
+					calls = append(calls, fmt.Sprintf("tunnel:%s:%d", host, localPort))
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got, want := strings.Join(calls, ","), "ports:myserver,tunnel:myserver:0,config:myserver"; got != want {
+				t.Fatalf("cleanup order = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestUninstallPeerRemoteAndConfigDoesNotPrintConfigRemovalWhenTunnelCleanupFails(t *testing.T) {
+	var err error
+	out := captureStdout(t, func() {
+		err = uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+			return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+		}, uninstallPeerCleanupOps{
+			readManagedTunnelPorts: func(host string) (setup.ManagedTunnelPorts, error) {
+				return setup.ManagedTunnelPorts{RemotePort: 18340, LocalPort: 18339}, nil
+			},
+			removePersistentTunnel: func(string, int) error {
+				return errors.New("tunnel cleanup failed")
+			},
+			removeManagedHostConfig: func(string) error {
+				t.Fatal("removeManagedHostConfig should not be called when tunnel cleanup fails")
+				return nil
+			},
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "persistent tunnel") {
+		t.Fatalf("err = %v, want tunnel cleanup failure", err)
+	}
+	if strings.Contains(out, "Removed cc-clip SSH config") {
+		t.Fatalf("unexpected config removal message in output:\n%s", out)
+	}
+}
+
+func TestRemovePersistentTunnelWithStopsOfflineAndRemovesStateWhenDaemonUnavailable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	postCalls := 0
+	persistCalls := 0
+	removeCalls := 0
+
+	err := removePersistentTunnelWith("myserver", 18339,
+		func(_ int, host string) error {
+			postCalls++
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			return fmt.Errorf("%w (dial tcp 127.0.0.1:18339: connect: connection refused)", errDaemonUnreachable)
+		},
+		func(host string, localPort int) error {
+			persistCalls++
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			if localPort != 18339 {
+				t.Fatalf("localPort = %d, want 18339", localPort)
+			}
+			return nil
+		},
+		func(stateDir, host string, localPort int) error {
+			removeCalls++
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			if stateDir != tunnel.DefaultStateDir() {
+				t.Fatalf("stateDir = %q, want %q", stateDir, tunnel.DefaultStateDir())
+			}
+			if localPort != 18339 {
+				t.Fatalf("localPort = %d, want 18339", localPort)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if postCalls != 1 {
+		t.Fatalf("postCalls = %d, want 1", postCalls)
+	}
+	if persistCalls != 1 {
+		t.Fatalf("persistCalls = %d, want 1", persistCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
+func TestRemovePersistentTunnelWithKeepsStateWhenOfflineStopFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	persistCalls := 0
+	removeCalls := 0
+
+	err := removePersistentTunnelWith("myserver", 18339,
+		func(_ int, _ string) error {
+			return fmt.Errorf("%w (dial tcp 127.0.0.1:18339: connect: connection refused)", errDaemonUnreachable)
+		},
+		func(host string, localPort int) error {
+			persistCalls++
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			if localPort != 18339 {
+				t.Fatalf("localPort = %d, want 18339", localPort)
+			}
+			return errors.New("still running")
+		},
+		func(string, string, int) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "stop persistent tunnel offline") {
+		t.Fatalf("err = %v, want offline stop error", err)
+	}
+	if persistCalls != 1 {
+		t.Fatalf("persistCalls = %d, want 1", persistCalls)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("removeCalls = %d, want 0", removeCalls)
+	}
+}
+
+func TestRemovePersistentTunnelWithFallsBackOfflineWhenTunnelControlRouteIsUnavailable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	postCalls := 0
+	persistCalls := 0
+	removeCalls := 0
+
+	err := removePersistentTunnelWith("myserver", 18339,
+		func(_ int, host string) error {
+			postCalls++
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			return fmt.Errorf("%w: daemon returned 404: Not Found", errDaemonTunnelControlUnavailable)
+		},
+		func(host string, localPort int) error {
+			persistCalls++
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			if localPort != 18339 {
+				t.Fatalf("localPort = %d, want 18339", localPort)
+			}
+			return nil
+		},
+		func(string, string, int) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if postCalls != 1 {
+		t.Fatalf("postCalls = %d, want 1", postCalls)
+	}
+	if persistCalls != 1 {
+		t.Fatalf("persistCalls = %d, want 1", persistCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
+func TestRemovePersistentTunnelWithReturnsAuthFailureWithoutOfflineFallback(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	persistCalls := 0
+	removeCalls := 0
+
+	err := removePersistentTunnelWith("myserver", 18339,
+		func(port int, _ string) error {
+			if port != 18339 {
+				t.Fatalf("port = %d, want 18339", port)
+			}
+			return fmt.Errorf("%w: daemon returned 401: missing authorization", errDaemonAuth)
+		},
+		func(string, int) error {
+			persistCalls++
+			return nil
+		},
+		func(_ string, _ string, _ int) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "stop persistent tunnel") {
+		t.Fatalf("err = %v, want daemon auth failure", err)
+	}
+	if persistCalls != 0 {
+		t.Fatalf("persistCalls = %d, want 0", persistCalls)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("removeCalls = %d, want 0", removeCalls)
+	}
+}
+
+func TestRemovePersistentTunnelWithIgnoresMissingTunnelInDaemon(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	removeCalls := 0
+
+	err := removePersistentTunnelWith("myserver", 18339,
+		func(_ int, _ string) error {
+			return fmt.Errorf("%w: tunnel myserver not found", tunnel.ErrTunnelNotFound)
+		},
+		func(string, int) error {
+			t.Fatal("persistFn should not be called when daemon reports missing tunnel")
+			return nil
+		},
+		func(string, string, int) error {
+			removeCalls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
+func TestRemovePersistentTunnelWithDoesNotRetryDifferentSavedPort(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	setupLocalOnlyTokenDir(t)
+
+	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+		Config: tunnel.TunnelConfig{
+			Host:       "myserver",
+			LocalPort:  18444,
+			RemotePort: 19001,
+			Enabled:    true,
+		},
+		Status: tunnel.StatusConnected,
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	var ports []int
+	persistCalls := 0
+	removeCalls := 0
+
+	err := removePersistentTunnelWith("myserver", 18339,
+		func(port int, _ string) error {
+			ports = append(ports, port)
+			return fmt.Errorf("%w (dial tcp 127.0.0.1:%d: connect: connection refused)", errDaemonUnreachable, port)
+		},
+		func(host string, localPort int) error {
+			persistCalls++
+			if host != "myserver" || localPort != 18339 {
+				t.Fatalf("offline stop = (%q, %d), want (%q, %d)", host, localPort, "myserver", 18339)
+			}
+			return os.ErrNotExist
+		},
+		func(_ string, _ string, localPort int) error {
+			removeCalls++
+			if localPort != 18339 {
+				t.Fatalf("localPort = %d, want 18339", localPort)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got, want := fmt.Sprint(ports), "[18339]"; got != want {
+		t.Fatalf("ports = %s, want %s", got, want)
+	}
+	if persistCalls != 1 {
+		t.Fatalf("persistCalls = %d, want 1", persistCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
+func TestRemovePersistentTunnelRemovesOnlyRequestedPortForHost(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	setupLocalOnlyTokenDir(t)
+
+	ports := []int{18444, 18555}
+	for _, port := range ports {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "myserver",
+				LocalPort:  port,
+				RemotePort: 19001,
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", port, err)
+		}
+	}
+
+	if err := removePersistentTunnel("myserver", ports[0]); err != nil {
+		t.Fatalf("removePersistentTunnel: %v", err)
+	}
+
+	if _, err := tunnel.LoadState(tunnel.DefaultStateDir(), "myserver", ports[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("LoadState(%d) err = %v, want os.ErrNotExist", ports[0], err)
+	}
+	if _, err := tunnel.LoadState(tunnel.DefaultStateDir(), "myserver", ports[1]); err != nil {
+		t.Fatalf("LoadState(%d): %v", ports[1], err)
+	}
+}
+
+func TestRemovePersistentTunnelRemovesAllSavedPortsForHostWhenPortUnknown(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	setupLocalOnlyTokenDir(t)
+
+	ports := []int{18444, 18555}
+	for _, port := range ports {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "myserver",
+				LocalPort:  port,
+				RemotePort: 19001 + (port - ports[0]),
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", port, err)
+		}
+	}
+
+	if err := removePersistentTunnel("myserver", 0); err != nil {
+		t.Fatalf("removePersistentTunnel: %v", err)
+	}
+
+	for _, port := range ports {
+		if _, err := tunnel.LoadState(tunnel.DefaultStateDir(), "myserver", port); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("LoadState(%d) err = %v, want os.ErrNotExist", port, err)
+		}
+	}
+}
+
 type recordingRemoteExecutor struct {
 	commands  []string
 	responses map[string]remoteExecResponse
@@ -817,6 +1408,20 @@ func extractPort(t *testing.T, url string) int {
 	return port
 }
 
+func TestListenerPortUsesBoundEphemeralPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	want := ln.Addr().(*net.TCPAddr).Port
+	got := listenerPort(ln, 0)
+	if got != want {
+		t.Fatalf("listenerPort = %d, want %d", got, want)
+	}
+}
+
 func TestIsNumeric(t *testing.T) {
 	tests := []struct {
 		input string
@@ -834,6 +1439,47 @@ func TestIsNumeric(t *testing.T) {
 			got := isNumeric(tt.input)
 			if got != tt.want {
 				t.Errorf("isNumeric(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestConfiguredPortFlagWinsOverEnv pins the precedence contract: an explicit
+// --port argument must beat CC_CLIP_PORT. Otherwise scripts that pass --port
+// target the wrong daemon whenever an unrelated CC_CLIP_PORT is exported.
+func TestConfiguredPortFlagWinsOverEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		env      string
+		envSet   bool
+		wantPort int
+		wantExpl bool
+	}{
+		{name: "flag only", args: []string{"cc-clip", "--port", "18500"}, wantPort: 18500, wantExpl: true},
+		{name: "env only", args: []string{"cc-clip"}, env: "18400", envSet: true, wantPort: 18400, wantExpl: true},
+		{name: "flag beats env", args: []string{"cc-clip", "--port", "18500"}, env: "18400", envSet: true, wantPort: 18500, wantExpl: true},
+		{name: "neither", args: []string{"cc-clip"}, wantPort: 18339, wantExpl: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			savedArgs := os.Args
+			os.Args = tt.args
+			t.Cleanup(func() { os.Args = savedArgs })
+			if tt.envSet {
+				t.Setenv("CC_CLIP_PORT", tt.env)
+			} else {
+				os.Unsetenv("CC_CLIP_PORT")
+			}
+			got, explicit, err := configuredPort()
+			if err != nil {
+				t.Fatalf("configuredPort err = %v", err)
+			}
+			if got != tt.wantPort {
+				t.Errorf("port = %d, want %d", got, tt.wantPort)
+			}
+			if explicit != tt.wantExpl {
+				t.Errorf("explicit = %v, want %v", explicit, tt.wantExpl)
 			}
 		})
 	}

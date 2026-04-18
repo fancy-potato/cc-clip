@@ -3,6 +3,7 @@ package token
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -33,6 +34,18 @@ func TestValidateWrongToken(t *testing.T) {
 	err := m.Validate("wrong-token")
 	if err != ErrTokenInvalid {
 		t.Fatalf("expected ErrTokenInvalid, got %v", err)
+	}
+}
+
+func TestConstantTimeEqual(t *testing.T) {
+	if !ConstantTimeEqual("same-token", "same-token") {
+		t.Fatal("expected equal strings to match")
+	}
+	if ConstantTimeEqual("same-token", "other-token") {
+		t.Fatal("expected different strings to mismatch")
+	}
+	if ConstantTimeEqual("short", "much-longer-token") {
+		t.Fatal("expected different-length strings to mismatch")
 	}
 }
 
@@ -155,6 +168,112 @@ func TestReadTokenFileWithExpiry_OldFormat(t *testing.T) {
 	_, _, err = ReadTokenFileWithExpiry()
 	if err == nil {
 		t.Fatal("expected error for old format token file, got nil")
+	}
+}
+
+func TestLoadOrGenerateTunnelControlToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	first, reused, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+	if reused {
+		t.Fatal("expected first tunnel control token load to create a token")
+	}
+	if len(first) != 64 {
+		t.Fatalf("token length = %d, want 64", len(first))
+	}
+
+	second, reused, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+	if !reused {
+		t.Fatal("expected second tunnel control token load to reuse existing token")
+	}
+	if second != first {
+		t.Fatalf("token mismatch: first=%q second=%q", first, second)
+	}
+
+	read, err := ReadTunnelControlToken()
+	if err != nil {
+		t.Fatalf("ReadTunnelControlToken: %v", err)
+	}
+	if read != first {
+		t.Fatalf("ReadTunnelControlToken = %q, want %q", read, first)
+	}
+}
+
+// TestReadTunnelControlTokenTightensPermissiveMode pins the rescue path
+// where a token file on disk is readable but world/group-accessible. A
+// log-only warning would leave every subsequent read observing the same
+// leak; the reader tightens to 0600 in place so the next caller sees the
+// repaired mode.
+func TestReadTunnelControlTokenTightensPermissiveMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod semantics differ; Unix-only regression")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	if _, _, err := LoadOrGenerateTunnelControlToken(); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir: %v", err)
+	}
+	path := filepath.Join(dir, tunnelControlTokenFileName)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod 0644: %v", err)
+	}
+
+	if _, err := ReadTunnelControlToken(); err != nil {
+		t.Fatalf("ReadTunnelControlToken: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat after read: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("post-read perm = %o, want 0600", got)
+	}
+}
+
+func TestLoadOrGenerateTunnelControlTokenRegeneratesInvalidFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir: %v", err)
+	}
+	path := filepath.Join(dir, tunnelControlTokenFileName)
+	if err := os.WriteFile(path, []byte("\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	tok, reused, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+	if reused {
+		t.Fatal("expected invalid tunnel control token file to be regenerated")
+	}
+	if len(tok) != 64 {
+		t.Fatalf("token length = %d, want 64", len(tok))
 	}
 }
 
@@ -305,6 +424,14 @@ func TestValidateSlidingExpiration(t *testing.T) {
 	if !expiryAfter.After(expiryBefore) {
 		t.Fatalf("expected expiry to be extended: before=%v, after=%v", expiryBefore, expiryAfter)
 	}
+	// The new expiry must land within [now+ttl-epsilon, now+ttl+epsilon];
+	// a weaker "After(before)" assertion would pass even if the slide
+	// extended expiry by seconds instead of the full ttl.
+	wantLow := time.Now().Add(ttl - 5*time.Second)
+	wantHigh := time.Now().Add(ttl + 5*time.Second)
+	if expiryAfter.Before(wantLow) || expiryAfter.After(wantHigh) {
+		t.Fatalf("expected expiry to land near now+ttl (=%v); got %v", ttl, expiryAfter.Sub(time.Now()))
+	}
 
 	// Verify token file was updated
 	_, fileExpiry, err := ReadTokenFileWithExpiry()
@@ -335,6 +462,70 @@ func TestValidateNoSlidingWhenFresh(t *testing.T) {
 	}
 }
 
+// TTL=0 is the "no sliding window" mode: the token is whatever Generate()
+// stamped and Validate must never extend it. A latent off-by-one on the
+// ttl-zero branch would otherwise treat "0 < time.Until(expiry) < ttl/2 ==
+// 0" as a hit and slide the expiry into the past, which would later surface
+// as mysterious TokenExpired errors for freshly generated sessions.
+func TestValidateNoSlidingWhenTTLIsZero(t *testing.T) {
+	tmpDir := filepath.Join(t.TempDir(), "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	m := NewManager(0)
+	// Directly install a session that expires in the distant future so the
+	// sliding-window math has every opportunity to misfire.
+	s := Session{
+		Token:     "zero-ttl-token",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	m.mu.Lock()
+	m.session = &s
+	m.mu.Unlock()
+
+	expiryBefore := m.Current().ExpiresAt
+	if err := m.Validate(s.Token); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	expiryAfter := m.Current().ExpiresAt
+	if !expiryAfter.Equal(expiryBefore) {
+		t.Fatalf("expiry must not slide when ttl=0: before=%v, after=%v", expiryBefore, expiryAfter)
+	}
+}
+
+// A token file whose expiry line is corrupted should regenerate cleanly. This
+// covers partial writes and old malformed files without pinning startup on a
+// manual token reset.
+func TestLoadOrGenerate_CorruptExpiryRegenerates(t *testing.T) {
+	tmpDir := filepath.Join(t.TempDir(), "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir failed: %v", err)
+	}
+	path := filepath.Join(dir, "session.token")
+	if err := os.WriteFile(path, []byte("a-valid-looking-token\nnot-a-timestamp\n"), 0600); err != nil {
+		t.Fatalf("write corrupt expiry file: %v", err)
+	}
+
+	m := NewManager(1 * time.Hour)
+	session, reused, err := m.LoadOrGenerate(1 * time.Hour)
+	if err != nil {
+		t.Fatalf("LoadOrGenerate with corrupt expiry: %v", err)
+	}
+	if reused {
+		t.Fatal("reused = true, want false for corrupt expiry")
+	}
+	if session.Token == "a-valid-looking-token" {
+		t.Fatal("expected corrupt expiry to trigger token regeneration")
+	}
+	if !session.ExpiresAt.After(time.Now()) {
+		t.Fatalf("ExpiresAt = %v, want future expiry", session.ExpiresAt)
+	}
+}
+
 func TestRotateToken_ForcesNewGeneration(t *testing.T) {
 	tmpDir := filepath.Join(t.TempDir(), "cc-clip")
 	TokenDirOverride = tmpDir
@@ -360,5 +551,247 @@ func TestRotateToken_ForcesNewGeneration(t *testing.T) {
 	}
 	if len(session.Token) != 64 {
 		t.Fatalf("expected 64 char hex token, got %d chars", len(session.Token))
+	}
+}
+
+// F10: RotateTunnelControlToken generates and writes a new token regardless
+// of whether an existing token is present.
+
+func TestRotateTunnelControlTokenCreatesWhenMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	tok, err := RotateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("RotateTunnelControlToken: %v", err)
+	}
+	if len(tok) != 64 {
+		t.Fatalf("token length = %d, want 64", len(tok))
+	}
+
+	onDisk, err := ReadTunnelControlToken()
+	if err != nil {
+		t.Fatalf("ReadTunnelControlToken: %v", err)
+	}
+	if onDisk != tok {
+		t.Fatalf("on-disk token = %q, want %q", onDisk, tok)
+	}
+
+	path := filepath.Join(tmpDir, tunnelControlTokenFileName)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("token file perm = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestRotateTunnelControlTokenReplacesExistingToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	first, _, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+
+	rotated, err := RotateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("RotateTunnelControlToken: %v", err)
+	}
+	if rotated == first {
+		t.Fatal("expected rotated token to differ from previous token")
+	}
+	if len(rotated) != 64 {
+		t.Fatalf("rotated token length = %d, want 64", len(rotated))
+	}
+
+	onDisk, err := ReadTunnelControlToken()
+	if err != nil {
+		t.Fatalf("ReadTunnelControlToken: %v", err)
+	}
+	if onDisk != rotated {
+		t.Fatalf("on-disk token = %q, want rotated token %q", onDisk, rotated)
+	}
+
+	// Subsequent rotations keep producing distinct tokens.
+	rotated2, err := RotateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("RotateTunnelControlToken (second): %v", err)
+	}
+	if rotated2 == rotated || rotated2 == first {
+		t.Fatalf("expected a fresh token, got %q (prev=%q first=%q)", rotated2, rotated, first)
+	}
+}
+
+func TestLoadOrGenerateTunnelControlTokenRegeneratesMultilineFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir: %v", err)
+	}
+	path := filepath.Join(dir, tunnelControlTokenFileName)
+	if err := os.WriteFile(path, []byte("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\nextra\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	tok, reused, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+	if reused {
+		t.Fatal("expected multiline tunnel control token file to be regenerated")
+	}
+	if len(tok) != 64 {
+		t.Fatalf("token length = %d, want 64", len(tok))
+	}
+	if tok == "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" {
+		t.Fatal("expected malformed multiline token to be replaced")
+	}
+}
+
+func TestReadTunnelControlTokenRejectsInvalidLength(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir: %v", err)
+	}
+	path := filepath.Join(dir, tunnelControlTokenFileName)
+	if err := os.WriteFile(path, []byte("short-token\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = ReadTunnelControlToken()
+	if !IsOpaqueTokenInvalid(err) {
+		t.Fatalf("ReadTunnelControlToken err = %v, want invalid opaque token", err)
+	}
+}
+
+// F12: writes must tighten pre-existing loose permissions on the token file.
+// os.WriteFile leaves the mode of an existing file untouched, so rotating onto
+// a file left at 0644 by a prior bug would silently keep the secret
+// world-readable.
+
+func TestWriteTokenFileTightensLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningfully enforced on Windows; os.Chmod clamps to 0666/0444")
+	}
+	tmpDir := filepath.Join(t.TempDir(), "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(tmpDir, "session.token")
+	if err := os.WriteFile(path, []byte("old\n2026-01-01T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatalf("seed loose perms: %v", err)
+	}
+
+	expiry := time.Now().Add(time.Hour).Truncate(time.Second)
+	if _, err := WriteTokenFile("new-token", expiry); err != nil {
+		t.Fatalf("WriteTokenFile: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("session.token perm = %o after rewrite, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestRotateTunnelControlTokenTightensLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningfully enforced on Windows; os.Chmod clamps to 0666/0444")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(tmpDir, tunnelControlTokenFileName)
+	if err := os.WriteFile(path, []byte("seed\n"), 0o644); err != nil {
+		t.Fatalf("seed loose perms: %v", err)
+	}
+
+	if _, err := RotateTunnelControlToken(); err != nil {
+		t.Fatalf("RotateTunnelControlToken: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("tunnel-control.token perm = %o after rotate, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestLocalOnlyTokenDirAllowsSubdirectoriesOfHomeCacheRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	nested := filepath.Join(home, ".cache", "cc-clip", "nested")
+	TokenDirOverride = nested
+	defer func() { TokenDirOverride = "" }()
+
+	tok, _, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+	if len(tok) != 64 {
+		t.Fatalf("token length = %d, want 64", len(tok))
+	}
+}
+
+// TestWriteTokenFileSurfaceWriteErrors verifies that an unreachable token
+// directory (parent read-only so MkdirAll fails, mimicking EROFS / tightened
+// ACLs) surfaces an error rather than silently succeeding with no persisted
+// token. If this path ever started swallowing write errors, callers expecting
+// the token file to exist on disk would be left holding a session only
+// present in memory.
+func TestWriteTokenFileSurfaceWriteErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory write-protection is not meaningfully enforced on Windows test envs")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
+	parent := t.TempDir()
+	// Nest the target dir inside a read-only parent so TokenDir()'s
+	// MkdirAll cannot create it.
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatalf("Chmod parent: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	target := filepath.Join(parent, "cc-clip")
+	TokenDirOverride = target
+	defer func() { TokenDirOverride = "" }()
+
+	expiry := time.Now().Add(time.Hour).Truncate(time.Second)
+	_, err := WriteTokenFile("fresh", expiry)
+	if err == nil {
+		t.Fatal("WriteTokenFile = nil, want error when token dir cannot be created")
 	}
 }
