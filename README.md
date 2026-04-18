@@ -474,6 +474,16 @@ Port source model:
 - The runtime source used by `cc-clip tunnel up` is the local managed block in `~/.ssh/config`. `tunnel up` does not SSH back to the remote just to look up the port.
 - `cc-clip doctor --host` compares the remote peer registry with the local managed block, then checks the effective SSH config from `ssh -G`.
 
+Remote peer registry on the server:
+
+- Location: the remote registry lives under `~/.cache/cc-clip/`, with shared index files at `~/.cache/cc-clip/registry/ports.json` and `~/.cache/cc-clip/registry/peers.json`, plus a per-peer state file at `~/.cache/cc-clip/peers/<peer-id>/state.json`.
+- What `ports.json` does: it is the port-to-peer index. It records which remote listen port is currently reserved by which `peer_id`, so two peers do not claim the same reverse-forward port.
+- What `peers.json` does: it is the peer-to-registration index. It records each peer's `peer_id`, label, reserved port, state dir, and timestamps such as `created_at`, `updated_at`, and `last_connect_at`.
+- What `peers/<peer-id>/state.json` does: it is a compact per-peer snapshot derived from the registration, used as that peer's own persisted state directory.
+- How it is persisted: registry writes are protected by a local directory lock at `~/.cache/cc-clip/registry/lock`, then written atomically via `*.tmp.<timestamp>` followed by `rename`. Registry JSON files are written `0600`; directories are created `0700`.
+- Who reads and writes it: `cc-clip connect` reaches the remote `cc-clip peer reserve/show/release` commands over SSH. Those commands update the remote peer registry, and the resulting reservation is then synced into the local managed SSH config block.
+- What it is not: this is not the same as the daemon's in-memory notification nonce registry. Notification nonces are kept only in the local daemon process and are not persisted as remote registry files.
+
 Daemon/port model:
 
 - The local daemon port defaults to `18339`. Override per-command with `--port`, or globally with `CC_CLIP_PORT`.

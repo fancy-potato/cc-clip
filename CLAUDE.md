@@ -82,6 +82,15 @@ goreleaser config: `.goreleaser.yaml`. Release is published automatically (not d
 23. **tunnel CLI** (`cmd/cc-clip/tunnel_cmd.go`) — `cc-clip tunnel list [--json]`, `cc-clip tunnel up <host> [--remote-port N]`, `cc-clip tunnel down <host>`, `cc-clip tunnel remove <host>`. Talks to daemon via HTTP. All three mutating subcommands route to the daemon selected by `--port` / `CC_CLIP_PORT` (default 18339); there is no `--local-port` flag because, by construction, a persistent tunnel's `local_port` equals the owning daemon's HTTP port. `tunnel up` auto-detects the remote port from the local `~/.ssh/config` managed block via `setup.ReadManagedTunnelPorts()`, or falls back to existing tunnel state. If `--port` was not set and the managed block (or the only saved state for the host) points at a different daemon port, the CLI adopts that port so the tunnel is sent to the daemon that actually owns it. The allocation source of truth remains the remote peer registry; runtime tunnel startup uses the locally synced managed block instead of SSHing back to the remote. `tunnel remove` stops the tunnel and deletes its state file (unlike `tunnel down`, which keeps state with `enabled=false`); if the daemon is unreachable it falls through to delete the on-disk state file directly.
 24. **SwiftBar plugin** (`scripts/cc-clip-tunnels.30s.sh`) — macOS menu bar plugin showing tunnel status for all hosts. Refreshes every 30 seconds. Shows connected/total count in menu bar, per-host status with start/stop actions in dropdown, and sends each action to the tunnel's recorded local daemon port. Requires `cc-clip` and `jq` in PATH.
 
+### Remote Peer Registry
+
+- Remote peer registry lives under `~/.cache/cc-clip/`.
+- Shared registry files: `registry/ports.json` (`remote_port -> peer_id`) and `registry/peers.json` (`peer_id -> registration`).
+- Per-peer snapshot: `peers/<peer-id>/state.json`.
+- Persistence model: directory lock at `registry/lock`, then atomic JSON rewrite via temp file + rename. Files are `0600`, directories `0700`.
+- Role: `cc-clip connect` reserves the remote listen port here first; that registry remains the allocation source of truth before the chosen port is mirrored into the local managed `RemoteForward` block.
+- Separate concern: notification nonce registration is an in-memory daemon map, not part of the remote on-disk peer registry.
+
 ### Key Design Decisions
 
 - **Shim is a bash script, not a binary** — installed to `~/.local/bin/` with PATH priority over `/usr/bin/xclip`. Uses `which -a` to find the real binary, skipping its own directory.
