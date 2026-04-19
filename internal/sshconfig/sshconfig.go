@@ -163,6 +163,30 @@ func ReadManagedEnvFromBytes(data []byte, host string) (map[string]string, error
 	return nil, nil
 }
 
+// HostBlockStatusFromBytes reports whether the config contains a literal
+// `Host <host>` block that cc-clip is allowed to manage. It returns nil when
+// such a block exists, or one of ErrOnlyGlobMatch / ErrHostBlockInInclude /
+// ErrHostBlockMissing to explain why no manageable block is available.
+func HostBlockStatusFromBytes(data []byte, host string) error {
+	if err := validateHost(host); err != nil {
+		return err
+	}
+	lines, _ := splitLines(data)
+	blocks, status := findHostBlocks(lines, host)
+	switch status {
+	case hostMatchLiteral:
+		if len(blocks) > 0 {
+			return nil
+		}
+	case hostMatchGlob:
+		return ErrOnlyGlobMatch
+	}
+	if hasIncludeDirective(lines) {
+		return ErrHostBlockInInclude
+	}
+	return ErrHostBlockMissing
+}
+
 // parseSetEnvAssignments splits the argument of a `SetEnv KEY=V …` line
 // into a key=value map, honoring double-quoted values and backslash
 // escapes the same way OpenSSH's tokenizer does. Returns an error for
@@ -232,22 +256,19 @@ func ApplyToFile(path, host string, env map[string]string) error {
 		}
 	}
 
-	// Serialize concurrent Apply/Remove on the same config file via an
-	// advisory flock on a sidecar. Two racing Applies must not read the
-	// same snapshot, both append, and clobber each other's marker block.
-	// A lock failure is surfaced as an error rather than silently falling
-	// back to an unlocked path: the atomic rename prevents torn writes but
-	// does NOT prevent a lost-update race, and previously the silent
-	// degrade defeated the cross-process serialization invariant that
-	// multi-laptop setups rely on. Windows has no flock and its
-	// acquireConfigLock is a documented no-op (returns nil).
+	data, meta, err := readConfig(path)
+	if err != nil {
+		return err
+	}
+	// Prove the target is a real readable config before creating the sidecar
+	// lock. Missing or symlinked configs should remain no-op / fail-closed
+	// cases without materializing a new `.cc-clip.lock` file next to them.
 	release, err := acquireConfigLock(path)
 	if err != nil {
 		return fmt.Errorf("acquire ssh_config advisory lock: %w", err)
 	}
 	defer release()
-
-	data, meta, err := readConfig(path)
+	data, meta, err = readConfig(path)
 	if err != nil {
 		return err
 	}
@@ -309,17 +330,22 @@ func RemoveFromFile(path, host string) error {
 		return err
 	}
 
-	// Mirror ApplyToFile's advisory-lock discipline so a concurrent
-	// Apply cannot see a half-removed state and vice-versa. Lock failure
-	// is fatal for the same reason: a silent no-lock fallback would
-	// allow a concurrent Apply to observe a half-removed state.
+	data, meta, err := readConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// Mirror ApplyToFile's locking, but only after we know the path is an
+	// actual readable file. That keeps missing configs as no-ops and
+	// symlinked configs as fail-closed without creating sidecar lock files.
 	release, err := acquireConfigLock(path)
 	if err != nil {
 		return fmt.Errorf("acquire ssh_config advisory lock: %w", err)
 	}
 	defer release()
-
-	data, meta, err := readConfig(path)
+	data, meta, err = readConfig(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -386,6 +412,18 @@ func collectContinuation(lines []string, i int, rest string) (string, int) {
 	return rest, end
 }
 
+func continuationEnd(lines []string, i int) int {
+	end := i
+	const maxContinuation = 64
+	for steps := 0; steps < maxContinuation && end+1 < len(lines); steps++ {
+		if !strings.HasSuffix(strings.TrimRight(lines[end], " \t"), `\`) {
+			break
+		}
+		end++
+	}
+	return end
+}
+
 func findHostBlocks(lines []string, alias string) ([]hostBlock, hostMatchStatus) {
 	type pendingBlock struct {
 		start  int
@@ -408,7 +446,20 @@ func findHostBlocks(lines []string, alias string) ([]hostBlock, hostMatchStatus)
 		current = nil
 	}
 
+	// skipUntil is the index (inclusive) of the last line consumed by a
+	// backslash-newline continuation on a `Host` keyword. We advance past it
+	// so a continuation line whose textual content happens to begin with
+	// `Host ` (after whitespace trim) is NOT mis-classified as a new
+	// top-level directive: ssh_config has already joined those tokens into
+	// the parent directive via the trailing backslash.
+	skipUntil := -1
 	for i, line := range lines {
+		if i <= skipUntil {
+			continue
+		}
+		if end := continuationEnd(lines, i); end > i {
+			skipUntil = end
+		}
 		trimmed := strings.TrimSpace(line)
 		// `Host` / `Match` start or end blocks even when the user indents the
 		// stanza; ssh_config ignores leading whitespace on keywords.
@@ -420,13 +471,16 @@ func findHostBlocks(lines []string, alias string) ([]hostBlock, hostMatchStatus)
 		keyword, rest := splitDirective(trimmed)
 		switch strings.ToLower(keyword) {
 		case "host":
-			joinedRest, _ := collectContinuation(lines, i, rest)
+			joinedRest, end := collectContinuation(lines, i, rest)
 			tokens := tokenizeHostPatterns(joinedRest)
 			current = &pendingBlock{start: i, tokens: tokens}
+			skipUntil = end
 		case "match":
 			// `Match host …` blocks are intentionally not considered:
 			// SetEnv inside a Match block has surprising scoping rules
 			// and we restrict injection to plain Host blocks.
+			_, end := collectContinuation(lines, i, rest)
+			skipUntil = end
 		}
 	}
 	flush()
@@ -444,36 +498,72 @@ func findHostBlocks(lines []string, alias string) ([]hostBlock, hostMatchStatus)
 	return nil, hostMatchNone
 }
 
-// hasIncludeDirective reports whether the config contains a top-level
-// `Include` directive outside any Host/Match block. OpenSSH allows
-// Include inside a block too, but the risk we care about is the
-// user's `Host <alias>` living in an included file — which only
-// requires a top-level Include to be reachable.
+// hasIncludeDirective reports whether the config contains an `Include`
+// directive that could plausibly reach the queried alias. The risk we
+// care about is the user's `Host <alias>` living in an included file —
+// which only matters when the Include itself is reachable for our query.
+//
+// Discriminator (per ssh_config grammar):
+//   - Indented `Include` belongs to its enclosing Host/Match block; we
+//     skip it because we only care about top-level reachability here.
+//   - Column-0 `Include` BEFORE any Host/Match: unconditionally reached.
+//   - Column-0 `Include` after a `Host <pat>` directive: ssh treats it
+//     as INSIDE that Host block, conditional on matching <pat>. Since
+//     findHostBlocks already proved no literal Host block matches our
+//     alias, an Include inside some other Host block cannot reach us.
+//     Skip it.
+//   - Column-0 `Include` after a `Match` directive: Match patterns can
+//     match unconditionally (e.g. `Match all`) and we deliberately
+//     don't evaluate them — treat the Include as potentially reachable.
+//
+// An earlier version tracked an `inBlock` flag that flipped true on the
+// first Host/Match and never reset, silently masking any later Include
+// and turning `Match all\n …\nInclude ~/.ssh/conf.d/*` into a false
+// `ErrHostBlockMissing`. The most-recent-opener tracking below restores
+// the documented fail-loud behavior without falsely flagging Include
+// directives that live inside a non-matching Host block.
 func hasIncludeDirective(lines []string) bool {
-	inBlock := false
+	insideHostBlock := false
 	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Indented directive: belongs to the enclosing block per ssh_config
+		// grammar. Skip — we only care about column-0 reachability.
+		if line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if startsTopLevelDirective(line) {
-			keyword, _ := splitDirective(trimmed)
-			switch strings.ToLower(keyword) {
-			case "host", "match":
-				inBlock = true
-				continue
-			}
-		}
 		keyword, _ := splitDirective(trimmed)
-		if !inBlock && strings.EqualFold(keyword, "include") {
-			return true
+		switch strings.ToLower(keyword) {
+		case "host":
+			insideHostBlock = true
+		case "match":
+			// Match opens a new block whose body is reachable whenever
+			// the Match pattern fires. Treat any subsequent column-0
+			// Include as potentially reachable.
+			insideHostBlock = false
+		case "include":
+			if !insideHostBlock {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 func blockEnd(lines []string, start int) int {
+	skipUntil := continuationEnd(lines, start)
 	for i := start + 1; i < len(lines); i++ {
+		if i <= skipUntil {
+			continue
+		}
+		if end := continuationEnd(lines, i); end > i {
+			skipUntil = end
+		}
 		if startsTopLevelDirective(lines[i]) {
 			keyword, _ := splitDirective(strings.TrimSpace(lines[i]))
 			kw := strings.ToLower(keyword)
@@ -808,7 +898,19 @@ func findAdjacentManagedSetEnv(lines []string, start, end, orphanIdx int) (int, 
 				continue
 			}
 			keyword, rest := splitDirective(trimmed)
-			if strings.EqualFold(keyword, "setenv") && strings.Contains(rest, "CC_CLIP_") {
+			// Match only the two specific keys cc-clip itself writes
+			// (CC_CLIP_PORT, CC_CLIP_STATE_DIR). A user-authored
+			// `SetEnv CC_CLIP_DEBUG=1` next to an orphaned marker is NOT
+			// ours to delete — the previous "any `CC_CLIP_` substring"
+			// match would have silently removed it, breaking the "never
+			// touch unrelated SetEnv lines" invariant in CLAUDE.md.
+			//
+			// Either key alone is enough: older cc-clip releases wrote a
+			// single-key SetEnv (just CC_CLIP_PORT) and the orphan-repair
+			// path must still clean those up after an upgrade.
+			if strings.EqualFold(keyword, "setenv") &&
+				(strings.Contains(rest, "CC_CLIP_PORT=") ||
+					strings.Contains(rest, "CC_CLIP_STATE_DIR=")) {
 				return i, true
 			}
 			break
@@ -908,10 +1010,11 @@ func validateHost(host string) error {
 		}
 		// OpenSSH matches Host tokens byte-for-byte and tunnel.ValidateSSHHost
 		// already constrains live code paths to [A-Za-z0-9._:@-]. Restrict this
-		// validator to the same ASCII printable range so a direct caller can't
-		// smuggle a non-ASCII alias into ~/.ssh/config that ssh -G would then
-		// refuse to resolve.
-		if r > 127 || r < 0x20 {
+		// validator to the printable-ASCII range [0x20, 0x7e] so a direct
+		// caller can't smuggle a non-ASCII alias OR a control byte (DEL 0x7f
+		// included) into ~/.ssh/config that ssh -G would then refuse to
+		// resolve or that could trip a downstream parser on \r / NUL.
+		if r > 0x7e || r < 0x20 {
 			return fmt.Errorf("%w: non-ASCII or non-printable character %U", ErrInvalidHost, r)
 		}
 	}
@@ -1131,12 +1234,24 @@ func writeAtomic(path string, data []byte, meta fileMeta) error {
 		cleanup()
 		return err
 	}
-	// Best-effort fsync on the parent dir so the rename is durable. Some
-	// filesystems (Windows, certain FUSE mounts) reject O_RDONLY+Sync on
-	// a directory; a failure here doesn't invalidate the write.
+	// Parent-dir fsync makes the rename durable across a crash. If we
+	// couldn't even Open the parent, treat that as best-effort (some
+	// platforms — Windows, certain FUSE mounts — refuse O_RDONLY on
+	// directories). But if Open succeeded, a Sync failure is a real
+	// durability signal: swallowing it turns the "torn rename" class
+	// of bugs the atomic write was designed to prevent into silent data
+	// loss. Returning the error here would not unwind the rename (the
+	// file is in place), so the disk state is consistent either way;
+	// we propagate so the caller can decide whether to retry or alert.
 	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+		syncErr := d.Sync()
+		closeErr := d.Close()
+		if syncErr != nil {
+			return fmt.Errorf("fsync ssh_config dir after rename: %w", syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close ssh_config dir handle: %w", closeErr)
+		}
 	}
 	return nil
 }

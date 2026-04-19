@@ -66,6 +66,29 @@ func TestHookScriptSupportsStrictHealthChecks(t *testing.T) {
 	}
 }
 
+// TestHookScriptStrictModePrefixIsExportedConstant cross-pins the strict-
+// mode error wording with the exported HookHealthFailurePrefix constant
+// that runRemoteNotificationHealthProbe (cmd/cc-clip/main.go) keys off.
+// Without this test, a future template refactor that reworded the printf
+// could pass the loose substring test above (which only checks for the
+// shell-variable form) and the probe-side test (which checks for a
+// literal "http=500" string) independently, while silently breaking the
+// end-to-end probe for any OTHER status code or reword variant.
+func TestHookScriptStrictModePrefixIsExportedConstant(t *testing.T) {
+	got := HookScript(18339)
+	if !strings.Contains(got, HookHealthFailurePrefix) {
+		t.Fatalf("rendered hook script does not contain HookHealthFailurePrefix %q; the constant must match the bash template wording so runRemoteNotificationHealthProbe can recognise the probe failure", HookHealthFailurePrefix)
+	}
+	// Defense in depth: assert no near-miss variant has crept in. If a
+	// future refactor introduces a second prefix (e.g. plural "probes"),
+	// this catches the divergence.
+	if strings.Count(got, "cc-clip-hook health probe") != 2 {
+		// One occurrence in the with-curl-err branch, one in the without-
+		// curl-err branch. Both must use the canonical wording.
+		t.Fatalf("expected exactly 2 occurrences of canonical 'cc-clip-hook health probe' wording; got %d", strings.Count(got, "cc-clip-hook health probe"))
+	}
+}
+
 func TestHookScriptPassesHostAliasViaEnvNotShellInterpolation(t *testing.T) {
 	got := HookScript(18339)
 	// Host alias is attacker-influenced (hostname -s output, or a user-set

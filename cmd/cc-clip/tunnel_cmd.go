@@ -228,7 +228,7 @@ func cmdTunnelUp() {
 		log.Fatalf("resolve tunnel ports: %v", err)
 	}
 	if remotePort == 0 {
-		log.Fatalf("cannot determine remote port for %s. Either run `cc-clip connect %s` first (records the remote port locally), or re-run with `--remote-port <PORT>` explicitly.", host, host)
+		log.Fatal(cannotDetermineRemotePortMessage(host))
 	}
 	if err := validateTunnelPort("--port", daemonPort, false); err != nil {
 		log.Fatalf("resolve tunnel ports: %v", err)
@@ -241,6 +241,20 @@ func cmdTunnelUp() {
 		log.Fatalf("tunnel up failed: %v", err)
 	}
 	fmt.Printf("Tunnel to %s started (remote:%d -> local:%d)\n", host, remotePort, daemonPort)
+}
+
+// cannotDetermineRemotePortMessage formats the actionable error for
+// `cc-clip tunnel up <host>` when no saved tunnel state exists. The
+// wording is contractual — it names `cc-clip connect <host>` as the
+// preferred fix and `--remote-port` as the manual override. Install
+// scripts and docs reference both phrases, so this helper exists to make
+// the wording directly testable without subprocess-running the binary
+// past log.Fatal. Pinned by TestCannotDetermineRemotePortMessageWording.
+func cannotDetermineRemotePortMessage(host string) string {
+	return fmt.Sprintf(
+		"cannot determine remote port for %s. Either run `cc-clip connect %s` first (records the remote port locally), or re-run with `--remote-port <PORT>` explicitly.",
+		host, host,
+	)
 }
 
 // resolveTunnelUpPorts fills in missing remotePort / daemonPort values from

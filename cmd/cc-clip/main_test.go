@@ -331,6 +331,34 @@ func TestRunRemoteNotificationHealthProbeSurfacesStderrWhenStdoutEmpty(t *testin
 	}
 }
 
+// TestRunRemoteNotificationHealthProbeSurfacesExportedHookPrefix
+// cross-pins the hook-template prefix constant with the probe's
+// error-wrapping path. The hook script's strict-mode echo writes a string
+// starting with shim.HookHealthFailurePrefix; this test feeds a synthetic
+// remote stdout containing that exact prefix and asserts the probe
+// surfaces it verbatim. Together with TestHookScriptStrictModePrefixIsExportedConstant
+// in internal/shim, a future template refactor that diverges from the
+// constant will fail BOTH sides simultaneously instead of letting one
+// half drift.
+func TestRunRemoteNotificationHealthProbeSurfacesExportedHookPrefix(t *testing.T) {
+	remoteStdout := shim.HookHealthFailurePrefix + "418"
+	session := &fixedRemoteExecutor{
+		out: remoteStdout,
+		err: errors.New("exit status 1"),
+	}
+
+	err := runRemoteNotificationHealthProbe(session, 19001, "~/.cache/cc-clip/peers/peer-a")
+	if err == nil {
+		t.Fatal("expected probe failure")
+	}
+	if !strings.Contains(err.Error(), shim.HookHealthFailurePrefix) {
+		t.Fatalf("err = %v; want surfaced %q from exported hook constant", err, shim.HookHealthFailurePrefix)
+	}
+	if !strings.Contains(err.Error(), "418") {
+		t.Fatalf("err = %v; want HTTP code suffix preserved", err)
+	}
+}
+
 // TestRunRemoteNotificationHealthProbeRejectsEmptyStateDir pins the new
 // contract that an empty stateDir is a programming error — the probe's
 // purpose is to exercise the run's specific nonce via that peer-scoped
@@ -460,11 +488,11 @@ func TestRunShimUninstallWithHostPreservesPATHWhenOtherPeersRemain(t *testing.T)
 			pathCalls++
 			return nil
 		},
-		countRemoteOtherPeers: func(host string) (int, error) {
+		countRemoteOtherPeers: func(host string) (int, bool, error) {
 			if host != "example" {
 				t.Fatalf("peer-count query host = %q, want %q", host, "example")
 			}
-			return 2, nil
+			return 2, true, nil
 		},
 	})
 	if err != nil {
@@ -486,13 +514,64 @@ func TestRunShimUninstallWithHostRemovesPATHWhenLastPeer(t *testing.T) {
 			pathCalls++
 			return nil
 		},
-		countRemoteOtherPeers: func(host string) (int, error) { return 0, nil },
+		countRemoteOtherPeers: func(host string) (int, bool, error) { return 0, true, nil },
 	})
 	if err != nil {
 		t.Fatalf("runShimUninstall returned error: %v", err)
 	}
 	if pathCalls != 1 {
 		t.Fatalf("removeRemotePath called %d times, want 1 when no peers remain", pathCalls)
+	}
+}
+
+// TestRunShimUninstallWithHostPreservesPATHWhenSelfUnresolved pins the
+// "ambiguous preserve" branch: the registry reports peers but we can't
+// identify which one (if any) is this workstation. A confident
+// "N other peer(s)" message would misattribute the preservation to
+// nonexistent peers and mislead the operator. Preserve with a distinct
+// warning instead.
+func TestRunShimUninstallWithHostPreservesPATHWhenSelfUnresolved(t *testing.T) {
+	pathCalls := 0
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath: func(string) error {
+			pathCalls++
+			return nil
+		},
+		countRemoteOtherPeers: func(host string) (int, bool, error) {
+			// Registry has 1 peer but self couldn't be resolved. That 1
+			// peer might be us — we can't tell — so preserve.
+			return 1, false, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0 when self peer id could not be resolved", pathCalls)
+	}
+}
+
+// TestRunShimUninstallWithHostRemovesPATHWhenSelfUnresolvedAndEmpty pins
+// the complementary case: registry is empty AND self could not be resolved.
+// There is no risk of breaking another peer (there are none), so the marker
+// is safe to remove. The self-resolution signal only gates the preserve
+// branch; it does not itself block cleanup.
+func TestRunShimUninstallWithHostRemovesPATHWhenSelfUnresolvedAndEmpty(t *testing.T) {
+	pathCalls := 0
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath: func(string) error {
+			pathCalls++
+			return nil
+		},
+		countRemoteOtherPeers: func(host string) (int, bool, error) { return 0, false, nil },
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if pathCalls != 1 {
+		t.Fatalf("removeRemotePath called %d times, want 1 when registry is empty", pathCalls)
 	}
 }
 
@@ -507,8 +586,8 @@ func TestRunShimUninstallWithHostFailsSafeOnCountQueryError(t *testing.T) {
 			pathCalls++
 			return nil
 		},
-		countRemoteOtherPeers: func(host string) (int, error) {
-			return 0, errors.New("ssh handshake failed")
+		countRemoteOtherPeers: func(host string) (int, bool, error) {
+			return 0, false, errors.New("ssh handshake failed")
 		},
 	})
 	if err != nil {
@@ -706,6 +785,54 @@ func TestResolveUninstallPeerTargetBareFlagUsesLocalIdentity(t *testing.T) {
 	}
 	if managedHost != "myserver" {
 		t.Fatalf("bare --peer must tear down local tunnel state, got host=%q", managedHost)
+	}
+}
+
+func TestResolveUninstallPeerTargetBareIgnoresManagedSetEnvWithoutLocalIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	cfg := `Host myserver
+  HostName example.com
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18339 CC_CLIP_STATE_DIR=/home/shared/.cache/cc-clip/peers/stale-peer
+  # <<< cc-clip SetEnv (do not edit) <<<
+`
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, _, err := resolveUninstallPeerTarget("myserver", "", peer.Identity{})
+	if err == nil || !strings.Contains(err.Error(), "pass --peer-id <id> explicitly") {
+		t.Fatalf("err = %v, want fail-closed missing-identity error", err)
+	}
+}
+
+func TestResolveSelfUninstallPeerTargetRequiresLocalIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	cfg := `Host myserver
+  HostName example.com
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18339 CC_CLIP_STATE_DIR=/home/shared/.cache/cc-clip/peers/stale-peer
+  # <<< cc-clip SetEnv (do not edit) <<<
+`
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, _, err := resolveSelfUninstallPeerTarget("myserver", peer.Identity{})
+	if err == nil || !strings.Contains(err.Error(), "restore the local peer identity first") {
+		t.Fatalf("err = %v, want fail-closed self-resolution error", err)
 	}
 }
 
@@ -1755,7 +1882,6 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 
 	for _, needle := range []string{
 		`rm -f "$HOME/.cache/cc-clip/peers/peer-a/notify.nonce" "$HOME/.cache/cc-clip/peers/peer-a/notify-health.log"`,
-		`rm -f "$HOME/.cache/cc-clip/notify.nonce" "$HOME/.cache/cc-clip/notify-health.log"`,
 		`rm -f "$HOME/.local/bin/cc-clip-hook"`,
 		`rm -f "$HOME/.local/bin/clipcc"`,
 		`sed -i.cc-clip-bak '/# >>> cc-clip notify \(do not edit\) >>>/,/# <<< cc-clip notify \(do not edit\) <<</d' ~/.codex/config.toml 2>/dev/null || true; rm -f ~/.codex/config.toml.cc-clip-bak`,
@@ -1765,13 +1891,23 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 		}
 	}
 
-	// Multi-peer safety pin: removeRemoteNotifyState no longer issues the
+	// Multi-peer safety pin #1: removeRemoteNotifyState no longer issues the
 	// global `find ~/.cache/cc-clip/peers … -delete` sweep that earlier
 	// versions ran. If this re-appears, it will silently wipe other
 	// laptops' notify nonces on shared-account servers. See
 	// cmd/cc-clip/main.go:removeRemoteNotifyState for the rationale.
 	if session.indexOfCommandContaining(`find "$HOME/.cache/cc-clip/peers"`) >= 0 {
 		t.Fatalf("removeRemoteNotifyState must not sweep other peers' notify state, got %v", session.commands)
+	}
+
+	// Multi-peer safety pin #2: removeRemoteNotifyState no longer touches
+	// the legacy ~/.cache/cc-clip/notify.nonce that the hook script falls
+	// back to when a caller's SSH session lacks CC_CLIP_STATE_DIR. Sweeping
+	// it from one peer's teardown would break every other peer that relies
+	// on that fallback. The contract in AGENTS.md is explicit: "touches only
+	// the caller's own stateDir".
+	if session.indexOfCommandContaining(`rm -f "$HOME/.cache/cc-clip/notify.nonce"`) >= 0 {
+		t.Fatalf("removeRemoteNotifyState must not delete the legacy shared notify.nonce, got %v", session.commands)
 	}
 }
 
@@ -1937,6 +2073,86 @@ func TestUninstallPeerRemoteAndConfigSurfacesTunnelCleanupErrors(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "persistent tunnel") {
 		t.Fatalf("err = %v, want tunnel cleanup failure", err)
+	}
+}
+
+// TestRunCmdUninstallPeerPreservesSetEnvWhenSessionFails pins the
+// cmdUninstallPeer ordering invariant directly: any failure on the path
+// to uninstallPeerRemoteAndConfig — including a failed SSH session
+// open — must NOT call deps.removeSetEnv. The local SetEnv block in
+// ~/.ssh/config has to survive so the operator's retry can reuse the
+// already-allocated remote port; rewriting it on a failed cleanup would
+// either force-allocate a new remote port on retry or, worse, drop the
+// per-peer state-dir hint and let the next session's hook script
+// authenticate against the wrong nonce.
+func TestRunCmdUninstallPeerPreservesSetEnvWhenSessionFails(t *testing.T) {
+	prev := loadLocalPeerIdentity
+	t.Cleanup(func() { loadLocalPeerIdentity = prev })
+	loadLocalPeerIdentity = func() (peer.Identity, error) {
+		return peer.Identity{ID: "abcdef0123456789", Label: "imac"}, nil
+	}
+
+	setEnvCalls := []string{}
+	advisCalls := []string{}
+	err := runCmdUninstallPeer("myserver", "", cmdUninstallPeerDeps{
+		newSession: func(host string) (*shim.SSHSession, error) {
+			return nil, errors.New("ssh transport down")
+		},
+		removeSetEnv:     func(host string) { setEnvCalls = append(setEnvCalls, host) },
+		printLegacyAdvis: func(host string) { advisCalls = append(advisCalls, host) },
+	})
+	if err == nil || !strings.Contains(err.Error(), "ssh transport down") {
+		t.Fatalf("expected ssh transport error, got %v", err)
+	}
+	if len(setEnvCalls) != 0 {
+		t.Fatalf("removeSetEnv was called %v despite session failure; SetEnv block must survive for retry", setEnvCalls)
+	}
+	if len(advisCalls) != 0 {
+		t.Fatalf("printLegacyAdvis was called %v despite session failure; must abort early", advisCalls)
+	}
+}
+
+// TestRunCmdUninstallPeerSkipsSetEnvForNonSelfPeer pins the second half
+// of the ordering contract on the SUCCESS path: removeSetEnv must NOT fire
+// when the operator is releasing somebody else's peer (managedHost == "").
+// Cleaning a foreign peer's lease does not grant permission to edit this
+// laptop's ssh config, which is what would happen if a future refactor
+// unconditionally called removeSetEnv after a successful cleanup.
+func TestRunCmdUninstallPeerSkipsSetEnvForNonSelfPeer(t *testing.T) {
+	prev := loadLocalPeerIdentity
+	t.Cleanup(func() { loadLocalPeerIdentity = prev })
+	// Local identity has its own ID; we pass a DIFFERENT --peer-id, so
+	// resolveUninstallPeerTarget returns managedHost="" (foreign peer).
+	loadLocalPeerIdentity = func() (peer.Identity, error) {
+		return peer.Identity{ID: "this-laptop-id", Label: "imac"}, nil
+	}
+
+	setEnvCalls := []string{}
+	legacyAdvisCalls := []string{}
+	err := runCmdUninstallPeer("myserver", "some-other-peer-id", cmdUninstallPeerDeps{
+		remoteCleanup: func(host, managedHost, peerID string) error {
+			if host != "myserver" {
+				t.Fatalf("host = %q, want myserver", host)
+			}
+			if managedHost != "" {
+				t.Fatalf("managedHost = %q, want empty for foreign peer", managedHost)
+			}
+			if peerID != "some-other-peer-id" {
+				t.Fatalf("peerID = %q, want some-other-peer-id", peerID)
+			}
+			return nil
+		},
+		removeSetEnv:     func(host string) { setEnvCalls = append(setEnvCalls, host) },
+		printLegacyAdvis: func(host string) { legacyAdvisCalls = append(legacyAdvisCalls, host) },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(setEnvCalls) != 0 {
+		t.Fatalf("removeSetEnv was called %v for a foreign --peer-id; only self-release may touch ssh_config", setEnvCalls)
+	}
+	if got, want := legacyAdvisCalls, []string{"myserver"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy advisory calls = %#v, want %#v", got, want)
 	}
 }
 
@@ -2545,6 +2761,61 @@ func TestConfiguredPortFlagWinsOverEnv(t *testing.T) {
 			}
 			if explicit != tt.wantExpl {
 				t.Errorf("explicit = %v, want %v", explicit, tt.wantExpl)
+			}
+		})
+	}
+}
+
+func TestConfiguredDoctorPortsUsesRemoteSelectorOnlyWhenExplicit(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		env            string
+		envSet         bool
+		wantLocalPort  int
+		wantRemotePort int
+	}{
+		{
+			name:           "implicit default leaves remote selector unset",
+			args:           []string{"cc-clip", "doctor", "--host", "myserver"},
+			wantLocalPort:  18339,
+			wantRemotePort: 0,
+		},
+		{
+			name:           "explicit flag selects same remote port",
+			args:           []string{"cc-clip", "doctor", "--host", "myserver", "--port", "18444"},
+			wantLocalPort:  18444,
+			wantRemotePort: 18444,
+		},
+		{
+			name:           "env override is explicit for remote selector too",
+			args:           []string{"cc-clip", "doctor", "--host", "myserver"},
+			env:            "18444",
+			envSet:         true,
+			wantLocalPort:  18444,
+			wantRemotePort: 18444,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			savedArgs := os.Args
+			os.Args = tt.args
+			t.Cleanup(func() { os.Args = savedArgs })
+			if tt.envSet {
+				t.Setenv("CC_CLIP_PORT", tt.env)
+			} else {
+				os.Unsetenv("CC_CLIP_PORT")
+			}
+
+			localPort, remotePort, err := configuredDoctorPorts()
+			if err != nil {
+				t.Fatalf("configuredDoctorPorts err = %v", err)
+			}
+			if localPort != tt.wantLocalPort {
+				t.Fatalf("localPort = %d, want %d", localPort, tt.wantLocalPort)
+			}
+			if remotePort != tt.wantRemotePort {
+				t.Fatalf("remotePort = %d, want %d", remotePort, tt.wantRemotePort)
 			}
 		})
 	}

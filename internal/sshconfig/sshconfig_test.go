@@ -320,6 +320,70 @@ Include ~/.ssh/conf.d/*.conf
 	}
 }
 
+// TestApplyReportsHostBlockInIncludeAfterMatchBlock pins the fix for the
+// review P1 case: an `Include` that follows a `Match` directive at column
+// 0 is potentially reachable (Match can fire unconditionally, e.g. `Match
+// all`), so it MUST surface as ErrHostBlockInInclude — not the default
+// ErrHostBlockMissing. The pre-fix `inBlock` flag latched true on the
+// first Host/Match and never reset, masking the Include. Without this
+// test, a regression that re-introduces the latch goes undetected.
+func TestApplyReportsHostBlockInIncludeAfterMatchBlock(t *testing.T) {
+	path := writeTempConfig(t, `Match all
+  ForwardAgent yes
+
+Include ~/.ssh/conf.d/*.conf
+`)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrHostBlockInInclude) {
+		t.Fatalf("expected ErrHostBlockInInclude, got %v", err)
+	}
+}
+
+// TestApplyReportsHostBlockInIncludeAfterHostThenMatch covers a slightly
+// trickier ordering: Host opens a block (inside-host=true), then Match
+// opens a NEW block which resets the inside-host tracking, and a column-0
+// Include after that Match is reachable via the Match. Asserts the
+// most-recent-opener semantics, not just the most-recent-of-each-kind.
+func TestApplyReportsHostBlockInIncludeAfterHostThenMatch(t *testing.T) {
+	path := writeTempConfig(t, `Host other
+  HostName other.example.com
+
+Match all
+
+Include ~/.ssh/conf.d/*.conf
+`)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrHostBlockInInclude) {
+		t.Fatalf("expected ErrHostBlockInInclude, got %v", err)
+	}
+}
+
+func TestHostBlockStatusFromBytesReportsUnsupportedIncludeLayout(t *testing.T) {
+	data := []byte("Include ~/.ssh/conf.d/*.conf\n")
+	err := HostBlockStatusFromBytes(data, "myalias")
+	if !errors.Is(err, ErrHostBlockInInclude) {
+		t.Fatalf("expected ErrHostBlockInInclude, got %v", err)
+	}
+}
+
+func TestApplyDoesNotSplitContinuationWrappedHostDirective(t *testing.T) {
+	path := writeTempConfig(t, `Host decoy \
+Host myalias
+  HostName srv.example.com
+`)
+	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := readFile(t, path)
+	if strings.Contains(got, "Host decoy \\\n  # >>> cc-clip SetEnv") {
+		t.Fatalf("marker was inserted in the middle of a continued Host directive:\n%s", got)
+	}
+	wantOrder := "Host decoy \\\nHost myalias\n  HostName srv.example.com\n  " + markerBegin
+	if !strings.Contains(got, wantOrder) {
+		t.Fatalf("expected marker after the continued Host block body, got:\n%s", got)
+	}
+}
+
 func TestApplyPrefersLiteralOverGlob(t *testing.T) {
 	path := writeTempConfig(t, `Host *.example.com
   User globaluser
@@ -427,6 +491,13 @@ func TestApplyRejectsInvalidHost(t *testing.T) {
 		// write a stanza ssh -G would then refuse to resolve.
 		"myalias\u00e9",
 		"myalias\u4e2d",
+		// ASCII control characters under 0x20 must also be rejected. They
+		// could otherwise smuggle a CR into a Host stanza or terminate the
+		// directive mid-line for an unsuspecting parser.
+		"my\x01alias",
+		"my\x07alias",
+		"my\x1balias",
+		"my\x7falias",
 	}
 	for _, h := range cases {
 		err := ApplyToFile(path, h, map[string]string{"CC_CLIP_PORT": "18340"})
@@ -530,6 +601,45 @@ func TestApplyRejectsExistingUserSetEnv(t *testing.T) {
 	}
 	if got := readFile(t, path); got != original {
 		t.Fatalf("config was mutated on SetEnv conflict:\n--- got\n%s\n--- want\n%s", got, original)
+	}
+}
+
+// TestApplySucceedsAfterUserRemovesConflictingSetEnv pins the recovery
+// path: an Apply that returned ErrSetEnvConflict is not a sticky error.
+// Once the operator removes their conflicting SetEnv line, the next Apply
+// must install the marker block cleanly. A future refactor that caches
+// "this host is poisoned" or that fails to re-scan the file would silently
+// break recovery without breaking the original conflict-detection test.
+func TestApplySucceedsAfterUserRemovesConflictingSetEnv(t *testing.T) {
+	conflicting := `Host myalias
+  HostName srv
+  SetEnv FOO=bar
+`
+	path := writeTempConfig(t, conflicting)
+	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"}); !errors.Is(err, ErrSetEnvConflict) {
+		t.Fatalf("step 1: expected ErrSetEnvConflict, got %v", err)
+	}
+
+	cleaned := `Host myalias
+  HostName srv
+`
+	if err := os.WriteFile(path, []byte(cleaned), 0600); err != nil {
+		t.Fatalf("rewrite cleaned config: %v", err)
+	}
+
+	if err := ApplyToFile(path, "myalias", map[string]string{
+		"CC_CLIP_PORT":      "18340",
+		"CC_CLIP_STATE_DIR": "/home/u/.cache/cc-clip/peers/abc",
+	}); err != nil {
+		t.Fatalf("step 2: Apply after conflict resolution failed: %v", err)
+	}
+
+	got := readFile(t, path)
+	if !strings.Contains(got, markerBegin) || !strings.Contains(got, markerEnd) {
+		t.Fatalf("recovered Apply did not write marker pair:\n%s", got)
+	}
+	if !strings.Contains(got, "CC_CLIP_PORT=18340") || !strings.Contains(got, "CC_CLIP_STATE_DIR=/home/u/.cache/cc-clip/peers/abc") {
+		t.Fatalf("recovered Apply did not write expected env values:\n%s", got)
 	}
 }
 
@@ -1203,6 +1313,47 @@ func TestApplyHonorsBackslashNewlineContinuationInHost(t *testing.T) {
 	got := readFile(t, path)
 	if !strings.Contains(got, "# >>> cc-clip SetEnv") {
 		t.Fatalf("marker not inserted for continuation-wrapped Host block:\n%s", got)
+	}
+}
+
+// TestApplyDoesNotMisclassifyHostContinuationLineAsNewBlock pins that a
+// backslash-newline continuation whose continuation line textually starts
+// with `Host ` stays tokenised as part of the parent directive. ssh_config
+// has already joined those tokens, so the outer findHostBlocks loop must
+// skip past the consumed continuation lines — otherwise `Host decoy \<nl>
+// Host realalias` would be parsed as two separate Host blocks and Apply
+// would target the wrong one (writing the SetEnv marker inside a stanza
+// the user never intended to scope to the alias).
+func TestApplyDoesNotMisclassifyHostContinuationLineAsNewBlock(t *testing.T) {
+	// Line 1 opens `Host decoy` with a trailing backslash; line 2's textual
+	// content begins with `Host realalias` but is structurally a continuation
+	// of line 1 — both tokens belong to the same logical Host directive.
+	// The alias we want to target is `onlyhost`, which has its own block
+	// further down. If the continuation is mis-classified as a new top-level
+	// Host, `Host realalias` would match literally and the marker would end
+	// up in the wrong block.
+	cfg := "Host decoy \\\nHost realalias\n  HostName decoy.example.com\n\nHost onlyhost\n  HostName srv.example.com\n  User shareduser\n"
+	path := writeTempConfig(t, cfg)
+	if err := ApplyToFile(path, "onlyhost", map[string]string{
+		"CC_CLIP_PORT":      "18340",
+		"CC_CLIP_STATE_DIR": "/home/u/.cache/cc-clip/peers/abc",
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := readFile(t, path)
+	// The marker must land inside the `Host onlyhost` block, not inside the
+	// decoy block. A simple way to assert that: the marker must appear AFTER
+	// the `Host onlyhost` line and BEFORE EOF, and there must be exactly one.
+	markerIdx := strings.Index(got, "# >>> cc-clip SetEnv")
+	onlyHostIdx := strings.Index(got, "Host onlyhost")
+	if markerIdx < 0 {
+		t.Fatalf("marker not inserted at all:\n%s", got)
+	}
+	if onlyHostIdx < 0 || markerIdx < onlyHostIdx {
+		t.Fatalf("marker landed in the wrong block (before Host onlyhost):\n%s", got)
+	}
+	if strings.Count(got, "# >>> cc-clip SetEnv") != 1 {
+		t.Fatalf("expected exactly one marker block, got %d:\n%s", strings.Count(got, "# >>> cc-clip SetEnv"), got)
 	}
 }
 

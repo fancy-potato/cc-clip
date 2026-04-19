@@ -124,7 +124,7 @@ Doctor check ID: `ssh-config-legacy` (advisory only — this check is cosmetic; 
 
 **Cause:** Older cc-clip releases wrote that block so interactive SSH sessions would establish the reverse tunnel. The current release owns the tunnel from the local daemon directly; the leftover `RemoteForward` competes with the daemon-held port and OpenSSH warns.
 
-**Fix:** cc-clip does **not** migrate this block for you. This is an intentional manual step; `setup`, `connect`, and `uninstall` leave old managed blocks alone. Open `~/.ssh/config`, locate the block, and delete everything between (and including) the two marker lines:
+**Fix:** cc-clip does **not** migrate this block for you during the normal CLI flows. This is an intentional manual step; `setup`, `connect`, and `uninstall` leave old managed blocks alone. Open `~/.ssh/config`, locate the block, and delete everything between (and including) the two marker lines:
 
 ```
 # >>> cc-clip managed host: <alias> >>>
@@ -133,6 +133,8 @@ Doctor check ID: `ssh-config-legacy` (advisory only — this check is cosmetic; 
 ```
 
 Save and reconnect. The warning will not return.
+
+The one exception is the destructive local purge script: `scripts/uninstall-local.sh` removes legacy managed blocks too, but only when `~/.ssh/config` is a regular file. Symlinked SSH configs are preserved with a warning.
 
 ---
 
@@ -422,7 +424,7 @@ The fix is one of:
     User shareduser
   ```
 
-- **Move the SetEnv block manually** into the included fragment. You can read the exact SetEnv line cc-clip would emit with `cc-clip doctor --host myalias` (after a successful `connect`) and paste it into your included file yourself. This is a one-time manual step; subsequent `cc-clip setup` / `connect` runs will keep warning unless the Host block moves into the top-level file.
+- **Move the `Host myalias` stanza into the top-level `~/.ssh/config` and re-run `cc-clip setup` / `connect`.** cc-clip intentionally does not walk `Include` directives, and the warning does not print a paste-ready `SetEnv ...` line. The supported recovery is to add a literal `Host myalias` block to the top-level file, then rerun so cc-clip can write and maintain its managed SetEnv marker block there.
 
 - **Disable the Include** and re-run setup. Not recommended if your included files carry other hosts you need.
 

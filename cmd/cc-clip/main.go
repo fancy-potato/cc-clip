@@ -39,6 +39,24 @@ import (
 
 var version = "dev"
 
+// failUsage prints a user-facing argument-validation error and exits with
+// exitcode.UsageError so wrapper scripts can distinguish "you typed it
+// wrong" from a runtime failure (exit 1) or a known business condition
+// (NoImage / TunnelUnreachable / …). Use this in place of log.Fatalf for
+// any error rooted in CLI invocation (mutex'd flags, missing required
+// args, malformed flag values).
+//
+// Mirrors the format used by log.Fatalf — newline-terminated stderr write
+// + os.Exit — so callers don't need to think about logging formatting.
+func failUsage(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+	fmt.Fprint(os.Stderr, msg)
+	os.Exit(exitcode.UsageError)
+}
+
 func main() {
 	log.SetFlags(0)
 
@@ -275,6 +293,27 @@ func configuredPort() (int, bool, error) {
 		}
 	}
 	return port, explicit, nil
+}
+
+// configuredDoctorPorts returns the local daemon port for doctor's local
+// checks plus the selector to use for remote tunnel-state alignment.
+//
+// The subtle part is the remote selector: when the user did NOT pass
+// `--port` (and did not set CC_CLIP_PORT), doctor should not force the
+// default 18339 into the remote saved-state matcher. Doing so makes
+// `doctor --host` falsely fail on hosts whose only saved tunnel state lives
+// on some other daemon port. In that implicit-default case we pass 0 to the
+// remote side, which means "auto-select the unique saved state if there is
+// exactly one, otherwise ask the user to disambiguate with --port".
+func configuredDoctorPorts() (localPort, remotePort int, err error) {
+	port, explicit, err := configuredPort()
+	if err != nil {
+		return 0, 0, err
+	}
+	if explicit {
+		return port, port, nil
+	}
+	return port, 0, nil
 }
 
 func parsePortSetting(source, raw string) (int, error) {
@@ -594,9 +633,17 @@ func cmdUninstall() {
 	// so the README example `cc-clip uninstall --host myserver --peer` works.
 	// --peer-id <id> remains the escape hatch for releasing a non-local peer
 	// ID (rare; cleaning up a workstation's lease from a different machine).
+	// The two are alternatives — passing both at once is almost always a
+	// typo and the silent "--peer-id wins" behavior in earlier revisions
+	// hid real operator intent (e.g. "release the local peer AND peer X").
+	// Reject the combination so the operator picks one.
 	peerFlag := hasFlag("peer")
 	peerID := getFlag("peer-id", "")
 	codex := hasFlag("codex")
+
+	if peerFlag && peerID != "" {
+		failUsage("uninstall: pass either --peer (release this workstation's peer) or --peer-id <id> (release a specific peer), not both")
+	}
 
 	if peerFlag || peerID != "" {
 		cmdUninstallPeer(host, peerID)
@@ -644,38 +691,56 @@ type uninstallOps struct {
 	// marker cleanup only when another laptop on the same Unix account
 	// still depends on it. A non-nil error preserves the PATH marker
 	// (fail safe).
-	countRemoteOtherPeers func(host string) (int, error)
+	//
+	// The second return value reports whether this workstation's own peer
+	// identity was resolvable. When false, the returned count is the raw
+	// registry total (no self-subtraction happened) — callers should treat
+	// that as an ambiguous preserve, not a confident "N other peers remain",
+	// since one of the N could be us.
+	countRemoteOtherPeers func(host string) (count int, selfResolved bool, err error)
 }
 
 // countRemoteOtherPeersOverSSH opens a short-lived SSH session to the host
 // to invoke `cc-clip peer list`, then subtracts this workstation's own peer
 // ID when we can resolve it. Lives in cmd/cc-clip because it bridges the
 // internal/shim SSHSession type with the injectable hook on uninstallOps.
-func countRemoteOtherPeersOverSSH(host string) (int, error) {
+//
+// Returns (otherPeers, selfResolved, err). When selfResolved is false, the
+// caller can't distinguish "N other peers" from "N peers including me", so
+// the uninstall flow emits a distinct warning instead of the confident
+// "N other peer(s) still registered" line.
+func countRemoteOtherPeersOverSSH(host string) (int, bool, error) {
 	session, err := shim.NewSSHSession(host)
 	if err != nil {
-		return 0, fmt.Errorf("open ssh session: %w", err)
+		return 0, false, fmt.Errorf("open ssh session: %w", err)
 	}
 	defer session.Close()
 	regs, err := shim.ListPeersViaSession(session, "~/.local/bin/cc-clip")
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	otherPeers := len(regs)
-	selfPeerID := localPeerIDForHost(host)
+	total := len(regs)
+	selfPeerID := localPeerIDForHost()
 	if selfPeerID == "" {
-		return otherPeers, nil
+		return total, false, nil
 	}
 	for _, reg := range regs {
 		if reg.PeerID == selfPeerID {
-			otherPeers--
-			break
+			otherPeers := total - 1
+			if otherPeers < 0 {
+				otherPeers = 0
+			}
+			return otherPeers, true, nil
 		}
 	}
-	if otherPeers < 0 {
-		return 0, nil
-	}
-	return otherPeers, nil
+	// We resolved a local peer ID but it isn't in the remote registry —
+	// either we never actually registered with this host, the registry was
+	// hand-edited, or the entry was reaped out from under us. We cannot
+	// confidently subtract ourselves from `total`, so report selfResolved=false
+	// so the caller's fail-safe preserves shared assets instead of treating
+	// `total` as "other peers" and potentially yanking the PATH marker out
+	// from under another laptop.
+	return total, false, nil
 }
 
 // legacyManagedBlockAdvisor is a package-level indirection so tests can stub
@@ -695,28 +760,42 @@ func printLegacyManagedBlockAdvisoryIfAny(host string) {
 	}
 }
 
-func localPeerIDForHost(host string) string {
+func localPeerIDForHost() string {
 	ident, err := loadLocalPeerIdentity()
 	if err == nil && strings.TrimSpace(ident.ID) != "" {
 		return ident.ID
 	}
-	return managedPeerIDForHost(host)
+	// Intentionally DO NOT fall back to ~/.ssh/config's managed SetEnv block
+	// here. That file proves only "someone wrote CC_CLIP_STATE_DIR for this
+	// Host alias on this machine at some point" — not "the current machine still
+	// owns that peer id". It is user-editable, can be stale after dotfile copy /
+	// restore, and may even point at another laptop's peer on a shared account.
+	// Using it as self-proof would let `uninstall --host H` subtract the wrong
+	// registry row and misclassify "other peers remain" vs "I am the last peer",
+	// which is exactly the cross-laptop collateral this uninstall flow is meant
+	// to avoid. For self-detection we trust only the local identity files.
+	return ""
 }
 
 func runShimUninstall(target shim.Target, installPath, host string, ops uninstallOps) error {
 	if host != "" {
-		// Gate the PATH-marker deletion on the remote peer registry: the
+		// Gate the PATH-marker deletion on the remote peer registry. The
 		// marker block is shared by every laptop on the same Unix account,
-		// so yanking it while another peer is still using `~/.local/bin`
-		// would silently disable THEIR Claude Code clipboard shim. On any
-		// error resolving "am I the last peer?" we fail safe and preserve
-		// the marker — operators can rerun `cc-clip doctor` or remove it
-		// manually if the registry is corrupted.
+		// so any ambiguity must fail safe and preserve it.
 		if ops.countRemoteOtherPeers != nil {
-			count, err := ops.countRemoteOtherPeers(host)
+			count, selfResolved, err := ops.countRemoteOtherPeers(host)
 			switch {
 			case err != nil:
-				fmt.Printf("Preserving shared PATH marker on %s: unable to confirm this is the last peer (%v); rerun `cc-clip uninstall --host %s --peer` once the registry is healthy\n", host, err, host)
+				fmt.Printf("Preserving shared PATH marker on %s: unable to confirm whether other peers remain (%v); rerun `cc-clip uninstall --host %s --peer` once the registry is healthy\n", host, err, host)
+				printLegacyManagedBlockAdvisoryIfAny(host)
+				return nil
+			case !selfResolved && count > 0:
+				// Registry has peers but we couldn't identify which one is
+				// us because the local identity files are missing.
+				// One of the reported peers could be this workstation, so
+				// we cannot confidently claim "N other peers remain" —
+				// preserve the marker and spell out the ambiguity instead.
+				fmt.Printf("Preserving shared PATH marker on %s: %d peer(s) registered but this workstation's own peer id could not be resolved; rerun with `--peer-id <id>` or reinstall to re-establish a local identity\n", host, count)
 				printLegacyManagedBlockAdvisoryIfAny(host)
 				return nil
 			case count > 0:
@@ -746,40 +825,57 @@ func runShimUninstall(target shim.Target, installPath, host string, ops uninstal
 }
 
 func cmdUninstallPeer(host, peerArg string) {
-	ident, err := loadIdentityForUninstallPeer(peerArg)
-	if err != nil {
+	if err := runCmdUninstallPeer(host, peerArg, cmdUninstallPeerDeps{
+		newSession:       shim.NewSSHSession,
+		removeSetEnv:     removeLaptopSSHConfigSetEnv,
+		printLegacyAdvis: printLegacyManagedBlockAdvisoryIfAny,
+	}); err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
 	}
+}
 
-	// Bare `--peer` (no --peer-id) auto-discovers the local identity's ID.
-	// Explicit `--peer-id <id>` overrides this for the rare case of releasing
-	// a non-local workstation's lease.
-	if peerArg == "" {
-		peerArg = ident.ID
+// cmdUninstallPeerDeps is the test seam for runCmdUninstallPeer. The
+// production call site (cmdUninstallPeer) wires real implementations; tests
+// substitute stubs to pin the ordering invariant — specifically that
+// removeSetEnv MUST NOT fire when the remote/PATH/tunnel cleanup chain
+// fails, so a retry can pick up the same SetEnv block instead of leaking
+// the per-peer port/state-dir into a fresh ssh-config write.
+type cmdUninstallPeerDeps struct {
+	newSession       func(host string) (*shim.SSHSession, error)
+	remoteCleanup    func(host, managedHost, peerID string) error
+	removeSetEnv     func(host string)
+	printLegacyAdvis func(host string)
+}
+
+// runCmdUninstallPeer performs the full uninstall-peer flow but returns
+// errors instead of calling log.Fatalf, so the ordering invariant is
+// directly testable. ORDERING INVARIANT: every remote/PATH/tunnel cleanup
+// step runs before deps.removeSetEnv. If anything in the cleanup chain
+// fails, this function returns the error WITHOUT calling deps.removeSetEnv,
+// so the local SetEnv block survives for the operator's retry. Pinned by
+// TestRunCmdUninstallPeerPreservesSetEnvWhenRemoteCleanupFails.
+func runCmdUninstallPeer(host, peerArg string, deps cmdUninstallPeerDeps) error {
+	ident, err := loadIdentityForUninstallPeer(peerArg)
+	if err != nil {
+		return err
 	}
 
 	peerID, managedHost, err := resolveUninstallPeerTarget(host, peerArg, ident)
 	if err != nil {
-		log.Fatalf("uninstall peer failed: %v", err)
+		return err
 	}
 	if err := peer.ValidateID(peerID); err != nil {
-		log.Fatalf("uninstall peer failed: invalid peer id: %v", err)
+		return fmt.Errorf("invalid peer id: %w", err)
 	}
 	if err := tunnel.ValidateSSHHost(host); err != nil {
-		log.Fatalf("uninstall peer failed: invalid host: %v", err)
+		return fmt.Errorf("invalid host: %w", err)
 	}
-
-	session, err := shim.NewSSHSession(host)
-	if err != nil {
-		log.Fatalf("uninstall peer failed: %v", err)
-	}
-	defer session.Close()
 
 	// INVARIANT: the remote peer lease, remote PATH marker, and local
-	// tunnel-state cleanup ALL run BEFORE removeLaptopSSHConfigSetEnv.
-	// A log.Fatalf on cleanup failure aborts the process without touching
-	// ssh_config, preserving the SetEnv block for a safe retry. See
-	// removeLaptopSSHConfigSetEnv doc for the matching contract.
+	// tunnel-state cleanup ALL run BEFORE deps.removeSetEnv. A returned
+	// error aborts before touching ssh_config, preserving the SetEnv block
+	// for a safe retry. See removeLaptopSSHConfigSetEnv doc for the
+	// matching contract.
 	//
 	// `cc-clip uninstall --host H --peer` is documented (see main.go help
 	// around line 123) as the single-command "remote shim + peer + local
@@ -787,33 +883,48 @@ func cmdUninstallPeer(host, peerArg string) {
 	// "remote shim" part true — without it, operators following the README
 	// would be left with an orphan `~/.local/bin` PATH marker pointing at
 	// a now-unreachable daemon port.
-	if err := uninstallPeerRemoteAndConfig(managedHost, func() (*peer.Registration, error) {
-		return cleanupAndReleasePeer(session, "~/.local/bin/cc-clip", peerID)
-	}, func() error {
-		return shim.RemoveRemotePathSession(session)
-	}, func(reg *peer.Registration) error {
-		stateDir := legacyPeerStateDir(peerID)
-		if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
-			stateDir = strings.TrimSpace(reg.StateDir)
+	if deps.remoteCleanup != nil {
+		if err := deps.remoteCleanup(host, managedHost, peerID); err != nil {
+			return err
 		}
-		return connectNotifyDisable(session, stateDir)
-	}, func() (int, error) {
-		// Count peers remaining AFTER our release: the release already
-		// removed our own entry, so any survivors are other laptops
-		// sharing this remote Unix account. Used to gate the
-		// shared-asset cleanup inside uninstallPeerRemoteAndConfig.
-		return countRemoteActivePeers(session, "~/.local/bin/cc-clip")
-	}); err != nil {
-		log.Fatalf("uninstall peer failed: %v", err)
+	} else {
+		session, err := deps.newSession(host)
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+
+		if err := uninstallPeerRemoteAndConfig(managedHost, func() (*peer.Registration, error) {
+			return cleanupAndReleasePeer(session, "~/.local/bin/cc-clip", peerID)
+		}, func() error {
+			return shim.RemoveRemotePathSession(session)
+		}, func(reg *peer.Registration) error {
+			stateDir := legacyPeerStateDir(peerID)
+			if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
+				stateDir = strings.TrimSpace(reg.StateDir)
+			}
+			return connectNotifyDisable(session, stateDir)
+		}, func() (int, error) {
+			// Count peers remaining AFTER our release: the release already
+			// removed our own entry, so any survivors are other laptops
+			// sharing this remote Unix account. Used to gate the
+			// shared-asset cleanup inside uninstallPeerRemoteAndConfig.
+			return countRemoteActivePeers(session, "~/.local/bin/cc-clip")
+		}); err != nil {
+			return err
+		}
 	}
 	// managedHost != "" means the self-release path: we own this laptop's
 	// lease for `host`, so the matching ~/.ssh/config SetEnv block is ours
 	// to clean up. Cleaning a foreign peer-id's lease does not grant
 	// permission to edit this laptop's ssh config.
-	if managedHost != "" {
-		removeLaptopSSHConfigSetEnv(managedHost)
+	if managedHost != "" && deps.removeSetEnv != nil {
+		deps.removeSetEnv(managedHost)
 	}
-	printLegacyManagedBlockAdvisoryIfAny(host)
+	if deps.printLegacyAdvis != nil {
+		deps.printLegacyAdvis(host)
+	}
+	return nil
 }
 
 // loadIdentityForUninstallPeer resolves the local peer identity for an
@@ -823,13 +934,7 @@ func cmdUninstallPeer(host, peerArg string) {
 //
 //   - peerArg != "" AND local identity files are missing → returns
 //     (peer.Identity{}, nil). The explicit --peer-id <id> form remains
-//     usable for foreign-peer cleanup, and the explicit `--peer-id self`
-//     form is resolved later via resolveSelfUninstallPeerTarget. The
-//     empty ident.ID signals "no managed ssh_config SetEnv block belongs
-//     to this laptop for the target peer" so the caller skips
-//     removeLaptopSSHConfigSetEnv unless the later resolver proves this
-//     is the self-cleanup path. Contract: callers MUST gate any ssh_config
-//     edit on managedHost != "", never on ident.ID != "".
+//     usable for foreign-peer cleanup.
 //   - peerArg == "" AND local identity missing → returns ErrLocalIdentityNotFound
 //     wrapped with an actionable hint, so bare `--peer` fails closed
 //     rather than inventing a fresh identity and orphaning the real
@@ -864,6 +969,13 @@ func resolveUninstallPeerTarget(host, peerArg string, ident peer.Identity) (stri
 	}
 	if peerArg == "" {
 		if ident.ID == "" {
+			// Bare `--peer` is the "clean up THIS workstation's peer" path, so it
+			// needs an authoritative local identity. We fail closed instead of
+			// inferring the peer id from ~/.ssh/config's SetEnv block because that
+			// block is not an ownership proof: it is user-editable and can be stale
+			// or copied from another machine. Guessing here could release another
+			// laptop's lease and, if that peer happened to be the last registry
+			// entry, cascade into deleting shared remote assets out from under it.
 			return "", "", fmt.Errorf("bare `--peer` requires the existing local peer identity; pass --peer-id <id> explicitly if the local identity files are gone")
 		}
 		return ident.ID, host, nil
@@ -877,11 +989,6 @@ func resolveUninstallPeerTarget(host, peerArg string, ident peer.Identity) (stri
 		// state for this (host, localPort) in addition to releasing the peer.
 		return peerArg, host, nil
 	}
-	if ident.ID == "" {
-		if inferred := managedPeerIDForHost(host); inferred != "" && peerArg == inferred {
-			return peerArg, host, nil
-		}
-	}
 	return peerArg, "", nil
 }
 
@@ -889,38 +996,12 @@ func resolveSelfUninstallPeerTarget(host string, ident peer.Identity) (string, s
 	if ident.ID != "" {
 		return ident.ID, host, nil
 	}
-	if inferred := managedPeerIDForHost(host); inferred != "" {
-		return inferred, host, nil
-	}
-	return "", "", fmt.Errorf("cannot resolve `--peer-id self` for Host %s; restore the local peer identity or the managed SetEnv block first", host)
-}
-
-func managedPeerIDForHost(host string) string {
-	path, err := sshconfig.LocalConfigPath()
-	if err != nil {
-		return ""
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	env, err := sshconfig.ReadManagedEnvFromBytes(data, host)
-	if err != nil || env == nil {
-		return ""
-	}
-	stateDir := strings.TrimSpace(env["CC_CLIP_STATE_DIR"])
-	if stateDir == "" {
-		return ""
-	}
-	parts := strings.Split(strings.TrimRight(stateDir, "/"), "/")
-	if len(parts) < 2 || parts[len(parts)-2] != "peers" {
-		return ""
-	}
-	peerID := parts[len(parts)-1]
-	if err := peer.ValidateID(peerID); err != nil {
-		return ""
-	}
-	return peerID
+	// `--peer-id self` carries the same safety requirement as bare `--peer`:
+	// only the saved local identity may prove "self". We intentionally do NOT
+	// recover from ~/.ssh/config's managed SetEnv block for the same reason
+	// explained above — that block can be stale / copied and is not a reliable
+	// ownership signal for destructive self-cleanup.
+	return "", "", fmt.Errorf("cannot resolve `--peer-id self` for Host %s; restore the local peer identity first", host)
 }
 
 func uninstallPeerRemoteAndConfig(
@@ -1176,7 +1257,15 @@ func cmdUninstallCodexRemote(host string) {
 	// Step 3: Remove codex state directory
 	fmt.Println("[3/5] Removing codex state files...")
 	for _, codexStateDir := range codexStateDirs {
-		session.Exec(fmt.Sprintf("rm -rf %s", shimShellQuote(codexStateDir)))
+		// Capture the rm error: a silent swallow here makes step 3 print
+		// "done" even when a stale lock or perms-bug leaves another peer's
+		// codex state behind. Surfacing the warning + flipping hasError
+		// matches the surrounding steps (Xvfb stop, DISPLAY marker, etc.)
+		// and gives the operator a signal to investigate.
+		if _, err := session.Exec(fmt.Sprintf("rm -rf %s", shimShellQuote(codexStateDir))); err != nil {
+			fmt.Printf("      warning: rm -rf %s: %v\n", codexStateDir, err)
+			hasError = true
+		}
 	}
 	remainingCodexEnv = remoteHasRemainingCodexState(session)
 	fmt.Println("      done")
@@ -2219,13 +2308,16 @@ func findSourceDir() (string, error) {
 }
 
 func cmdDoctor() {
-	port := getPort()
+	localPort, remotePort, err := configuredDoctorPorts()
+	if err != nil {
+		log.Fatal(err)
+	}
 	host := getFlag("host", "")
 
 	if host == "" {
 		fmt.Println("cc-clip doctor (local)")
 		fmt.Println()
-		results := doctor.RunLocal(port)
+		results := doctor.RunLocal(localPort)
 		allOK := doctor.PrintResults(results)
 		fmt.Println()
 		if allOK {
@@ -2239,12 +2331,12 @@ func cmdDoctor() {
 		fmt.Println()
 
 		fmt.Println("Local checks:")
-		localResults := doctor.RunLocal(port)
+		localResults := doctor.RunLocal(localPort)
 		localOK := doctor.PrintResults(localResults)
 		fmt.Println()
 
 		fmt.Println("Remote checks:")
-		remoteResults := doctor.RunRemote(host, port)
+		remoteResults := doctor.RunRemote(host, remotePort)
 		remoteOK := doctor.PrintResults(remoteResults)
 		fmt.Println()
 
@@ -3025,26 +3117,41 @@ type remoteExecutor interface {
 }
 
 func removeRemoteNotifyState(session remoteExecutor, stateDir string) error {
-	var errs []error
-
-	// Only touch the current peer's own notify state. Earlier revisions also
-	// ran a `find ~/.cache/cc-clip/peers … -delete` sweep to catch
-	// "peer-scoped leftovers", but on hosts where several laptops share a
-	// remote Unix account that sweep would wipe every other active peer's
-	// notify nonce, silently breaking their notification path until their
-	// next `cc-clip connect`. The multi-peer invariant is: one laptop's
-	// uninstall MUST NOT mutate another laptop's runtime state.
-	for _, dir := range compatStateDirs(stateDir) {
-		cmd := fmt.Sprintf("rm -f %s %s",
-			shimShellQuote(dir+"/notify.nonce"),
-			shimShellQuote(dir+"/notify-health.log"),
-		)
-		if _, err := session.Exec(cmd); err != nil {
-			errs = append(errs, fmt.Errorf("remove notify state from %s: %w", dir, err))
-		}
+	// Only touch the caller's own per-peer stateDir. Two earlier shapes of
+	// this function each silently broke the multi-peer invariant — these
+	// were not "overcautious sweeps", they were destructive bugs that took
+	// out other laptops' clipboard or notification path while reporting
+	// success to the operator running uninstall:
+	//
+	//   1. A `find ~/.cache/cc-clip/peers … -delete` sweep that silently
+	//      wiped EVERY other active peer's notify nonce on the shared
+	//      account — every other laptop's hook script then started
+	//      authenticating with a stale nonce and POSTs to /notify began
+	//      returning 401, with no error visible to the laptop running
+	//      uninstall.
+	//   2. A sweep over compatStateDirs(stateDir) that always included the
+	//      legacy ~/.cache/cc-clip/notify.nonce — which on shared-account
+	//      hosts is the fallback the hook script reads whenever a caller's
+	//      SSH session didn't inherit CC_CLIP_STATE_DIR, so deleting it
+	//      silently broke those fallback paths for every other peer that
+	//      relied on the legacy file.
+	//
+	// The contract documented in AGENTS.md ("removeRemoteNotifyState touches
+	// only the caller's own stateDir; no cross-peer sweep") is deliberately
+	// enforced here; the test suite pins both the "no find sweep" and the
+	// "no legacy sweep" shapes so a future contributor cannot reintroduce
+	// either path without updating the pinning tests.
+	if strings.TrimSpace(stateDir) == "" {
+		return nil
 	}
-
-	return errors.Join(errs...)
+	cmd := fmt.Sprintf("rm -f %s %s",
+		shimShellQuote(stateDir+"/notify.nonce"),
+		shimShellQuote(stateDir+"/notify-health.log"),
+	)
+	if _, err := session.Exec(cmd); err != nil {
+		return fmt.Errorf("remove notify state from %s: %w", stateDir, err)
+	}
+	return nil
 }
 
 func removeRemoteManagedHookScript(session remoteExecutor) error {
@@ -3576,10 +3683,10 @@ func cmdPeer() {
 	_ = fs.Parse(os.Args[3:])
 
 	if *peerID == "" {
-		log.Fatal("peer failed: --peer-id is required")
+		failUsage("peer failed: --peer-id is required")
 	}
 	if err := peer.ValidateID(*peerID); err != nil {
-		log.Fatalf("peer failed: invalid --peer-id: %v", err)
+		failUsage("peer failed: invalid --peer-id: %v", err)
 	}
 
 	baseDir, err := peer.BaseDir()

@@ -147,13 +147,15 @@ func RunRemote(host string, port int) []CheckResult {
 	tunnelStateResults, savedState := checkTunnelStateAlignment(host, reg, port)
 	results = append(results, tunnelStateResults...)
 
+	managedEnv, managedEnvErr := readManagedSetEnv(host)
+
 	// Validate the SetEnv marker block in ~/.ssh/config matches the current
 	// peer registration. A stale block (user ran `cc-clip connect` on a new
 	// port without a subsequent rewrite, or hand-edited ~/.ssh/config) would
 	// silently mis-route the remote shims on the next interactive ssh
 	// session, so this check is strict (OK=false on mismatch) even though
 	// the rest of the ssh-config-related advisories stay OK=true.
-	if setEnvResult := checkSetEnvAlignment(host, reg); setEnvResult != nil {
+	if setEnvResult := checkSetEnvAlignment(host, reg, managedEnv, managedEnvErr); setEnvResult != nil {
 		results = append(results, *setEnvResult)
 	}
 
@@ -193,10 +195,7 @@ echo tunnel fail
 	}
 
 	// Check token on remote
-	stateDir := "~/.cache/cc-clip"
-	if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
-		stateDir = reg.StateDir
-	}
+	stateDir := resolveDoctorStateDir(reg, managedEnv)
 	stateDirExpr := remotePathExpr(stateDir)
 	out, err = remoteExecNoForward(host, fmt.Sprintf("test -f %s/session.token && echo 'present' || echo 'missing'", stateDirExpr))
 	if strings.Contains(out, "present") {
@@ -223,6 +222,26 @@ echo tunnel fail
 	}
 
 	return results
+}
+
+func readManagedSetEnv(host string) (map[string]string, error) {
+	data, err := readLocalSSHConfig()
+	if err != nil {
+		return nil, nil
+	}
+	return sshconfig.ReadManagedEnvFromBytes(data, host)
+}
+
+func resolveDoctorStateDir(reg *peer.Registration, managedEnv map[string]string) string {
+	if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
+		return strings.TrimSpace(reg.StateDir)
+	}
+	if managedEnv != nil {
+		if stateDir := strings.TrimSpace(managedEnv["CC_CLIP_STATE_DIR"]); stateDir != "" {
+			return stateDir
+		}
+	}
+	return "~/.cache/cc-clip"
 }
 
 // remoteExecNoForward runs an SSH command without applying RemoteForward from ssh config.
@@ -253,14 +272,24 @@ func remoteExecNoForward(host string, args ...string) (string, error) {
 
 func resolveInInteractiveShell(host, bin string) (string, error) {
 	shellPath, _ := remoteExecNoForward(host, "echo $SHELL")
-	// IMPORTANT: shellPath is attacker-influenceable (it comes from the
-	// remote's $SHELL env). We deliberately do NOT interpolate shellPath
-	// itself into the command line — only one of the three literal
-	// constants "bash" / "zsh" / "fish" is ever placed in the argv. A
-	// future "optimization" that passes shellPath directly to ssh would
-	// let a crafted $SHELL (e.g. `bash -c pwned`) reach the remote shell
-	// verbatim. If you need to support more shells, extend the switch
-	// with new literal constants; do NOT widen to raw shellPath.
+	script := buildInteractiveShellProbe(shellPath, bin)
+	out, err := remoteExecNoForward(host, script)
+	return strings.TrimSpace(out), err
+}
+
+// buildInteractiveShellProbe is a pure helper extracted from
+// resolveInInteractiveShell so tests can pin the literal-only contract:
+// shellPath is attacker-influenceable (the remote's $SHELL env), so the
+// returned script must NEVER interpolate shellPath verbatim — only one of
+// the three literal constants "bash" / "zsh" / "fish" is ever placed in
+// the script. A future "optimization" that passes shellPath directly to
+// ssh would let a crafted $SHELL (e.g. `/bin/bash -c pwned`) reach the
+// remote shell verbatim. To support more shells, extend the switch with
+// new literal constants; do NOT widen to raw shellPath.
+//
+// fish does not accept `-ic` — it uses `-i -c` with a different quoting
+// convention. The script form is shell-appropriate for each.
+func buildInteractiveShellProbe(shellPath, bin string) string {
 	shellName := "bash"
 	switch {
 	case strings.Contains(shellPath, "zsh"):
@@ -268,18 +297,10 @@ func resolveInInteractiveShell(host, bin string) (string, error) {
 	case strings.Contains(shellPath, "fish"):
 		shellName = "fish"
 	}
-
-	// fish does not accept `-ic` — it uses `-i -c` with a different quoting
-	// convention. Use a shell-appropriate form for each.
-	var script string
-	switch shellName {
-	case "fish":
-		script = fmt.Sprintf(`fish -i -c 'which %s 2>/dev/null; or echo "not in PATH"'`, bin)
-	default:
-		script = fmt.Sprintf(`%s -ic 'which %s 2>/dev/null || echo "not in PATH"'`, shellName, bin)
+	if shellName == "fish" {
+		return fmt.Sprintf(`fish -i -c 'which %s 2>/dev/null; or echo "not in PATH"'`, bin)
 	}
-	out, err := remoteExecNoForward(host, script)
-	return strings.TrimSpace(out), err
+	return fmt.Sprintf(`%s -ic 'which %s 2>/dev/null || echo "not in PATH"'`, shellName, bin)
 }
 
 func tunnelOK(results []CheckResult) bool {
@@ -294,6 +315,16 @@ func tunnelOK(results []CheckResult) bool {
 func runImageProbe(host string, port int, stateDir string) []CheckResult {
 	// Run the probe FROM the remote host through the tunnel, not from local.
 	// This validates the full chain: remote -> tunnel -> daemon.
+	//
+	// Timeout layering: curl --max-time 5 is the inner deadline for the
+	// HTTP round-trip itself; the surrounding remoteExecNoForward applies
+	// remoteExecTimeout (15 s) for the SSH connect + command lifecycle.
+	// The two are intentionally distinct because the failure modes are
+	// distinct: curl >5s means "the daemon is up but slow / the tunnel is
+	// degrading the request"; ssh >15s means "we cannot even reach the
+	// remote host". Aligning them to the same value would conflate those
+	// signals and either report SSH issues as image-probe failures (if
+	// curl swallows the SSH delay) or vice versa.
 	stateDirExpr := remotePathExpr(stateDir)
 	cmd := fmt.Sprintf(
 		`TOKEN=$(cat %s/session.token 2>/dev/null) && `+
@@ -514,20 +545,18 @@ func checkTunnelStateAlignment(host string, reg *peer.Registration, localPort in
 // state_dir). When the managed block is absent but the current
 // registration has enough data to reconstruct it, the check returns an
 // OK advisory carrying the exact manual SetEnv line.
-func checkSetEnvAlignment(host string, reg *peer.Registration) *CheckResult {
+func checkSetEnvAlignment(host string, reg *peer.Registration, managedEnv map[string]string, managedEnvErr error) *CheckResult {
 	if reg == nil || reg.ReservedPort == 0 {
 		return nil
 	}
-	data, err := readLocalSSHConfig()
-	if err != nil {
-		return nil
+	if managedEnv == nil && managedEnvErr == nil {
+		managedEnv, managedEnvErr = readManagedSetEnv(host)
 	}
-	env, err := sshconfig.ReadManagedEnvFromBytes(data, host)
-	if err != nil {
+	if managedEnvErr != nil {
 		return &CheckResult{
 			Name:    "ssh-config-setenv",
 			OK:      false,
-			Message: fmt.Sprintf("cannot parse SetEnv block for Host %s: %v", host, err),
+			Message: fmt.Sprintf("cannot parse SetEnv block for Host %s: %v", host, managedEnvErr),
 		}
 	}
 
@@ -543,19 +572,39 @@ func checkSetEnvAlignment(host string, reg *peer.Registration) *CheckResult {
 		}
 	}
 
-	if env == nil {
+	if managedEnv == nil {
 		if expectedLine == "" {
 			return nil
 		}
-		// A missing managed block when we already have a peer registration
-		// is a real misconfiguration: the next interactive `ssh <host>`
-		// session will not push CC_CLIP_PORT / CC_CLIP_STATE_DIR, so the
-		// shared remote shims will mis-route. Report OK=false to match the
-		// severity of the "block present but port stale" branch below — the
-		// two states are equivalently broken from the operator's point of
-		// view. Users who have not yet run `cc-clip connect` won't hit this
-		// branch because the early nil return at the top of this function
-		// shortcircuits when reg has no reserved port.
+		layoutReason := ""
+		data, err := readLocalSSHConfig()
+		if err != nil {
+			// Surface "skipped because config is unreadable" as an advisory
+			// rather than silently returning nil. A missing/permission-denied
+			// ~/.ssh/config is not a hard failure (cc-clip can still operate
+			// with manual env in the user's shell), but the operator should
+			// see WHY the SetEnv-alignment check did not run.
+			return &CheckResult{
+				Name:    "ssh-config-setenv",
+				OK:      true,
+				Message: fmt.Sprintf("skipped: cannot read ~/.ssh/config (%v); add SetEnv manually if needed: %s", err, expectedLine),
+			}
+		}
+		switch statusErr := sshconfig.HostBlockStatusFromBytes(data, host); {
+		case errors.Is(statusErr, sshconfig.ErrOnlyGlobMatch):
+			layoutReason = fmt.Sprintf("Host %s is matched only by wildcard/negation patterns, so cc-clip will not auto-write the SetEnv block; add a literal `Host %s` entry or merge this line manually", host, host)
+		case errors.Is(statusErr, sshconfig.ErrHostBlockInInclude):
+			layoutReason = fmt.Sprintf("Host %s exists only behind an Include, so cc-clip will not auto-write the SetEnv block there; inline a literal `Host %s` entry or merge this line manually", host, host)
+		case errors.Is(statusErr, sshconfig.ErrHostBlockMissing):
+			layoutReason = fmt.Sprintf("no literal `Host %s` block exists in ~/.ssh/config; add one or merge this line manually", host)
+		}
+		if layoutReason != "" {
+			return &CheckResult{
+				Name:    "ssh-config-setenv",
+				OK:      false,
+				Message: fmt.Sprintf("no managed SetEnv block for Host %s; %s (exact manual line: %s)", host, layoutReason, expectedLine),
+			}
+		}
 		return &CheckResult{
 			Name:    "ssh-config-setenv",
 			OK:      false,
@@ -563,8 +612,8 @@ func checkSetEnvAlignment(host string, reg *peer.Registration) *CheckResult {
 		}
 	}
 
-	gotPort := env["CC_CLIP_PORT"]
-	gotStateDir := env["CC_CLIP_STATE_DIR"]
+	gotPort := managedEnv["CC_CLIP_PORT"]
+	gotStateDir := managedEnv["CC_CLIP_STATE_DIR"]
 
 	if gotPort != wantPort {
 		return &CheckResult{

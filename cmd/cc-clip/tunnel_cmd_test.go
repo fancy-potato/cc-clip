@@ -651,6 +651,48 @@ func TestResolveTunnelUpPortsRejectsCorruptStateWithZeroLocalPort(t *testing.T) 
 	}
 }
 
+// TestCannotDetermineRemotePortMessageWording pins the actionable wording
+// emitted by cmdTunnelUp when the host has no saved tunnel state. Install
+// scripts, docs, and operator muscle memory rely on the message naming
+// `cc-clip connect <host>` as the fix and `--remote-port` as the manual
+// override. A future refactor that drops either reference would silently
+// downgrade the operator UX from "here's exactly what to type" to a
+// generic "tunnel up failed".
+func TestCannotDetermineRemotePortMessageWording(t *testing.T) {
+	got := cannotDetermineRemotePortMessage("myserver")
+	for _, want := range []string{
+		"cannot determine remote port for myserver",
+		"cc-clip connect myserver",
+		"--remote-port",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("message %q missing %q", got, want)
+		}
+	}
+}
+
+// TestResolveTunnelUpPortsReturnsZeroRemoteWhenNoStateExists pins the
+// precondition for the cmdTunnelUp "cannot determine remote port" error.
+// When the operator runs `cc-clip tunnel up <host>` for a host that was
+// never `cc-clip connect`-ed, resolveTunnelUpPorts must return remotePort=0
+// and no error so cmdTunnelUp can surface the actionable message that names
+// `cc-clip connect <host>` as the fix. A future refactor that returns a
+// generic error here would hide the actionable wording behind a
+// "tunnel up failed:" stderr that doesn't tell the operator what to do.
+func TestResolveTunnelUpPortsReturnsZeroRemoteWhenNoStateExists(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	remote, daemon, err := resolveTunnelUpPorts("never-connected-host", 0, 18339, false)
+	if err != nil {
+		t.Fatalf("expected nil error so cmdTunnelUp emits its connect-first message; got %v", err)
+	}
+	if remote != 0 {
+		t.Fatalf("remote = %d, want 0 (so cmdTunnelUp triggers the cannot-determine-remote-port branch)", remote)
+	}
+	if daemon != 18339 {
+		t.Fatalf("daemon = %d, want 18339 (caller-supplied default preserved)", daemon)
+	}
+}
+
 func TestResolveTunnelUpPortsRequiresExplicitDaemonWhenRemotePortExplicitAndOwnerAmbiguous(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

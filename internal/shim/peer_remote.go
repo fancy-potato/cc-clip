@@ -151,12 +151,25 @@ func ListPeersViaSession(session *SSHSession, remoteBin string) ([]peer.Registra
 		return nil, fmt.Errorf("failed to list remote peer registry: %w", err)
 	}
 	trimmed := bytes.TrimSpace([]byte(out))
+	// `cc-clip peer list` always prints `[]` for an empty registry (see
+	// cmdPeer in cmd/cc-clip/main.go). Empty stdout therefore signals a
+	// broken remote: a transport that swallowed the output, a wrapper that
+	// truncated it, or a remote binary that exited 0 without writing. The
+	// uninstall fail-safe contract (AGENTS.md: "Uninstall is multi-peer safe")
+	// requires we treat ambiguous registry reads as errors so callers
+	// preserve shared assets rather than racing to delete them. Returning a
+	// nil slice here would conflate "no peers, safe to clean up" with "I
+	// don't know" — the exact regression the registry overhaul exists to
+	// prevent.
 	if len(trimmed) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("remote peer list returned empty output (expected JSON array, got 0 bytes)")
 	}
 	var regs []peer.Registration
 	if err := json.Unmarshal(trimmed, &regs); err != nil {
 		return nil, fmt.Errorf("failed to decode peer list: %w", err)
+	}
+	if regs == nil {
+		return nil, fmt.Errorf("failed to decode peer list: expected JSON array, got null")
 	}
 	return regs, nil
 }

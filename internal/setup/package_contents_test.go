@@ -154,10 +154,21 @@ func TestPackageDoesNotDependOnSSHConfigRewriters(t *testing.T) {
 
 		deps := strings.Split(strings.TrimSpace(string(out)), "\n")
 		for _, line := range deps {
+			trimmed := strings.TrimSpace(line)
 			for _, suffix := range forbiddenSSHConfigDepSuffixes {
-				if strings.HasSuffix(strings.TrimSpace(line), suffix) {
+				if strings.HasSuffix(trimmed, suffix) {
 					t.Errorf("internal/setup (GOOS=%s) depends on %q (via its import graph); ssh_config rewrites must live outside internal/setup — route callers through cmd/cc-clip instead (see CLAUDE.md)", goos, line)
 				}
+			}
+			// Subpackage match: a future contributor splitting sshconfig into
+			// `internal/sshconfig/writer` etc. would slip past the suffix-only
+			// check above. Treat ANY import path containing `/internal/sshconfig/`
+			// (note the trailing slash — distinguishes child packages from a
+			// hypothetical sibling like `internal/sshconfighelpers`) as a
+			// violation too. The plain `/internal/sshconfig` exact-suffix match
+			// above continues to handle the canonical package.
+			if strings.Contains(trimmed, "/internal/sshconfig/") {
+				t.Errorf("internal/setup (GOOS=%s) depends on subpackage %q under internal/sshconfig; ssh_config rewrites must live outside internal/setup (see CLAUDE.md)", goos, line)
 			}
 		}
 	}
@@ -182,7 +193,7 @@ var forbiddenSSHConfigDepSuffixes = []string{
 func TestForbiddenSSHConfigDepSuffixesCatchesViolators(t *testing.T) {
 	synthetic := []string{
 		"github.com/shunmei/cc-clip/internal/setup",
-		"github.com/shunmei/cc-clip/internal/sshconfig", // forbidden
+		"github.com/shunmei/cc-clip/internal/sshconfig", // forbidden by suffix
 		"github.com/shunmei/cc-clip/internal/token",
 	}
 	hits := 0
@@ -195,5 +206,21 @@ func TestForbiddenSSHConfigDepSuffixesCatchesViolators(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Fatalf("classifier matched %d entries, want exactly 1 (the sshconfig line)", hits)
+	}
+
+	// Subpackage substring guard: a contributor splitting logic into
+	// `internal/sshconfig/writer` would not match the exact suffix above.
+	// The Contains check in TestPackageDoesNotDependOnSSHConfigRewriters is
+	// what catches that — verify it would fire here.
+	subpkg := "github.com/shunmei/cc-clip/internal/sshconfig/writer"
+	if !strings.Contains(subpkg, "/internal/sshconfig/") {
+		t.Fatalf("subpackage substring guard would miss %q", subpkg)
+	}
+	// And confirm the guard does NOT misfire on a sibling that merely shares
+	// the prefix (the trailing slash on `/internal/sshconfig/` is what
+	// distinguishes a child package from a hypothetical sibling).
+	sibling := "github.com/shunmei/cc-clip/internal/sshconfighelpers"
+	if strings.Contains(sibling, "/internal/sshconfig/") {
+		t.Fatalf("subpackage substring guard misfired on sibling %q", sibling)
 	}
 }

@@ -156,7 +156,7 @@ Copy an image to your Mac clipboard (e.g. `Cmd+Shift+Ctrl+4`), then:
 
 ```bash
 ssh myserver
-claude          # or: codex
+clipcc          # or: codex
 # press Ctrl+V in the prompt — the image lands in the model
 ```
 
@@ -178,7 +178,7 @@ After initial setup your workflow is just:
 
 ```bash
 ssh myserver
-claude          # Claude Code — Ctrl+V pastes your Mac clipboard
+clipcc          # Claude Code — Ctrl+V pastes your Mac clipboard
 codex           # Codex CLI  — Ctrl+V pastes your Mac clipboard
 ```
 
@@ -188,7 +188,7 @@ The daemon runs under launchd (`KeepAlive=true`) and restarts saved tunnels auto
 
 If you ran `cc-clip setup` (or `cc-clip connect`), the notification path is already wired: Codex `notify` is auto-configured (when `~/.codex/` exists on the remote), and the notification nonce is registered and synced.
 
-You only need to make sure `cc-clip-hook` is in your remote Claude Code `Stop` and `Notification` hook arrays — see [SSH Notifications](#ssh-notifications) for how.
+If `clipcc` installed successfully, Claude notifications are already wired too: the wrapper injects `cc-clip-hook` into Claude's `Stop` and `Notification` hooks via `--settings`. You only need the manual hook steps below if you want to keep launching plain `claude`, or if wrapper installation failed and setup printed the fallback JSON.
 
 ### Windows workflow
 
@@ -216,7 +216,7 @@ When Claude Code or Codex CLI runs on a remote server, **notifications don't wor
 
 ### Hook configuration
 
-`cc-clip setup` / `connect` already installed `cc-clip-hook` at `~/.local/bin/cc-clip-hook` on the remote. All that's left is to register it in Claude Code's hook arrays. The easiest way is to ask Claude Code itself — SSH into the server, start Claude Code, and paste:
+`cc-clip setup` / `connect` already installed `cc-clip-hook` at `~/.local/bin/cc-clip-hook` on the remote. If you launch Claude with `clipcc`, stop here — the wrapper injects the hooks automatically. The manual steps below are only for operators who want to keep using plain `claude` or need a fallback because the wrapper could not be installed. In that case, ask Claude Code itself — SSH into the server, start Claude Code, and paste:
 
 ```
 Please add cc-clip-hook to my Claude Code hooks configuration. Add it to both Stop and
@@ -790,13 +790,13 @@ All settings have sensible defaults. The local daemon port defaults to `18339`.
 
 ## Uninstall
 
-cc-clip no longer ships `uninstall-all.sh` / `uninstall-local.sh`. For a full removal, run the subcommands in order:
+For normal removal, run the subcommands in order:
 
 ```bash
 # Remote: release peer lease, remove remote PATH marker, delete local tunnel state for this host.
 # `--peer` auto-discovers your local peer id (see `cc-clip status` for the value).
-# Use `--peer-id self` to force this workstation's cleanup path when local identity files are gone;
-# pass `--peer-id <id>` only when cleaning up a different workstation's lease.
+# If the local identity files are gone, pass `--peer-id <id>` explicitly.
+# `--peer-id self` still requires the saved local identity.
 cc-clip uninstall --host myserver --peer
 
 # Remote Codex assets (only if you used --codex)
@@ -813,6 +813,22 @@ cc-clip service uninstall
 ```
 
 > **Shared account:** when multiple laptops share a Unix account on the remote, `uninstall --host H --peer` queries the remote peer registry and leaves `~/.local/bin/clipcc`, `~/.local/bin/cc-clip-hook`, the remote PATH marker, and the Codex `# >>> cc-clip notify >>>` block in place until the **last** peer uninstalls. Run the command on every laptop to force full cleanup. If the registry query itself fails (ssh down, corrupt registry), shared assets are also preserved on purpose — fix the registry and rerun.
+
+The repo also ships two destructive purge scripts for complete teardown only:
+
+```bash
+# Remove all local cc-clip binaries, shims, cache, launchd state, and every
+# cc-clip-managed block from local ~/.ssh/config when it is a regular file.
+# Symlinked SSH configs are preserved with a warning.
+scripts/uninstall-local.sh
+
+# Remove all cc-clip state from the target remote Unix account that lives in
+# regular files, then run the same full local purge on this machine.
+# Symlinked remote rc/config files are preserved with a warning.
+scripts/uninstall-all.sh --host myserver
+```
+
+Use these scripts carefully. They are intentionally aggressive and bypass the normal multi-peer preservation behavior so they can wipe all cc-clip installation data.
 
 If you upgraded from a pre-daemon-tunnel release, also see [Upgrading from pre-daemon-tunnel releases](#upgrading-from-pre-daemon-tunnel-releases).
 
@@ -838,7 +854,7 @@ because the daemon already holds the forward. The warning is harmless — clipbo
 # <<< cc-clip managed host: myserver <<<
 ```
 
-inclusive. cc-clip intentionally does **not** auto-clean this block during `setup`, `connect`, or `uninstall` — the migration surface is deliberately a one-time manual step. The newer managed block (`# >>> cc-clip SetEnv (do not edit) >>>`) is unrelated and is managed automatically.
+inclusive. The normal CLI commands intentionally do **not** auto-clean this block during `setup`, `connect`, or `uninstall`; the migration surface is deliberately a one-time manual step. The destructive purge script `scripts/uninstall-local.sh` is the one exception: when `~/.ssh/config` is a regular file, it strips both the legacy block and the newer managed SetEnv block. The newer managed block (`# >>> cc-clip SetEnv (do not edit) >>>`) is unrelated and is managed automatically.
 
 ---
 

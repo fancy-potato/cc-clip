@@ -53,7 +53,7 @@ json.dump(d, sys.stdout)
 if command -v mktemp >/dev/null 2>&1; then
 	_curl_err_file=$(mktemp 2>/dev/null || true)
 fi
-_http_code=$(curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w '%%{http_code}' -X POST \
+_http_code=$(curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%%{http_code}' -X POST \
 	-H "Authorization: Bearer $_nonce" \
 	-H "Content-Type: application/x-claude-hook" \
 	-H "User-Agent: cc-clip-hook/0.1" \
@@ -88,6 +88,23 @@ fi
 
 exit 0
 `
+
+// HookHealthFailurePrefix is the exact stdout prefix the cc-clip-hook
+// script emits in strict mode when the POST to /notify returns a non-2xx
+// status. The string is a contract between three places:
+//
+//  1. internal/shim/hook_template.go (the bash template that emits it),
+//  2. cmd/cc-clip/main.go runRemoteNotificationHealthProbe (the Go probe
+//     that wraps the surfaced stdout into a user-facing error), and
+//  3. internal/shim/hook_template_test.go +
+//     cmd/cc-clip/main_test.go (which assert the wording end-to-end).
+//
+// Pinning the prefix here means a future template refactor that changes
+// the wording will fail TestHookScriptStrictModePrefixIsExportedConstant
+// (which asserts the constant matches the rendered script) AND the
+// probe-side test in main_test.go simultaneously, instead of silently
+// drifting one half of the contract out of sync with the other.
+const HookHealthFailurePrefix = "cc-clip-hook health probe failed: http="
 
 // HookScript returns the cc-clip-hook bash script with the given port baked in.
 // This script is installed to ~/.local/bin/cc-clip-hook on the remote. Claude Code

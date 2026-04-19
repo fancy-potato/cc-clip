@@ -51,28 +51,44 @@ type State struct {
 }
 
 func BaseDir() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := baseDirPath()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".cache", "cc-clip")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}
 	return dir, nil
 }
 
+// baseDirPath returns the cc-clip cache path without creating the directory.
+// LoadLocalIdentity (and any other strictly read-only caller) goes through
+// this helper so asking "what is the local peer id?" does not have the side
+// effect of materializing ~/.cache/cc-clip — which matters for the bare
+// `cc-clip uninstall --peer` fail-closed contract: if the cache dir is
+// already gone, probing for the identity must fail with
+// ErrLocalIdentityNotFound rather than silently recreate the directory.
+func baseDirPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".cache", "cc-clip"), nil
+}
+
 // PeerStateDir returns the per-peer state directory under baseDir. It refuses
 // to compose a path when peerID fails ValidateID so a bad id cannot climb out
 // of ~/.cache/cc-clip/peers via string concatenation on paths that bypass
 // filepath.Clean. Callers are expected to validate the id beforehand (the
-// registry entry points do); the empty-string return here is a last-resort
-// guard so a future caller that forgets the validation can't silently escape.
-func PeerStateDir(baseDir, peerID string) string {
-	if ValidateID(peerID) != nil {
-		return ""
+// registry entry points do); the explicit error here surfaces the misuse so a
+// future caller that forgets the validation cannot silently compose
+// ~/.cache/cc-clip/peers/ (which filepath.Join would happily turn into the
+// shared peers root) and clobber another peer's state.
+func PeerStateDir(baseDir, peerID string) (string, error) {
+	if err := ValidateID(peerID); err != nil {
+		return "", fmt.Errorf("PeerStateDir: %w", err)
 	}
-	return filepath.Join(baseDir, "peers", peerID)
+	return filepath.Join(baseDir, "peers", peerID), nil
 }
 
 func AliasForHost(host, label string) string {
@@ -135,7 +151,7 @@ func LoadOrCreateLocalIdentity() (Identity, error) {
 // or rewriting any files. It requires the peer ID to be present; the label is
 // best-effort because only the ID is needed for self-targeted uninstall.
 func LoadLocalIdentity() (Identity, error) {
-	baseDir, err := BaseDir()
+	baseDir, err := baseDirPath()
 	if err != nil {
 		return Identity{}, err
 	}

