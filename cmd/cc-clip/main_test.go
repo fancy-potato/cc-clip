@@ -460,7 +460,7 @@ func TestRunShimUninstallWithHostPreservesPATHWhenOtherPeersRemain(t *testing.T)
 			pathCalls++
 			return nil
 		},
-		countRemoteActivePeers: func(host string) (int, error) {
+		countRemoteOtherPeers: func(host string) (int, error) {
 			if host != "example" {
 				t.Fatalf("peer-count query host = %q, want %q", host, "example")
 			}
@@ -486,7 +486,7 @@ func TestRunShimUninstallWithHostRemovesPATHWhenLastPeer(t *testing.T) {
 			pathCalls++
 			return nil
 		},
-		countRemoteActivePeers: func(host string) (int, error) { return 0, nil },
+		countRemoteOtherPeers: func(host string) (int, error) { return 0, nil },
 	})
 	if err != nil {
 		t.Fatalf("runShimUninstall returned error: %v", err)
@@ -507,7 +507,7 @@ func TestRunShimUninstallWithHostFailsSafeOnCountQueryError(t *testing.T) {
 			pathCalls++
 			return nil
 		},
-		countRemoteActivePeers: func(host string) (int, error) {
+		countRemoteOtherPeers: func(host string) (int, error) {
 			return 0, errors.New("ssh handshake failed")
 		},
 	})
