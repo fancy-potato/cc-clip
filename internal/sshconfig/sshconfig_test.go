@@ -551,6 +551,52 @@ Host myalias
 	}
 }
 
+func TestApplyRepairsOrphanedBeginMarker(t *testing.T) {
+	path := writeTempConfig(t, `Host myalias
+  HostName srv
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18339
+`)
+
+	if err := ApplyToFile(path, "myalias", map[string]string{
+		"CC_CLIP_PORT":      "18340",
+		"CC_CLIP_STATE_DIR": "/home/u/.cache/cc-clip/peers/abc",
+	}); err != nil {
+		t.Fatalf("Apply should repair orphaned begin marker, got %v", err)
+	}
+
+	got := readFile(t, path)
+	if strings.Count(got, markerBegin) != 1 || strings.Count(got, markerEnd) != 1 {
+		t.Fatalf("expected one repaired marker pair, got:\n%s", got)
+	}
+	if strings.Count(got, "\n  SetEnv ") != 1 || strings.Contains(got, "CC_CLIP_PORT=18339") {
+		t.Fatalf("expected orphaned SetEnv line to be replaced cleanly, got:\n%s", got)
+	}
+}
+
+func TestApplyRepairsOrphanedEndMarker(t *testing.T) {
+	path := writeTempConfig(t, `Host myalias
+  HostName srv
+  SetEnv CC_CLIP_PORT=18339
+  # <<< cc-clip SetEnv (do not edit) <<<
+`)
+
+	if err := ApplyToFile(path, "myalias", map[string]string{
+		"CC_CLIP_PORT":      "18340",
+		"CC_CLIP_STATE_DIR": "/home/u/.cache/cc-clip/peers/abc",
+	}); err != nil {
+		t.Fatalf("Apply should repair orphaned end marker, got %v", err)
+	}
+
+	got := readFile(t, path)
+	if strings.Count(got, markerBegin) != 1 || strings.Count(got, markerEnd) != 1 {
+		t.Fatalf("expected one repaired marker pair, got:\n%s", got)
+	}
+	if strings.Count(got, "\n  SetEnv ") != 1 || strings.Contains(got, "CC_CLIP_PORT=18339") {
+		t.Fatalf("expected orphaned SetEnv line to be replaced cleanly, got:\n%s", got)
+	}
+}
+
 // TestApplyEscapesEnvValueWithQuotesAndBackslash pins the contract that a
 // value containing `"` or `\` is both quoted AND escaped, even when it has
 // no whitespace. CC_CLIP_STATE_DIR is remote-influenceable, so a pathological

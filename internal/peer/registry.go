@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -421,30 +420,6 @@ func readLockHolderPID(lockPath string) (int, bool) {
 		return 0, false
 	}
 	return pid, true
-}
-
-// processAlive uses the POSIX "signal 0" probe to test whether pid is a
-// live process. Signal 0 performs permission and existence checks but does
-// not deliver a signal. EPERM means the process exists (we lack permission
-// to signal it) — treat as alive. ESRCH means the process has exited.
-func processAlive(pid int) (bool, error) {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false, nil
-	}
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, syscall.EPERM) {
-		return true, nil
-	}
-	if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
-		return false, nil
-	}
-	// Anything else (e.g. a Windows-specific error): fall back to
-	// treating as alive so we don't steal a possibly-valid lock.
-	return true, nil
 }
 
 func portAvailable(port int) bool {

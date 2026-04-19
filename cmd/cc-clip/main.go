@@ -626,9 +626,9 @@ func cmdUninstall() {
 	}
 
 	if err := runShimUninstall(target, installPath, host, uninstallOps{
-		uninstallLocalShim:     shim.Uninstall,
-		removeRemotePath:       shim.RemoveRemotePath,
-		countRemoteActivePeers: countRemoteActivePeersOverSSH,
+		uninstallLocalShim:    shim.Uninstall,
+		removeRemotePath:      shim.RemoveRemotePath,
+		countRemoteOtherPeers: countRemoteOtherPeersOverSSH,
 	}); err != nil {
 		log.Fatalf("uninstall failed: %v", err)
 	}
@@ -637,26 +637,45 @@ func cmdUninstall() {
 type uninstallOps struct {
 	uninstallLocalShim func(shim.Target, string) error
 	removeRemotePath   func(string) error
-	// countRemoteActivePeers queries the remote cc-clip peer registry and
-	// returns how many peers are still registered. The host-mode uninstall
+	// countRemoteOtherPeers queries the remote cc-clip peer registry and
+	// returns how many OTHER peers remain after excluding this workstation's
+	// own peer when we can resolve it. The host-mode uninstall
 	// (`cc-clip uninstall --host H`) uses this to skip the shared PATH
-	// marker cleanup when other laptops on the same Unix account still
-	// depend on it. A non-nil error preserves the PATH marker (fail safe).
-	countRemoteActivePeers func(host string) (int, error)
+	// marker cleanup only when another laptop on the same Unix account
+	// still depends on it. A non-nil error preserves the PATH marker
+	// (fail safe).
+	countRemoteOtherPeers func(host string) (int, error)
 }
 
-// countRemoteActivePeersOverSSH opens a short-lived SSH session to the
-// host to invoke `cc-clip peer list`. Lives in cmd/cc-clip because it
-// bridges the internal/shim SSHSession type with the injectable hook on
-// uninstallOps — adding it to internal/shim would force shim to carry
-// the uninstallOps wiring it doesn't otherwise need.
-func countRemoteActivePeersOverSSH(host string) (int, error) {
+// countRemoteOtherPeersOverSSH opens a short-lived SSH session to the host
+// to invoke `cc-clip peer list`, then subtracts this workstation's own peer
+// ID when we can resolve it. Lives in cmd/cc-clip because it bridges the
+// internal/shim SSHSession type with the injectable hook on uninstallOps.
+func countRemoteOtherPeersOverSSH(host string) (int, error) {
 	session, err := shim.NewSSHSession(host)
 	if err != nil {
 		return 0, fmt.Errorf("open ssh session: %w", err)
 	}
 	defer session.Close()
-	return countRemoteActivePeers(session, "~/.local/bin/cc-clip")
+	regs, err := shim.ListPeersViaSession(session, "~/.local/bin/cc-clip")
+	if err != nil {
+		return 0, err
+	}
+	otherPeers := len(regs)
+	selfPeerID := localPeerIDForHost(host)
+	if selfPeerID == "" {
+		return otherPeers, nil
+	}
+	for _, reg := range regs {
+		if reg.PeerID == selfPeerID {
+			otherPeers--
+			break
+		}
+	}
+	if otherPeers < 0 {
+		return 0, nil
+	}
+	return otherPeers, nil
 }
 
 // legacyManagedBlockAdvisor is a package-level indirection so tests can stub
@@ -676,6 +695,14 @@ func printLegacyManagedBlockAdvisoryIfAny(host string) {
 	}
 }
 
+func localPeerIDForHost(host string) string {
+	ident, err := loadLocalPeerIdentity()
+	if err == nil && strings.TrimSpace(ident.ID) != "" {
+		return ident.ID
+	}
+	return managedPeerIDForHost(host)
+}
+
 func runShimUninstall(target shim.Target, installPath, host string, ops uninstallOps) error {
 	if host != "" {
 		// Gate the PATH-marker deletion on the remote peer registry: the
@@ -685,8 +712,8 @@ func runShimUninstall(target shim.Target, installPath, host string, ops uninstal
 		// error resolving "am I the last peer?" we fail safe and preserve
 		// the marker — operators can rerun `cc-clip doctor` or remove it
 		// manually if the registry is corrupted.
-		if ops.countRemoteActivePeers != nil {
-			count, err := ops.countRemoteActivePeers(host)
+		if ops.countRemoteOtherPeers != nil {
+			count, err := ops.countRemoteOtherPeers(host)
 			switch {
 			case err != nil:
 				fmt.Printf("Preserving shared PATH marker on %s: unable to confirm this is the last peer (%v); rerun `cc-clip uninstall --host %s --peer` once the registry is healthy\n", host, err, host)
@@ -1422,22 +1449,20 @@ func runConnect(opts connectOpts) {
 	}
 
 	fmt.Printf("[5/8] Reserving peer port and recording tunnel state...\n")
-	hadExistingPeerReservation := false
 	if existingRegErr != nil {
 		log.Printf("      warning: could not check existing peer reservation: %v", existingRegErr)
-	} else if existingReg != nil {
-		hadExistingPeerReservation = true
 	}
+	releaseReservedPeerOnRollback := shouldReleaseReservedPeerOnRollback(existingReg, existingRegErr)
 	reg, err := shim.ReservePeerViaSession(session, remoteBin, ident.ID, ident.Label, peer.DefaultRangeStart, peer.DefaultRangeEnd)
 	if err != nil {
 		log.Fatalf("      failed to reserve peer port: %v", err)
 	}
 	if reg.StateDir, err = resolveRemoteStateDirForSSHConfig(session, reg.StateDir); err != nil {
-		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		bestEffortReleasePeer(session, remoteBin, ident.ID, releaseReservedPeerOnRollback)
 		log.Fatalf("      failed to resolve remote state dir: %v", err)
 	}
 	if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
-		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		bestEffortReleasePeer(session, remoteBin, ident.ID, releaseReservedPeerOnRollback)
 		log.Fatalf("      failed to record tunnel state for Host %s: %v", host, err)
 	}
 	// failAfterSave covers fatal exits between saveConnectTunnelState and
@@ -1452,7 +1477,7 @@ func runConnect(opts connectOpts) {
 	failAfterSave := func(format string, args ...any) {
 		rollbackConnectReservation(
 			func() error { return tunnel.RemoveState(tunnel.DefaultStateDir(), host, localPort) },
-			func() { bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation) },
+			func() { bestEffortReleasePeer(session, remoteBin, ident.ID, releaseReservedPeerOnRollback) },
 		)
 		log.Fatalf(format, args...)
 	}
@@ -2487,6 +2512,14 @@ func resolveTokenOnlyPeerReservation(existingReg *peer.Registration, lookupErr e
 		return peer.Registration{}, fmt.Errorf("existing peer reservation is incomplete; re-run without --token-only to recreate it")
 	}
 	return reg, nil
+}
+
+func shouldReleaseReservedPeerOnRollback(existingReg *peer.Registration, lookupErr error) bool {
+	// Only release automatically when the pre-reserve lookup proved there was
+	// no existing reservation. If the lookup itself failed, we cannot tell
+	// whether ReservePeerViaSession created a fresh lease or reused an
+	// existing one, so fail closed and preserve the remote reservation.
+	return lookupErr == nil && existingReg == nil
 }
 
 func legacyPeerStateDir(peerID string) string {

@@ -514,6 +514,60 @@ func TestReservePortRemovesStaleRegistryLock(t *testing.T) {
 	}
 }
 
+func TestStaleRegistryLockHonorsHardCeilingEvenWhenPIDIsAlive(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "registry", "lock")
+	if err := os.MkdirAll(lockPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockPath, "pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHardCeiling := registryLockHardCeiling
+	registryLockHardCeiling = time.Minute
+	defer func() { registryLockHardCeiling = oldHardCeiling }()
+
+	staleAt := time.Now().Add(-2 * registryLockHardCeiling)
+	if err := os.Chtimes(lockPath, staleAt, staleAt); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := staleRegistryLock(lockPath)
+	if err != nil {
+		t.Fatalf("staleRegistryLock: %v", err)
+	}
+	if !stale {
+		t.Fatal("expected hard ceiling to reap an old lock even when the recorded PID is alive")
+	}
+}
+
+func TestStaleRegistryLockKeepsRecentLivePID(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "registry", "lock")
+	if err := os.MkdirAll(lockPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockPath, "pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHardCeiling := registryLockHardCeiling
+	registryLockHardCeiling = time.Minute
+	defer func() { registryLockHardCeiling = oldHardCeiling }()
+
+	recent := time.Now().Add(-time.Second)
+	if err := os.Chtimes(lockPath, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := staleRegistryLock(lockPath)
+	if err != nil {
+		t.Fatalf("staleRegistryLock: %v", err)
+	}
+	if stale {
+		t.Fatal("expected recent live PID to keep the lock valid")
+	}
+}
+
 // TestWriteJSONAtomicLeavesNoTempCruftAndIsSynced pins the durability contract
 // for writeJSONAtomic: (1) after a successful write the target file is
 // non-empty, valid JSON, and matches the input; (2) no `.tmp.*` siblings are
@@ -570,4 +624,3 @@ func TestWriteJSONAtomicLeavesNoTempCruftAndIsSynced(t *testing.T) {
 		}
 	}
 }
-

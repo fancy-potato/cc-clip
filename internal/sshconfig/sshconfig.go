@@ -800,6 +800,32 @@ func findOrphanMarker(lines []string, start, end int) (int, bool) {
 	return -1, false
 }
 
+func findAdjacentManagedSetEnv(lines []string, start, end, orphanIdx int) (int, bool) {
+	scan := func(i, step int) (int, bool) {
+		for ; i > start && i < end; i += step {
+			trimmed := strings.TrimSpace(lines[i])
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			keyword, rest := splitDirective(trimmed)
+			if strings.EqualFold(keyword, "setenv") && strings.Contains(rest, "CC_CLIP_") {
+				return i, true
+			}
+			break
+		}
+		return 0, false
+	}
+
+	switch strings.TrimSpace(lines[orphanIdx]) {
+	case markerBegin:
+		return scan(orphanIdx+1, 1)
+	case markerEnd:
+		return scan(orphanIdx-1, -1)
+	default:
+		return 0, false
+	}
+}
+
 func removeManagedMarkersFromBlocks(lines []string, blocks []hostBlock) ([]string, bool) {
 	out := append([]string{}, lines...)
 	removed := false
@@ -825,8 +851,17 @@ func removeManagedMarkersFromBlocks(lines []string, blocks []hostBlock) ([]strin
 				break
 			}
 			removed = true
-			out = append(out[:orphanIdx], out[orphanIdx+1:]...)
-			block.end--
+			removeStart, removeEnd := orphanIdx, orphanIdx
+			if setEnvIdx, ok := findAdjacentManagedSetEnv(out, block.start, block.end, orphanIdx); ok {
+				if setEnvIdx < removeStart {
+					removeStart = setEnvIdx
+				}
+				if setEnvIdx > removeEnd {
+					removeEnd = setEnvIdx
+				}
+			}
+			out = append(out[:removeStart], out[removeEnd+1:]...)
+			block.end -= removeEnd - removeStart + 1
 		}
 	}
 	return out, removed
