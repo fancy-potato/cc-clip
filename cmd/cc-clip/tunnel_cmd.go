@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/exitcode"
-	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
 )
@@ -229,7 +228,7 @@ func cmdTunnelUp() {
 		log.Fatalf("resolve tunnel ports: %v", err)
 	}
 	if remotePort == 0 {
-		log.Fatalf("cannot determine remote port for %s. Either run `cc-clip connect %s` first (writes the managed SSH config block), or re-run with `--remote-port <PORT>` explicitly.", host, host)
+		log.Fatalf("cannot determine remote port for %s. Either run `cc-clip connect %s` first (records the remote port locally), or re-run with `--remote-port <PORT>` explicitly.", host, host)
 	}
 	if err := validateTunnelPort("--port", daemonPort, false); err != nil {
 		log.Fatalf("resolve tunnel ports: %v", err)
@@ -245,70 +244,37 @@ func cmdTunnelUp() {
 }
 
 // resolveTunnelUpPorts fills in missing remotePort / daemonPort values from
-// the local managed SSH config block, falling back to saved tunnel state.
-// When --port was not set explicitly the CLI adopts whatever daemon port
-// the managed block (or the unambiguous saved tunnel) points at, so that
-// `cc-clip tunnel up <host>` routes to the daemon that actually owns the
-// forward for that host. If --port was explicit and diverges from the
-// managed/saved value, the call errors rather than silently crossing
-// daemons.
+// the locally saved tunnel state. When --port was not set explicitly the
+// CLI adopts whatever daemon port the saved tunnel points at (the one daemon
+// that owns the forward for that host). If --port was explicit and diverges
+// from the saved value, the call errors rather than silently crossing to a
+// different daemon.
 func resolveTunnelUpPorts(host string, remotePort, daemonPort int, daemonPortExplicit bool) (int, int, error) {
-	var (
-		managedPortErr error
-		savedPortErr   error
-		managedOwned   bool
-	)
-
-	managedPorts, err := setup.ReadManagedTunnelPorts(host)
-	switch {
-	case err == nil && managedPorts.LocalPort > 0:
-		managedOwned = true
-		switch {
-		case !daemonPortExplicit:
-			daemonPort = managedPorts.LocalPort
-		case daemonPort != managedPorts.LocalPort:
-			managedPortErr = fmt.Errorf("managed tunnel for %s uses local port %d (remote port %d); rerun with --port %d to use it, or pass --remote-port %d explicitly", host, managedPorts.LocalPort, managedPorts.RemotePort, managedPorts.LocalPort, managedPorts.RemotePort)
+	s, err := loadSavedTunnelForUp(host)
+	if err != nil {
+		if errors.Is(err, tunnel.ErrAmbiguousTunnelState) {
+			return 0, daemonPort, fmt.Errorf("%w; pass --port <local-port> to select one, or --remote-port <remote-port> to bypass saved-state lookup", err)
 		}
-		if remotePort == 0 && managedPorts.RemotePort > 0 {
-			remotePort = managedPorts.RemotePort
-		}
-	case errors.Is(err, setup.ErrManagedRemotePortInvalid):
-		return 0, daemonPort, err
-	case err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, setup.ErrSSHHostBlockNotFound):
-		managedPortErr = err
+		return 0, daemonPort, fmt.Errorf("load tunnel state for %s: %w", host, err)
 	}
-
-	if remotePort == 0 || !managedOwned {
-		s, err := loadSavedTunnelForUp(host)
-		if err != nil {
-			if errors.Is(err, tunnel.ErrAmbiguousTunnelState) {
-				return 0, daemonPort, fmt.Errorf("%w; pass --port <local-port> to select one, or --remote-port <remote-port> to bypass saved-state lookup", err)
-			}
-			return 0, daemonPort, err
-		}
-		if s != nil && s.Config.LocalPort > 0 {
-			if !daemonPortExplicit && !managedOwned {
-				daemonPort = s.Config.LocalPort
-			} else if daemonPortExplicit && daemonPort != s.Config.LocalPort {
-				savedPortErr = fmt.Errorf("saved tunnel for %s uses local port %d (remote port %d); rerun with --port %d to use it, or pass --remote-port %d explicitly", host, s.Config.LocalPort, s.Config.RemotePort, s.Config.LocalPort, s.Config.RemotePort)
-			}
-		}
-		if s != nil && remotePort == 0 && s.Config.RemotePort > 0 {
-			switch {
-			case !daemonPortExplicit:
-				remotePort = s.Config.RemotePort
-			case daemonPort == s.Config.LocalPort:
-				remotePort = s.Config.RemotePort
-			default:
-				savedPortErr = fmt.Errorf("saved tunnel for %s uses local port %d (remote port %d); rerun with --port %d to use it, or pass --remote-port %d explicitly", host, s.Config.LocalPort, s.Config.RemotePort, s.Config.LocalPort, s.Config.RemotePort)
-			}
-		}
+	if s == nil {
+		return remotePort, daemonPort, nil
 	}
-	if managedPortErr != nil {
-		return 0, daemonPort, managedPortErr
+	// A legacy or corrupt state file with LocalPort == 0 cannot be honored —
+	// neither adopt nor validate, since "owning daemon port" is ill-defined.
+	// Reject rather than silently using whatever --port the user passed; the
+	// next `cc-clip connect <host>` run will rewrite the state with a real
+	// local port.
+	if s.Config.LocalPort == 0 {
+		return 0, daemonPort, fmt.Errorf("saved tunnel for %s has no local_port; re-run `cc-clip connect %s` to rewrite the state file, or pass --remote-port <port> to bypass saved-state lookup", host, host)
 	}
-	if !managedOwned && savedPortErr != nil {
-		return 0, daemonPort, savedPortErr
+	if !daemonPortExplicit {
+		daemonPort = s.Config.LocalPort
+	} else if daemonPort != s.Config.LocalPort {
+		return 0, daemonPort, fmt.Errorf("saved tunnel for %s uses local port %d (remote port %d); rerun with --port %d to use it, or pass --remote-port %d explicitly", host, s.Config.LocalPort, s.Config.RemotePort, s.Config.LocalPort, s.Config.RemotePort)
+	}
+	if remotePort == 0 && s.Config.RemotePort > 0 {
+		remotePort = s.Config.RemotePort
 	}
 	return remotePort, daemonPort, nil
 }

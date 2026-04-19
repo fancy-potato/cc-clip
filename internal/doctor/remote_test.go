@@ -1,12 +1,14 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/shunmei/cc-clip/internal/peer"
-	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/shim"
+	"github.com/shunmei/cc-clip/internal/tunnel"
 )
 
 func TestRemotePathExprExpandsLegacyHome(t *testing.T) {
@@ -70,148 +72,300 @@ func TestPeerLookupCheckResultReportsActivePeer(t *testing.T) {
 	}
 }
 
-func TestCheckAliasPortSkipsWithoutPeerReservation(t *testing.T) {
-	got := checkAliasPort("myserver", nil, 18339)
-	if len(got) != 1 || !got[0].OK {
-		t.Fatalf("expected alias check skip success, got %#v", got)
-	}
-	if got[0].Message != "peer SSH forwarding not configured; skipping effective ssh config check" {
-		t.Fatalf("unexpected alias skip message: %#v", got)
-	}
-}
+func TestCheckTunnelStateAlignmentUsesSavedStateWithoutPeerReservation(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
 
-func TestCheckAliasPortPrefersBaseHostConfig(t *testing.T) {
-	oldQuery := sshConfigQuery
-	t.Cleanup(func() { sshConfigQuery = oldQuery })
-
-	var seen []string
-	sshConfigQuery = func(candidate string) (string, error) {
-		seen = append(seen, candidate)
-		if candidate == "myserver" {
-			return "remoteforward 18340 127.0.0.1:18339\n", nil
-		}
-		return "", fmt.Errorf("unexpected fallback")
-	}
-
-	got := checkAliasPort("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
-	if len(got) != 1 || !got[0].OK {
-		t.Fatalf("expected success, got %#v", got)
-	}
-	if got[0].Message != "effective ssh config forwards 18340 127.0.0.1:18339" {
-		t.Fatalf("unexpected message %#v", got[0])
-	}
-	if len(seen) != 1 || seen[0] != "myserver" {
-		t.Fatalf("expected only base host query, got %v", seen)
-	}
-}
-
-func TestCheckAliasPortSurfacesSSHQueryError(t *testing.T) {
-	oldQuery := sshConfigQuery
-	t.Cleanup(func() { sshConfigQuery = oldQuery })
-
-	sshConfigQuery = func(candidate string) (string, error) {
-		return "", fmt.Errorf("ssh config parse error")
-	}
-
-	got := checkAliasPort("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
-	if len(got) != 1 || got[0].OK {
-		t.Fatalf("expected failure, got %#v", got)
-	}
-	if got[0].Message != "ssh -G myserver failed: ssh config parse error; cannot verify effective RemoteForward" {
-		t.Fatalf("unexpected message %#v", got[0])
-	}
-}
-
-func TestCheckAliasPortFailsWhenForwardMissing(t *testing.T) {
-	oldQuery := sshConfigQuery
-	t.Cleanup(func() { sshConfigQuery = oldQuery })
-
-	sshConfigQuery = func(candidate string) (string, error) {
-		return "hostname 10.0.0.1\nuser admin\n", nil
-	}
-
-	got := checkAliasPort("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
-	if len(got) != 1 || got[0].OK {
-		t.Fatalf("expected failure, got %#v", got)
-	}
-	if got[0].Message != "effective ssh config missing RemoteForward 18340 127.0.0.1:18339" {
-		t.Fatalf("unexpected message %#v", got[0])
-	}
-}
-
-func TestCheckManagedPortAlignmentSkipsWithoutPeerReservation(t *testing.T) {
-	got, ports := checkManagedPortAlignment("myserver", nil)
-	if len(got) != 1 || !got[0].OK {
-		t.Fatalf("expected managed-block check skip success, got %#v", got)
-	}
-	if got[0].Message != "peer SSH forwarding not configured; skipping managed block check" {
-		t.Fatalf("unexpected managed-block skip message: %#v", got)
-	}
-	if ports != nil {
-		t.Fatalf("ports = %#v, want nil", ports)
-	}
-}
-
-func TestCheckManagedPortAlignmentReportsMatch(t *testing.T) {
-	oldRead := readManagedTunnelPorts
-	t.Cleanup(func() { readManagedTunnelPorts = oldRead })
-
-	readManagedTunnelPorts = func(host string) (setup.ManagedTunnelPorts, error) {
+	loadTunnelStatesForHost = func(host string) ([]*tunnel.TunnelState, error) {
 		if host != "myserver" {
 			t.Fatalf("host = %q, want myserver", host)
 		}
-		return setup.ManagedTunnelPorts{RemotePort: 18340, LocalPort: 18339}, nil
+		return []*tunnel.TunnelState{{
+			Config: tunnel.TunnelConfig{
+				Host:       "myserver",
+				LocalPort:  18339,
+				RemotePort: 18340,
+			},
+		}}, nil
 	}
 
-	got, ports := checkManagedPortAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340})
+	got, state := checkTunnelStateAlignment("myserver", nil, 18339)
+	if len(got) != 1 || !got[0].OK {
+		t.Fatalf("expected tunnel-state check success, got %#v", got)
+	}
+	if got[0].Message != "peer SSH forwarding not configured; using saved tunnel state (remote:18340 -> local:18339)" {
+		t.Fatalf("unexpected tunnel-state message: %#v", got)
+	}
+	if state == nil || state.Config.RemotePort != 18340 {
+		t.Fatalf("state = %#v, want remote port 18340", state)
+	}
+}
+
+func TestCheckTunnelStateAlignmentReportsMatch(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(host string) ([]*tunnel.TunnelState, error) {
+		if host != "myserver" {
+			t.Fatalf("host = %q, want myserver", host)
+		}
+		return []*tunnel.TunnelState{{
+			Config: tunnel.TunnelConfig{
+				Host:       "myserver",
+				LocalPort:  18339,
+				RemotePort: 18340,
+			},
+		}}, nil
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
 	if len(got) != 1 || !got[0].OK {
 		t.Fatalf("expected match success, got %#v", got)
 	}
-	if got[0].Message != "remote register port 18340 matches managed block remote port 18340 (target 127.0.0.1:18339)" {
+	if got[0].Message != "saved tunnel state matches remote register (remote:18340 -> local:18339)" {
 		t.Fatalf("unexpected message %#v", got[0])
 	}
-	if ports == nil || ports.RemotePort != 18340 || ports.LocalPort != 18339 {
-		t.Fatalf("ports = %#v, want 18340/18339", ports)
+	if state == nil || state.Config.RemotePort != 18340 {
+		t.Fatalf("state = %#v, want remote port 18340", state)
 	}
 }
 
-func TestCheckManagedPortAlignmentReportsMismatch(t *testing.T) {
-	oldRead := readManagedTunnelPorts
-	t.Cleanup(func() { readManagedTunnelPorts = oldRead })
+func TestCheckTunnelStateAlignmentReportsMismatch(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
 
-	readManagedTunnelPorts = func(host string) (setup.ManagedTunnelPorts, error) {
-		return setup.ManagedTunnelPorts{RemotePort: 19001, LocalPort: 18339}, nil
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return []*tunnel.TunnelState{{
+			Config: tunnel.TunnelConfig{
+				Host:       "myserver",
+				LocalPort:  18339,
+				RemotePort: 19001,
+			},
+		}}, nil
 	}
 
-	got, ports := checkManagedPortAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340})
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
 	if len(got) != 1 || got[0].OK {
 		t.Fatalf("expected mismatch failure, got %#v", got)
 	}
-	if got[0].Message != "remote register port 18340 != managed block remote port 19001; rerun `cc-clip connect myserver` to resync" {
+	if got[0].Message != "saved tunnel state for myserver on local port 18339 uses remote port 19001, but remote register uses 18340; rerun 'cc-clip connect myserver' to resync" {
 		t.Fatalf("unexpected message %#v", got[0])
 	}
-	if ports == nil || ports.RemotePort != 19001 || ports.LocalPort != 18339 {
-		t.Fatalf("ports = %#v, want 19001/18339", ports)
+	if state != nil {
+		t.Fatalf("state = %#v, want nil on mismatch (caller must not derive remote port from an unrelated saved tunnel)", state)
 	}
 }
 
-func TestMatchesRemoteForwardAcceptsBracketedLoopback(t *testing.T) {
-	line := "remoteforward 18340 [127.0.0.1]:18339"
-	if !matchesRemoteForward(line, 18340, "127.0.0.1", 18339) {
-		t.Fatalf("expected bracketed loopback RemoteForward to match: %q", line)
+func TestCheckTunnelStateAlignmentReportsMatchOnSecondState(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return []*tunnel.TunnelState{
+			{Config: tunnel.TunnelConfig{Host: "myserver", LocalPort: 18339, RemotePort: 19001}},
+			{Config: tunnel.TunnelConfig{Host: "myserver", LocalPort: 18444, RemotePort: 18340}},
+		}, nil
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 0)
+	if len(got) != 1 || !got[0].OK {
+		t.Fatalf("expected match success on second state, got %#v", got)
+	}
+	if got[0].Message != "saved tunnel state matches remote register (remote:18340 -> local:18444)" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if state == nil || state.Config.LocalPort != 18444 {
+		t.Fatalf("state = %#v, want local port 18444", state)
 	}
 }
 
-func TestMatchesRemoteForwardAcceptsPlainLoopback(t *testing.T) {
-	line := "remoteforward 18340 127.0.0.1:18339"
-	if !matchesRemoteForward(line, 18340, "127.0.0.1", 18339) {
-		t.Fatalf("expected plain loopback RemoteForward to match: %q", line)
+func TestCheckTunnelStateAlignmentHonorsSelectedLocalPort(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return []*tunnel.TunnelState{
+			{Config: tunnel.TunnelConfig{Host: "myserver", LocalPort: 18339, RemotePort: 19001}},
+			{Config: tunnel.TunnelConfig{Host: "myserver", LocalPort: 18444, RemotePort: 18340}},
+		}, nil
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected selected-port mismatch failure, got %#v", got)
+	}
+	if got[0].Message != "saved tunnel state for myserver on local port 18339 uses remote port 19001, but remote register uses 18340; rerun 'cc-clip connect myserver' to resync" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if state != nil {
+		t.Fatalf("state = %#v, want nil when only another daemon's saved state matches", state)
 	}
 }
 
-func TestMatchesRemoteForwardRejectsWrongTarget(t *testing.T) {
-	line := "remoteforward 18340 [127.0.0.1]:9999"
-	if matchesRemoteForward(line, 18340, "127.0.0.1", 18339) {
-		t.Fatalf("expected mismatched RemoteForward to be rejected: %q", line)
+func TestCheckTunnelStateAlignmentReportsMismatchAcrossMultipleStates(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return []*tunnel.TunnelState{
+			{Config: tunnel.TunnelConfig{Host: "myserver", LocalPort: 18339, RemotePort: 19001}},
+			{Config: tunnel.TunnelConfig{Host: "myserver", LocalPort: 18444, RemotePort: 19002}},
+		}, nil
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 0)
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected mismatch failure across multiple states, got %#v", got)
+	}
+	if state != nil {
+		t.Fatalf("state = %#v, want nil on multi-state mismatch", state)
+	}
+}
+
+func TestCheckTunnelStateAlignmentReportsMissingState(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return nil, nil
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected missing-state failure, got %#v", got)
+	}
+	if got[0].Message != "no local tunnel state for myserver; run 'cc-clip connect myserver' to record it" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if state != nil {
+		t.Fatalf("state = %#v, want nil", state)
+	}
+}
+
+func TestCheckTunnelStateAlignmentSurfacesLoadError(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return nil, errors.New("disk read failed")
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", &peer.Registration{Label: "macbook", ReservedPort: 18340}, 18339)
+	if len(got) != 1 || got[0].OK {
+		t.Fatalf("expected load-error failure, got %#v", got)
+	}
+	if got[0].Message != "cannot read local tunnel state: disk read failed" {
+		t.Fatalf("unexpected message %#v", got[0])
+	}
+	if state != nil {
+		t.Fatalf("state = %#v, want nil on error", state)
+	}
+}
+
+func TestCheckLegacyManagedBlockReturnsNilWhenConfigMissing(t *testing.T) {
+	old := readLocalSSHConfig
+	t.Cleanup(func() { readLocalSSHConfig = old })
+	readLocalSSHConfig = func() ([]byte, error) {
+		return nil, fmt.Errorf("open: no such file or directory")
+	}
+
+	if got := checkLegacyManagedBlock("myserver"); got != nil {
+		t.Fatalf("expected nil for missing ssh config, got %#v", got)
+	}
+}
+
+func TestCheckLegacyManagedBlockReturnsNilForCleanConfig(t *testing.T) {
+	old := readLocalSSHConfig
+	t.Cleanup(func() { readLocalSSHConfig = old })
+	readLocalSSHConfig = func() ([]byte, error) {
+		return []byte("Host myserver\n  HostName example.com\n  User alice\n"), nil
+	}
+
+	if got := checkLegacyManagedBlock("myserver"); got != nil {
+		t.Fatalf("expected nil for clean ssh config, got %#v", got)
+	}
+}
+
+func TestCheckLegacyManagedBlockSurfacesLeftoverMarker(t *testing.T) {
+	oldRead := readLocalSSHConfig
+	t.Cleanup(func() { readLocalSSHConfig = oldRead })
+	readLocalSSHConfig = func() ([]byte, error) {
+		return []byte(
+			"Host myserver\n  HostName example.com\n" +
+				"# >>> cc-clip managed host: myserver >>>\n" +
+				"  RemoteForward 19001 127.0.0.1:18339\n" +
+				"# <<< cc-clip managed host: myserver <<<\n",
+		), nil
+	}
+
+	got := checkLegacyManagedBlock("myserver")
+	if got == nil {
+		t.Fatal("expected legacy block advisory, got nil")
+	}
+	// This is a passive advisory: OK=true. `cc-clip doctor --host` must not
+	// exit 1 on a cosmetic leftover that does not actually break the
+	// daemon-owned tunnel (any CI/script gating on doctor's exit code
+	// would otherwise break for users with pre-daemon-tunnel ssh configs).
+	if !got.OK {
+		t.Fatalf("expected advisory to be a passing check (OK=true), got %#v", got)
+	}
+	if got.Name != "ssh-config-legacy" {
+		t.Fatalf("name = %q, want ssh-config-legacy", got.Name)
+	}
+	if !strings.Contains(got.Message, "myserver") {
+		t.Fatalf("expected host alias in message, got %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "delete the block manually") {
+		t.Fatalf("expected manual-delete guidance in message, got %q", got.Message)
+	}
+}
+
+// TestCheckLegacyManagedBlockHandlesOtherHostAliasGenerically pins the P3
+// fix for host-specificity: a leftover block for host "foo" must still
+// advise (so users notice) but the message should not imply the current
+// --host is the owner of that block.
+func TestCheckLegacyManagedBlockHandlesOtherHostAliasGenerically(t *testing.T) {
+	oldRead := readLocalSSHConfig
+	t.Cleanup(func() { readLocalSSHConfig = oldRead })
+	readLocalSSHConfig = func() ([]byte, error) {
+		return []byte(
+			"Host foo\n" +
+				"# >>> cc-clip managed host: foo >>>\n" +
+				"  RemoteForward 19001 127.0.0.1:18339\n" +
+				"# <<< cc-clip managed host: foo <<<\n",
+		), nil
+	}
+	got := checkLegacyManagedBlock("bar")
+	if got == nil {
+		t.Fatal("expected advisory when a DIFFERENT host alias has a legacy block")
+	}
+	if !got.OK {
+		t.Fatalf("expected passing check (OK=true), got %#v", got)
+	}
+	if strings.Contains(got.Message, "managed host: bar") {
+		t.Fatalf("message should not claim --host=bar owns the block: %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "different host alias") {
+		t.Fatalf("expected 'different host alias' hint, got %q", got.Message)
+	}
+}
+
+func TestCheckTunnelStateAlignmentSkipsWithoutPeerReservationOrSavedState(t *testing.T) {
+	oldLoad := loadTunnelStatesForHost
+	t.Cleanup(func() { loadTunnelStatesForHost = oldLoad })
+
+	loadTunnelStatesForHost = func(string) ([]*tunnel.TunnelState, error) {
+		return nil, nil
+	}
+
+	got, state := checkTunnelStateAlignment("myserver", nil, 18339)
+	if len(got) != 1 || !got[0].OK {
+		t.Fatalf("expected tunnel-state check skip success, got %#v", got)
+	}
+	if got[0].Message != "peer SSH forwarding not configured; skipping local tunnel state check" {
+		t.Fatalf("unexpected tunnel-state skip message: %#v", got)
+	}
+	if state != nil {
+		t.Fatalf("state = %#v, want nil", state)
 	}
 }

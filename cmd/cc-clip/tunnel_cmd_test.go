@@ -579,161 +579,6 @@ func TestResolveTunnelUpPortsRejectsHostWithMultipleSavedTunnels(t *testing.T) {
 	}
 }
 
-func TestResolveTunnelUpPortsRejectsMalformedManagedPortEvenWithSavedState(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
-		Config: tunnel.TunnelConfig{
-			Host:       "example",
-			LocalPort:  18444,
-			RemotePort: 19001,
-			Enabled:    true,
-		},
-		Status: tunnel.StatusConnected,
-	}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	_, _, err := resolveTunnelUpPorts("example", 0, 18339, false)
-	if err == nil || !strings.Contains(err.Error(), "managed RemoteForward is invalid") {
-		t.Fatalf("err = %v, want malformed managed-port error", err)
-	}
-}
-
-func TestResolveTunnelUpPortsRejectsOutOfRangeManagedPortEvenWithSavedState(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward 0 127.0.0.1:18444",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
-		Config: tunnel.TunnelConfig{
-			Host:       "example",
-			LocalPort:  18444,
-			RemotePort: 19001,
-			Enabled:    true,
-		},
-		Status: tunnel.StatusConnected,
-	}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	_, _, err := resolveTunnelUpPorts("example", 0, 18339, false)
-	if err == nil || !strings.Contains(err.Error(), "managed RemoteForward is invalid") {
-		t.Fatalf("err = %v, want invalid managed-port error", err)
-	}
-}
-
-func TestResolveTunnelUpPortsRejectsMalformedManagedPortWithoutSavedState(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	_, _, err := resolveTunnelUpPorts("example", 0, 18339, false)
-	if err == nil || !strings.Contains(err.Error(), "managed RemoteForward is invalid") {
-		t.Fatalf("err = %v, want malformed managed-port error", err)
-	}
-}
-
-func TestResolveTunnelUpPortsAdoptsManagedLocalPortWhenDaemonNotExplicit(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward 19001 127.0.0.1:18444",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	remotePort, daemonPort, err := resolveTunnelUpPorts("example", 0, 18339, false)
-	if err != nil {
-		t.Fatalf("resolveTunnelUpPorts: %v", err)
-	}
-	if remotePort != 19001 {
-		t.Fatalf("remotePort = %d, want 19001", remotePort)
-	}
-	if daemonPort != 18444 {
-		t.Fatalf("daemonPort = %d, want 18444", daemonPort)
-	}
-}
-
-func TestResolveTunnelUpPortsRejectsExplicitDaemonPortThatDiffersFromManagedLocalPort(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward 19001 127.0.0.1:18444",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	_, _, err := resolveTunnelUpPorts("example", 0, 19999, true)
-	if err == nil || !strings.Contains(err.Error(), "uses local port 18444") {
-		t.Fatalf("err = %v, want managed-local-port mismatch error", err)
-	}
-}
-
 func TestResolveTunnelUpPortsRejectsExplicitDaemonPortThatDiffersFromSavedLocalPort(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
@@ -755,68 +600,37 @@ func TestResolveTunnelUpPortsRejectsExplicitDaemonPortThatDiffersFromSavedLocalP
 	}
 }
 
-func TestResolveTunnelUpPortsRejectsEnvConfiguredDaemonPortThatDiffersFromManagedLocalPort(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+func TestResolveTunnelUpPortsRejectsEnvConfiguredDaemonPortThatDiffersFromSavedLocalPort(t *testing.T) {
+	// CC_CLIP_PORT is the only non-flag path that flips
+	// daemonPortConfiguredExplicitly() to true. Cover the env→explicit
+	// mapping end-to-end so a regression that drops the env branch in
+	// configuredPort() does not silently cross daemons during `tunnel up`.
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CC_CLIP_PORT", "19999")
 
-	oldArgs := os.Args
-	os.Args = []string{"cc-clip", "tunnel", "up", "example"}
-	defer func() { os.Args = oldArgs }()
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward 19001 127.0.0.1:18444",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+		Config: tunnel.TunnelConfig{
+			Host:       "example",
+			LocalPort:  18444,
+			RemotePort: 19001,
+			Enabled:    true,
+		},
+		Status: tunnel.StatusConnected,
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
 	}
 
+	daemonPort := getPort()
+	if daemonPort != 19999 {
+		t.Fatalf("getPort() = %d, want 19999", daemonPort)
+	}
 	if !daemonPortConfiguredExplicitly() {
-		t.Fatal("expected env-configured daemon port to be treated as explicit")
+		t.Fatal("daemonPortConfiguredExplicitly() = false, want true when CC_CLIP_PORT is set")
 	}
 
-	_, _, err := resolveTunnelUpPorts("example", 0, 19999, daemonPortConfiguredExplicitly())
+	_, _, err := resolveTunnelUpPorts("example", 0, daemonPort, daemonPortConfiguredExplicitly())
 	if err == nil || !strings.Contains(err.Error(), "uses local port 18444") {
-		t.Fatalf("err = %v, want managed-local-port mismatch error", err)
-	}
-}
-
-func TestResolveTunnelUpPortsAdoptsManagedDaemonWhenRemotePortIsExplicit(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	config := strings.Join([]string{
-		"Host example",
-		"    # >>> cc-clip managed host: example >>>",
-		"    RemoteForward 19022 127.0.0.1:18444",
-		"    # <<< cc-clip managed host: example <<<",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	remotePort, daemonPort, err := resolveTunnelUpPorts("example", 19001, 18339, false)
-	if err != nil {
-		t.Fatalf("resolveTunnelUpPorts: %v", err)
-	}
-	if remotePort != 19001 {
-		t.Fatalf("remotePort = %d, want 19001", remotePort)
-	}
-	if daemonPort != 18444 {
-		t.Fatalf("daemonPort = %d, want 18444", daemonPort)
+		t.Fatalf("err = %v, want saved-local-port mismatch error", err)
 	}
 }
 

@@ -13,6 +13,7 @@ _CC_CLIP_STATE_DIR="${CC_CLIP_STATE_DIR:-${HOME}/.cache/cc-clip}"
 _CC_CLIP_NONCE_FILE="${_CC_CLIP_STATE_DIR}/notify.nonce"
 _CC_CLIP_HOST_ALIAS="${CC_CLIP_HOST_ALIAS:-$(hostname -s)}"
 _CC_CLIP_HEALTH_FILE="${_CC_CLIP_STATE_DIR}/notify-health.log"
+_CC_CLIP_STRICT="${CC_CLIP_STRICT:-0}"
 
 _nonce=""
 if [ -f "$_CC_CLIP_NONCE_FILE" ]; then
@@ -21,12 +22,18 @@ fi
 
 _payload=$(cat)
 
-_payload=$(echo "$_payload" | python3 -c "
-import sys, json
+# Host-alias injection requires python3. If python3 is missing or errors,
+# we post the payload WITHOUT the _cc_clip_host field — the classifier
+# treats it as optional. This means host attribution is lost on such
+# remotes, but we prefer forwarding the notification over blocking it.
+# TestHookScriptFallbackPreservesPayloadWithoutPython pins the degraded
+# behavior so a future refactor can't silently drop notifications instead.
+_payload=$(CC_CLIP_HOST_ALIAS="$_CC_CLIP_HOST_ALIAS" python3 -c '
+import os, sys, json
 d = json.load(sys.stdin)
-d['_cc_clip_host'] = '${_CC_CLIP_HOST_ALIAS}'
+d["_cc_clip_host"] = os.environ.get("CC_CLIP_HOST_ALIAS", "")
 json.dump(d, sys.stdout)
-" 2>/dev/null || echo "$_payload")
+' <<<"$_payload" 2>/dev/null || echo "$_payload")
 
 _http_code=$(curl -sf --connect-timeout 2 --max-time 5 -o /dev/null -w '%%{http_code}' -X POST \
 	-H "Authorization: Bearer $_nonce" \
@@ -38,6 +45,10 @@ _http_code=$(curl -sf --connect-timeout 2 --max-time 5 -o /dev/null -w '%%{http_
 
 if [ "$_http_code" != "204" ] && [ "$_http_code" != "200" ]; then
 	echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) FAIL http=$_http_code" >> "$_CC_CLIP_HEALTH_FILE" 2>/dev/null || true
+	if [ "$_CC_CLIP_STRICT" = "1" ]; then
+		echo "cc-clip-hook health probe failed: http=$_http_code"
+		exit 1
+	fi
 fi
 
 exit 0

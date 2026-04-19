@@ -108,11 +108,19 @@ Remote:
   install            Install xclip/wl-paste shim
     --target         auto|xclip|wl-paste (default: auto)
     --path           Install directory (default: ~/.local/bin)
-  uninstall          Remove shim
+  uninstall          Remove shim (see flags; combine --host/--peer/--codex for remote/codex cleanup)
     --target         auto|xclip|wl-paste (default: auto; auto removes the installed shim when exactly one exists)
     --path           Install directory (default: ~/.local/bin)
     --host           Clean up PATH marker on remote host instead of local shim
-    --peer           Remove cc-clip SSH config; with --host also releases the remote peer lease
+    --peer           Release the remote peer lease AND local tunnel state for --host (bare; auto-discovers your peer id)
+    --peer-id <id>   Release a specific peer id (overrides the local identity lookup; rare)
+    --codex          Remove Codex support (local-only, or --host for remote)
+    # For a complete removal run in order:
+    #   cc-clip uninstall --host <host> --peer      # remote shim + peer + local tunnel state
+    #   cc-clip uninstall --codex --host <host>     # remote Codex assets (if installed)
+    #   cc-clip uninstall --codex                   # local DISPLAY marker (if --codex was used)
+    #   cc-clip uninstall                           # local xclip/wl-paste shim
+    #   cc-clip service uninstall                   # stop and remove local launchd daemon
   paste              Fetch clipboard image and output path
     --out-dir        Output directory (env: CC_CLIP_OUT_DIR)
   send [<host>]      Upload local clipboard image to remote file path
@@ -131,15 +139,22 @@ Remote:
     --status         Show hotkey process status
 
 One-command setup:
-  setup <host>       Full setup: deps, update exact SSH Host block, daemon, deploy
+  setup <host>       Full setup: deps, daemon, deploy, record local tunnel state
     --port           Tunnel port (default: 18339)
+    --force          Ignore remote state, full redeploy
+    --token-only     Only sync token, skip binary/shim deploy
+    --codex          Include Codex support (Xvfb + x11-bridge)
+    --no-notify      Skip notification bridge setup
+    --no-tunnel      Record tunnel state but do not start the daemon-managed tunnel
 
 Deploy (local -> remote):
-  connect <host>     Deploy cc-clip to remote and update exact SSH Host block
+  connect <host>     Deploy cc-clip to remote and record local tunnel state
     --port           Tunnel port (default: 18339)
     --local-bin      Path to pre-downloaded remote binary
     --force          Ignore remote state, full redeploy
     --token-only     Only sync token, skip binary/shim deploy
+    --no-notify      Skip notification bridge setup
+    --no-tunnel      Record tunnel state but do not start the daemon-managed tunnel
 
 Codex support (extends connect/setup/uninstall):
   connect <host> --codex   Deploy with Codex support (Xvfb + x11-bridge)
@@ -159,7 +174,7 @@ Persistent tunnels:
     --json             Output as JSON (for SwiftBar / scripting)
   tunnel up <host>     Start persistent tunnel to host
     --port             Owning daemon port (default: 18339, env: CC_CLIP_PORT)
-    --remote-port      Remote listen port (auto-detected from SSH config if omitted)
+    --remote-port      Remote listen port (auto-detected from saved tunnel state if omitted)
   tunnel down <host>   Stop persistent tunnel owned by --port daemon (keeps state for restart)
     --port             Owning daemon port (default: 18339, env: CC_CLIP_PORT)
   tunnel remove <host> Stop persistent tunnel AND delete its state file
@@ -561,11 +576,16 @@ func cmdUninstall() {
 	targetStr := getFlag("target", "auto")
 	installPath := getFlag("path", "")
 	host := getFlag("host", "")
-	peerArg := getFlag("peer", "")
+	// --peer is a boolean trigger ("also release the peer lease for this host")
+	// so the README example `cc-clip uninstall --host myserver --peer` works.
+	// --peer-id <id> remains the escape hatch for releasing a non-local peer
+	// ID (rare; cleaning up a workstation's lease from a different machine).
+	peerFlag := hasFlag("peer")
+	peerID := getFlag("peer-id", "")
 	codex := hasFlag("codex")
 
-	if peerArg != "" {
-		cmdUninstallPeer(host, peerArg)
+	if peerFlag || peerID != "" {
+		cmdUninstallPeer(host, peerID)
 		return
 	}
 
@@ -629,6 +649,13 @@ func cmdUninstallPeer(host, peerArg string) {
 		log.Fatalf("uninstall peer failed: %v", err)
 	}
 
+	// Bare `--peer` (no --peer-id) auto-discovers the local identity's ID.
+	// Explicit `--peer-id <id>` overrides this for the rare case of releasing
+	// a non-local workstation's lease.
+	if peerArg == "" {
+		peerArg = ident.ID
+	}
+
 	peerID, managedHost, err := resolveUninstallPeerTarget(host, peerArg, ident)
 	if err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
@@ -649,76 +676,45 @@ func cmdUninstallPeer(host, peerArg string) {
 
 func resolveUninstallPeerTarget(host, peerArg string, ident peer.Identity) (string, string, error) {
 	if host == "" {
-		return "", "", fmt.Errorf("--host is required; managed aliases are no longer created — use --peer <id> --host <host> to clean up the remote peer lease and SSH config")
+		return "", "", fmt.Errorf("--host is required; pair --peer (or --peer-id <id>) with --host <host>")
 	}
-	if peerArg == ident.ID {
-		return peerArg, host, nil
+	if peerArg == "" || peerArg == ident.ID {
+		// "Self" case — releasing the local identity's lease for this host.
+		// Return managedHost=host so the caller tears down the local tunnel
+		// state for this (host, localPort) in addition to releasing the peer.
+		return ident.ID, host, nil
 	}
 	return peerArg, "", nil
 }
 
 func uninstallPeerRemoteAndConfig(managedHost string, remoteCleanup func() (*peer.Registration, error)) error {
 	return uninstallPeerRemoteAndConfigWithOps(managedHost, remoteCleanup, uninstallPeerCleanupOps{
-		removeManagedHostConfig: setup.RemoveManagedHostConfig,
-		readManagedTunnelPorts:  setup.ReadManagedTunnelPorts,
-		removePersistentTunnel:  removePersistentTunnel,
+		removePersistentTunnel: removePersistentTunnel,
 	})
 }
 
 type uninstallPeerCleanupOps struct {
-	removeManagedHostConfig func(string) error
-	readManagedTunnelPorts  func(string) (setup.ManagedTunnelPorts, error)
-	removePersistentTunnel  func(string, int) error
+	// removePersistentTunnel tears down every saved tunnel state for the host
+	// across all daemon local ports (passing 0 as localPort).
+	removePersistentTunnel func(host string, localPort int) error
 }
 
 func uninstallPeerRemoteAndConfigWithOps(managedHost string, remoteCleanup func() (*peer.Registration, error), ops uninstallPeerCleanupOps) error {
 	reg, remoteErr := remoteCleanup()
-	var (
-		hostErr           error
-		tunnelErr         error
-		hostConfigRemoved bool
-	)
-	if managedHost != "" {
-		removeTunnelByHost := false
-		removeTunnelPort := 0
-		if ops.readManagedTunnelPorts != nil {
-			managedPorts, err := ops.readManagedTunnelPorts(managedHost)
-			switch {
-			case err == nil:
-				removeTunnelByHost = true
-				if managedPorts.LocalPort > 0 {
-					removeTunnelPort = managedPorts.LocalPort
-				}
-			case errors.Is(err, os.ErrNotExist), errors.Is(err, setup.ErrSSHHostBlockNotFound):
-				removeTunnelByHost = true
-			case errors.Is(err, setup.ErrManagedRemotePortInvalid):
-				removeTunnelByHost = true
-			default:
-				tunnelErr = fmt.Errorf("read managed tunnel ports for Host %s: %w", managedHost, err)
-			}
-		}
-		if tunnelErr == nil && ops.removePersistentTunnel != nil && removeTunnelByHost {
-			tunnelErr = ops.removePersistentTunnel(managedHost, removeTunnelPort)
-		}
-		if tunnelErr == nil && ops.removeManagedHostConfig != nil {
-			hostErr = ops.removeManagedHostConfig(managedHost)
-			hostConfigRemoved = hostErr == nil
-		}
+	var tunnelErr error
+	if managedHost != "" && ops.removePersistentTunnel != nil {
+		// localPort=0 means "every saved local_port for this host";
+		// removePersistentTunnel handles the enumeration internally.
+		tunnelErr = ops.removePersistentTunnel(managedHost, 0)
 	}
 
 	if remoteErr == nil && reg != nil {
 		fmt.Printf("Released peer %s on remote port %d\n", reg.Label, reg.ReservedPort)
 	}
-	if managedHost != "" && hostConfigRemoved {
-		fmt.Printf("Removed cc-clip SSH config from Host %s in ~/.ssh/config\n", managedHost)
-	}
 
 	var errs []error
 	if remoteErr != nil {
 		errs = append(errs, remoteErr)
-	}
-	if managedHost != "" && hostErr != nil {
-		errs = append(errs, fmt.Errorf("failed to remove Host %s cc-clip config: %w", managedHost, hostErr))
 	}
 	if managedHost != "" && tunnelErr != nil {
 		errs = append(errs, fmt.Errorf("failed to remove persistent tunnel for Host %s: %w", managedHost, tunnelErr))
@@ -908,11 +904,12 @@ type connectOpts struct {
 	tokenOnly bool
 	codex     bool
 	noNotify  bool
+	noTunnel  bool
 }
 
 func cmdConnect() {
 	if len(os.Args) < 3 {
-		log.Fatal("usage: cc-clip connect <host> [--port PORT] [--force] [--token-only] [--no-notify]")
+		log.Fatal("usage: cc-clip connect <host> [--port PORT] [--force] [--token-only] [--no-notify] [--no-tunnel]")
 	}
 	runConnect(connectOpts{
 		host:      os.Args[2],
@@ -921,6 +918,7 @@ func cmdConnect() {
 		tokenOnly: hasFlag("token-only"),
 		codex:     hasFlag("codex"),
 		noNotify:  hasFlag("no-notify"),
+		noTunnel:  hasFlag("no-tunnel"),
 	})
 }
 
@@ -1023,12 +1021,13 @@ func runConnect(opts connectOpts) {
 	existingReg, existingRegErr := lookupPeerReservation(session, remoteBin, ident.ID)
 	if tokenOnly {
 		createdReservation := false
+		savedTunnelState := false
 		rollbackCreatedReservation := func() error {
 			if !createdReservation {
 				return nil
 			}
-			return cleanupCreatedTokenOnlyFallback(host, tokenOnlyFallbackCleanupOps{
-				removeManagedHostConfig: setup.RemoveManagedHostConfig,
+			return cleanupCreatedTokenOnlyFallback(host, localPort, tokenOnlyFallbackCleanupOps{
+				removePersistentTunnel: removePersistentTunnel,
 				releasePeer: func() error {
 					_, err := cleanupAndReleasePeer(session, remoteBin, ident.ID)
 					return err
@@ -1037,6 +1036,15 @@ func runConnect(opts connectOpts) {
 		}
 		failTokenOnly := func(format string, args ...any) {
 			msg := fmt.Sprintf(format, args...)
+			// createdReservation=true is rolled back via removePersistentTunnel
+			// (which also removes state). Handle the "reused an existing
+			// reservation but we already wrote our own state file" case here
+			// so the state file does not outlive the failed token-only run.
+			if savedTunnelState && !createdReservation {
+				if rmErr := tunnel.RemoveState(tunnel.DefaultStateDir(), host, localPort); rmErr != nil {
+					log.Printf("      warning: rollback could not remove tunnel state file: %v", rmErr)
+				}
+			}
 			if rollbackErr := rollbackCreatedReservation(); rollbackErr != nil {
 				log.Fatalf("      %s; rollback failed: %v", msg, rollbackErr)
 			}
@@ -1055,18 +1063,15 @@ func runConnect(opts connectOpts) {
 			existingReg = &newReg
 			createdReservation = true
 		}
-		fmt.Printf("[5/8] Reusing peer reservation and updating SSH config (--token-only)...\n")
+		fmt.Printf("[5/8] Reusing peer reservation and recording tunnel state (--token-only)...\n")
 		reg, err := resolveTokenOnlyPeerReservation(existingReg, existingRegErr)
 		if err != nil {
 			failTokenOnly("%v", err)
 		}
-		changes, err := ensureManagedHostConfigForReservation(host, localPort, &reg)
-		if err != nil {
-			failTokenOnly("failed to update Host %s in ~/.ssh/config: %v", host, err)
+		if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
+			failTokenOnly("failed to record tunnel state for Host %s: %v", host, err)
 		}
-		for _, c := range changes {
-			fmt.Printf("      %s: %s\n", c.Action, c.Detail)
-		}
+		savedTunnelState = true
 		fmt.Printf("      host: %s\n", host)
 		fmt.Printf("      remote port: %d\n", reg.ReservedPort)
 		fmt.Printf("      state dir: %s\n", reg.StateDir)
@@ -1080,13 +1085,13 @@ func runConnect(opts connectOpts) {
 		if sid != "" {
 			fmt.Printf("      session ID: %s\n", sid[:16])
 		}
-		if err := connectVerifyTunnel(session, reg.ReservedPort, host); err != nil {
+		if err := connectActivateTunnel(session, opts, host, localPort, reg.ReservedPort); err != nil {
 			failTokenOnly("%v", err)
 		}
 		return
 	}
 
-	fmt.Printf("[5/8] Reserving peer port and updating SSH config...\n")
+	fmt.Printf("[5/8] Reserving peer port and recording tunnel state...\n")
 	hadExistingPeerReservation := false
 	if existingRegErr != nil {
 		log.Printf("      warning: could not check existing peer reservation: %v", existingRegErr)
@@ -1097,13 +1102,25 @@ func runConnect(opts connectOpts) {
 	if err != nil {
 		log.Fatalf("      failed to reserve peer port: %v", err)
 	}
-	changes, err := ensureManagedHostConfigForReservation(host, localPort, &reg)
-	if err != nil {
+	if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
 		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
-		log.Fatalf("      failed to update Host %s in ~/.ssh/config: %v", host, err)
+		log.Fatalf("      failed to record tunnel state for Host %s: %v", host, err)
 	}
-	for _, c := range changes {
-		fmt.Printf("      %s: %s\n", c.Action, c.Detail)
+	// failAfterSave covers fatal exits between saveConnectTunnelState and
+	// connectActivateTunnel reporting success — i.e. while the local state
+	// file still references a remote port that this run is in the middle of
+	// reserving. Without it, bestEffortReleasePeer would release the remote
+	// port while the local state file survived with a stale RemotePort that
+	// only `cc-clip tunnel remove` would clean. Failures AFTER activation
+	// (e.g. Codex setup at the bottom of this function) deliberately leave
+	// the state in place — the tunnel is already live and the state file
+	// accurately reflects reality.
+	failAfterSave := func(format string, args ...any) {
+		if rmErr := tunnel.RemoveState(tunnel.DefaultStateDir(), host, localPort); rmErr != nil {
+			log.Printf("      warning: rollback could not remove tunnel state file: %v", rmErr)
+		}
+		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		log.Fatalf(format, args...)
 	}
 	fmt.Printf("      host: %s\n", host)
 	fmt.Printf("      remote port: %d\n", reg.ReservedPort)
@@ -1133,7 +1150,7 @@ func runConnect(opts connectOpts) {
 			session.Exec(fmt.Sprintf("%s uninstall", remoteBin))
 			out, err = session.Exec(installCmd)
 			if err != nil {
-				log.Fatalf("      remote install failed: %s: %v", out, err)
+				failAfterSave("      remote install failed: %s: %v", out, err)
 			}
 		}
 		installOut = out
@@ -1162,7 +1179,7 @@ func runConnect(opts connectOpts) {
 	fmt.Printf("[7/8] Syncing peer token and session...\n")
 	sessionID, _ := shim.GenerateSessionID()
 	if err := syncRemoteTokenAndSession(session, daemonToken, reg.StateDir, sessionID); err != nil {
-		log.Fatalf("      failed to write token: %v", err)
+		failAfterSave("      failed to write token: %v", err)
 	}
 	fmt.Println("      token synced from local daemon")
 	if sessionID != "" {
@@ -1196,9 +1213,9 @@ func runConnect(opts connectOpts) {
 		log.Printf("      warning: could not write remote deploy state: %v", err)
 	}
 
-	// Step 8: Verify tunnel
-	if err := connectVerifyTunnel(session, reg.ReservedPort, host); err != nil {
-		log.Fatalf("%v", err)
+	// Step 8: Activate daemon-managed tunnel and verify remote binary
+	if err := connectActivateTunnel(session, opts, host, localPort, reg.ReservedPort); err != nil {
+		failAfterSave("%v", err)
 	}
 
 	// Notification bridge setup (unless --no-notify)
@@ -1207,7 +1224,7 @@ func runConnect(opts connectOpts) {
 		fmt.Println()
 		fmt.Println("Notification bridge setup:")
 		fmt.Println("  skipped (--no-notify)")
-	} else if notifyState := connectNotifySetup(session, localPort, reg.ReservedPort, reg.StateDir); notifyState != nil {
+	} else if notifyState := connectNotifySetup(session, localPort, reg.ReservedPort, reg.StateDir, !opts.noTunnel); notifyState != nil {
 		newState.Notify = notifyState
 		if err := shim.WriteRemoteState(session, newState); err != nil {
 			log.Printf("      warning: could not update remote deploy state: %v", err)
@@ -1235,8 +1252,9 @@ func runConnect(opts connectOpts) {
 // 3. Install hook script on remote
 // 4. Install clipcc wrapper or print Claude Code hook config
 // 5. Detect and configure Codex notify (if ~/.codex exists)
-// 6. Run health probe
-func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, stateDir string) *shim.NotifyDeployState {
+// 6. Run health probe (only when tunnelActive — otherwise the probe has no
+//    path to reach the local /notify endpoint and would always fail).
+func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, stateDir string, tunnelActive bool) *shim.NotifyDeployState {
 	fmt.Println()
 	fmt.Println("Notification bridge setup:")
 
@@ -1309,13 +1327,18 @@ func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, sta
 	}
 
 	// Step N6: Health probe
-	fmt.Println("  [N6] Running notification health probe...")
 	healthVerified := false
-	if err := runNotificationHealthProbe(localPort, notifyNonce); err != nil {
-		log.Printf("      warning: health probe failed: %v", err)
-	} else {
-		healthVerified = true
-		fmt.Println("      health probe passed")
+	switch {
+	case !tunnelActive:
+		fmt.Println("  [N6] Skipping notification health probe (--no-tunnel; tunnel not active)")
+	default:
+		fmt.Println("  [N6] Running notification health probe...")
+		if err := runRemoteNotificationHealthProbe(session, remotePort, stateDir); err != nil {
+			log.Printf("      warning: health probe failed: %v", err)
+		} else {
+			healthVerified = true
+			fmt.Println("      health probe passed")
+		}
 	}
 	return &shim.NotifyDeployState{
 		Enabled:        true,
@@ -1405,9 +1428,43 @@ func registerNonceWithDaemon(port int, bearerToken, nonce string) error {
 	return nil
 }
 
-// runNotificationHealthProbe sends a test notification to the local daemon
-// via /notify and checks for 204. This proves the nonce is registered and
-// the notification pipeline works end-to-end.
+// runRemoteNotificationHealthProbe executes the installed remote hook script in
+// a one-shot strict mode so connect/setup verifies the real remote notify path:
+// remote hook script -> reserved remote port -> tunnel -> local /notify.
+func runRemoteNotificationHealthProbe(session remoteExecutor, remotePort int, stateDir string) error {
+	if remotePort <= 0 {
+		return fmt.Errorf("invalid remote notify port %d", remotePort)
+	}
+	if strings.TrimSpace(stateDir) == "" {
+		// A caller without a peer-scoped state dir would end up probing
+		// `~/.cache/cc-clip/notify.nonce`, which does not contain the current
+		// connect run's nonce. Return a clear error rather than silently
+		// misdirecting the probe.
+		return fmt.Errorf("remote notify health probe: state dir is required (peer registration missing)")
+	}
+
+	payload := `{"hook_event_name":"notification","type":"idle_prompt","title":"cc-clip","body":"Notification bridge connected"}`
+	cmd := fmt.Sprintf(
+		"printf %%s %s | CC_CLIP_PORT=%d CC_CLIP_STATE_DIR=%s CC_CLIP_STRICT=1 %s",
+		shellutil.ShellQuote(payload),
+		remotePort,
+		shimShellQuote(stateDir),
+		shimShellQuote("~/.local/bin/cc-clip-hook"),
+	)
+	out, err := session.Exec(cmd)
+	if err != nil {
+		if strings.TrimSpace(out) != "" {
+			return fmt.Errorf("%s: %w", strings.TrimSpace(out), err)
+		}
+		return fmt.Errorf("remote hook execution failed: %w", err)
+	}
+	return nil
+}
+
+// runNotificationHealthProbe sends a direct test notification to the local
+// daemon via /notify and checks for 204. This validates nonce registration for
+// the local HTTP endpoint only; connect/setup uses runRemoteNotificationHealthProbe
+// to exercise the actual remote tunnel path.
 func runNotificationHealthProbe(port int, nonce string) error {
 	payload := `{"title":"cc-clip","body":"Notification bridge connected","urgency":0}`
 	url := fmt.Sprintf("http://127.0.0.1:%d/notify", port)
@@ -1462,7 +1519,7 @@ func claudeHookConfigJSON() string {
 
 func cmdSetup() {
 	if len(os.Args) < 3 {
-		log.Fatal("usage: cc-clip setup <host> [--port PORT]")
+		log.Fatal("usage: cc-clip setup <host> [--port PORT] [--force] [--token-only] [--codex] [--no-notify] [--no-tunnel]")
 	}
 	host := os.Args[2]
 	localPort := getPort()
@@ -1510,56 +1567,111 @@ func cmdSetup() {
 		log.Fatal("      daemon not running. Start it first: cc-clip serve")
 	}
 
-	// Step 3: Deploy to remote and update the existing SSH host entry.
-	// Forward the orchestration flags the user passed to `setup` so that
-	// e.g. `cc-clip setup host --force --token-only` redeploys instead of
-	// reusing the deploy-state cache. Previously these flags were silently
-	// dropped, leaving scripts that added --force puzzled when nothing
-	// redeployed.
-	fmt.Printf("\n[3/4] Deploying to %s and updating SSH host config...\n", host)
+	// Step 3: Deploy to the remote and record local tunnel state.
+	// cc-clip no longer touches `~/.ssh/config`; the daemon spawns its own
+	// `ssh -N -R` and tracks the (host, remote-port, daemon-port) mapping
+	// under ~/.cache/cc-clip/tunnels/. Forward the orchestration flags the
+	// user passed to `setup` so that e.g. `cc-clip setup host --force
+	// --token-only` redeploys instead of reusing the deploy-state cache.
+	// Previously these flags were silently dropped, leaving scripts that
+	// added --force puzzled when nothing redeployed.
+	fmt.Printf("\n[3/4] Deploying to %s and recording local tunnel state...\n", host)
 	runConnect(connectOpts{
 		host:      host,
 		port:      localPort,
 		codex:     hasFlag("codex"),
 		force:     hasFlag("force"),
 		tokenOnly: hasFlag("token-only"),
+		noNotify:  hasFlag("no-notify"),
+		noTunnel:  hasFlag("no-tunnel"),
 	})
 }
 
-// connectVerifyTunnel verifies the SSH tunnel from the remote side.
-func connectVerifyTunnel(session *shim.SSHSession, port int, host string) error {
+// connectActivateTunnel starts the daemon-managed persistent reverse tunnel
+// for this host (unless --no-tunnel defers to the operator) and verifies that
+// the remote binary is functional from the daemon's point of view.
+type connectActivateTunnelOps struct {
+	startPersistentTunnel func(int, string, int) error
+	stopPersistentTunnel  func(int, string) error
+	remoteStatus          func(*shim.SSHSession, string) (string, error)
+}
+
+func connectActivateTunnel(session *shim.SSHSession, opts connectOpts, host string, localPort, remotePort int) error {
+	return connectActivateTunnelWithOps(session, opts, host, localPort, remotePort, connectActivateTunnelOps{
+		startPersistentTunnel: connectStartPersistentTunnel,
+		stopPersistentTunnel: func(localPort int, host string) error {
+			return stopTunnelWithRetryPolicy(localPort, host, false, postTunnelDown, persistTunnelDownOffline)
+		},
+		remoteStatus: func(session *shim.SSHSession, cmd string) (string, error) {
+			return session.Exec(cmd)
+		},
+	})
+}
+
+func connectActivateTunnelWithOps(session *shim.SSHSession, opts connectOpts, host string, localPort, remotePort int, ops connectActivateTunnelOps) error {
 	remoteBin := "~/.local/bin/cc-clip"
+	if ops.startPersistentTunnel == nil {
+		ops.startPersistentTunnel = connectStartPersistentTunnel
+	}
+	if ops.stopPersistentTunnel == nil {
+		ops.stopPersistentTunnel = func(localPort int, host string) error {
+			return stopTunnelWithRetryPolicy(localPort, host, false, postTunnelDown, persistTunnelDownOffline)
+		}
+	}
+	if ops.remoteStatus == nil {
+		ops.remoteStatus = func(session *shim.SSHSession, cmd string) (string, error) {
+			return session.Exec(cmd)
+		}
+	}
+	tunnelStarted := false
 
-	fmt.Printf("[8/8] Verifying tunnel from remote...\n")
-	probeCmd := fmt.Sprintf(
-		"bash -c 'echo >/dev/tcp/127.0.0.1/%d' 2>/dev/null && echo 'tunnel:ok' || echo 'tunnel:fail'",
-		port)
-	probeOut, _ := session.Exec(probeCmd)
-
-	if probeOut == "tunnel:ok" {
-		fmt.Println("      tunnel verified (via existing SSH session)")
+	if opts.noTunnel {
+		fmt.Println("[8/8] Skipping daemon tunnel start (--no-tunnel)")
+		fmt.Printf("      tunnel state recorded; bring it up with: cc-clip tunnel up %s\n", host)
 	} else {
-		fmt.Println("      tunnel not detected (this is normal if no interactive SSH session is open)")
-		fmt.Println("      The tunnel is provided by your SSH connection, not by 'cc-clip connect'.")
-		fmt.Printf("      Open your SSH host to activate it: ssh %s\n", host)
+		fmt.Printf("[8/8] Starting daemon-managed tunnel for %s...\n", host)
+		if err := ops.startPersistentTunnel(localPort, host, remotePort); err != nil {
+			// `postTunnelUp` succeeds as soon as the daemon accepts the
+			// request; the daemon's ssh subprocess then retries indefinitely.
+			// If the subsequent `/tunnels` poll never reaches "connected",
+			// we must stop the daemon-side reconnect loop or a phantom tunnel
+			// is left behind. The caller (failAfterSave) separately removes
+			// the local state file.
+			if stopErr := ops.stopPersistentTunnel(localPort, host); stopErr != nil {
+				return fmt.Errorf("failed to start persistent tunnel: %w; additionally failed to stop pending tunnel: %v", err, stopErr)
+			}
+			return fmt.Errorf("failed to start persistent tunnel: %w", err)
+		}
+		tunnelStarted = true
+		fmt.Printf("      tunnel connected (remote:%d -> local:%d)\n", remotePort, localPort)
 	}
 
 	// Verify remote binary is functional
 	shimTestCmd := fmt.Sprintf("%s status 2>&1", remoteBin)
-	shimOut, shimErr := session.Exec(shimTestCmd)
+	shimOut, shimErr := ops.remoteStatus(session, shimTestCmd)
 	if shimErr != nil {
 		fmt.Printf("      WARNING: remote cc-clip status failed: %s\n", shimOut)
 		fmt.Println("      The remote binary may be missing or broken.")
 		fmt.Println("      Re-run with --force to redeploy: cc-clip connect <base-host> --force")
-		if strings.TrimSpace(shimOut) == "" {
-			return fmt.Errorf("remote binary verification failed")
+		verifyErr := fmt.Errorf("remote binary verification failed")
+		if strings.TrimSpace(shimOut) != "" {
+			verifyErr = fmt.Errorf("remote binary verification failed: %s", strings.TrimSpace(shimOut))
 		}
-		return fmt.Errorf("remote binary verification failed: %s", strings.TrimSpace(shimOut))
+		if tunnelStarted {
+			if stopErr := ops.stopPersistentTunnel(localPort, host); stopErr != nil {
+				return fmt.Errorf("%w; additionally failed to stop started tunnel: %v", verifyErr, stopErr)
+			}
+		}
+		return verifyErr
 	}
 	fmt.Printf("      %s\n", shimOut)
 
 	fmt.Println()
-	fmt.Printf("Setup complete. Open it with: ssh %s\n", host)
+	if opts.noTunnel {
+		fmt.Printf("Setup complete. Start the tunnel with: cc-clip tunnel up %s\n", host)
+	} else {
+		fmt.Printf("Setup complete. Tunnel is running; open a session with: ssh %s\n", host)
+	}
 	return nil
 }
 
@@ -1972,27 +2084,186 @@ func legacyPeerStateDir(peerID string) string {
 	return legacyStateDir + "/peers/" + peerID
 }
 
-func ensureManagedHostConfigForReservation(host string, localPort int, reg *peer.Registration) ([]setup.SSHConfigChange, error) {
-	if reg == nil {
-		return nil, fmt.Errorf("peer reservation is required")
+// saveConnectTunnelState records the host/port mapping locally so subsequent
+// invocations of `cc-clip tunnel up <host>` and `cc-clip tunnel list` can find
+// the tunnel parameters without consulting the remote peer registry. The
+// state is written with SSHConfigResolved=false; the daemon's /tunnels/up
+// handler will re-resolve and enrich the SSH options the first time it runs.
+// Enabled flags whether the caller intends to start the tunnel (true for the
+// normal connect flow, false when --no-tunnel defers to the operator).
+//
+// Idempotency: when re-running `cc-clip connect` against a host whose tunnel
+// is already connected with the same (LocalPort, RemotePort), preserve the
+// live runtime fields (Status, PID, StartedAt, ReconnectCount) so the
+// SwiftBar plugin and `cc-clip tunnel list` don't briefly flap a healthy
+// tunnel back to "connecting" on every reconnect. The daemon will still
+// re-resolve SSH options on the next /tunnels/up because we always reset
+// SSHConfigResolved=false above.
+func saveConnectTunnelState(host string, localPort, remotePort int, enabled bool) error {
+	status := tunnel.StatusStopped
+	if enabled {
+		status = tunnel.StatusConnecting
 	}
-	return setup.EnsureManagedHostConfig(setup.ManagedHostSpec{
-		Host:       host,
-		RemotePort: reg.ReservedPort,
-		LocalPort:  localPort,
-	})
+	state := &tunnel.TunnelState{
+		Config: tunnel.TunnelConfig{
+			Host:              host,
+			LocalPort:         localPort,
+			RemotePort:        remotePort,
+			Enabled:           enabled,
+			SSHConfigResolved: false,
+		},
+		Status: status,
+	}
+	// The preserve-live-fields branch only applies when the caller is about
+	// to (re)start the tunnel AND the existing state points at the SAME
+	// remote port. A --no-tunnel re-run of `connect` must not carry Status=
+	// connected and a stale PID into the freshly-written state — the tunnel
+	// we are persisting is about to be idle. A re-run with a different
+	// RemotePort must also not keep a stale PID pointing at the old forward.
+	if enabled {
+		if existing, err := tunnel.LoadState(tunnel.DefaultStateDir(), host, localPort); err == nil &&
+			existing != nil &&
+			existing.Config.RemotePort == remotePort &&
+			existing.Status == tunnel.StatusConnected {
+			state.Status = tunnel.StatusConnected
+			state.PID = existing.PID
+			state.StartedAt = existing.StartedAt
+			state.ReconnectCount = existing.ReconnectCount
+		}
+	}
+	// NOTE: Load-then-Save is not atomic. Concurrent `cc-clip connect
+	// <same-host>` runs could both observe the same `existing` state and
+	// then race on the final SaveState, with the later writer winning
+	// non-deterministically. Connects are not expected to run in parallel;
+	// automation that orchestrates multiple connects should serialize them.
+	return tunnel.SaveState(tunnel.DefaultStateDir(), state)
+}
+
+// connectTunnelUpTimeout is the deadline connectStartPersistentTunnel waits
+// for the daemon to report the tunnel as connected. The daemon's ssh spawn,
+// forward bind, and ready-line scrape typically settle within 1-3s on a LAN
+// host; 15s gives headroom for slow links without making the CLI feel hung.
+// Exposed as a var (not const) so tests can shrink it — otherwise a full
+// unit test of the timeout path would add 15s to every test run.
+var connectTunnelUpTimeout = 15 * time.Second
+
+// connectTunnelUpPollInterval is how often connectStartPersistentTunnel
+// re-reads /tunnels while waiting for the host to reach connected state.
+// Exposed as a var (not const) so tests can shrink it alongside the timeout.
+var connectTunnelUpPollInterval = 500 * time.Millisecond
+
+// connectStartPersistentTunnel asks the daemon to start a persistent SSH
+// reverse tunnel for (host, remotePort) and waits up to connectTunnelUpTimeout
+// for it to report as connected. The poll reads /tunnels via the existing
+// tunnel-control HTTP path; the caller is expected to have already verified
+// the daemon is reachable earlier in the connect flow.
+func connectStartPersistentTunnel(daemonPort int, host string, remotePort int) error {
+	return connectStartPersistentTunnelWith(daemonPort, host, remotePort, postTunnelUp, fetchTunnelList)
+}
+
+// connectStartPersistentTunnelWith is the inner implementation with injectable
+// HTTP funcs so tests can feed synthetic /tunnels responses without standing
+// up a real daemon.
+func connectStartPersistentTunnelWith(
+	daemonPort int,
+	host string,
+	remotePort int,
+	postUp func(int, string, int) error,
+	fetchList func(int) ([]*tunnel.TunnelState, error),
+) error {
+	if err := postUp(daemonPort, host, remotePort); err != nil {
+		return fmt.Errorf("daemon could not start tunnel for %s: %w", host, err)
+	}
+	deadline := time.Now().Add(connectTunnelUpTimeout)
+	var (
+		lastStatus  tunnel.Status
+		lastErr     string
+		lastHostHit bool
+		lastSummary string
+	)
+	for {
+		states, fetchErr := fetchList(daemonPort)
+		if fetchErr != nil {
+			return fmt.Errorf("cannot read tunnel status: %w", fetchErr)
+		}
+		lastHostHit = false
+		lastSummary = summarizeTunnelStatesForHost(states, host)
+		for _, s := range states {
+			if s == nil {
+				continue
+			}
+			if !strings.EqualFold(s.Config.Host, host) {
+				continue
+			}
+			if s.Config.LocalPort != daemonPort {
+				continue
+			}
+			lastHostHit = true
+			lastStatus = s.Status
+			lastErr = s.LastError
+			if s.Status == tunnel.StatusConnected {
+				return nil
+			}
+		}
+		// Fast-fail: if the daemon already knows about this host on some other
+		// local port but not on ours, no amount of waiting will promote it to
+		// our daemonPort. Surface the mismatch immediately.
+		if !lastHostHit && lastSummary != "" {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(connectTunnelUpPollInterval)
+	}
+	status := string(lastStatus)
+	if status == "" {
+		status = "unknown"
+	}
+	suffix := ""
+	// If we never saw any state whose LocalPort matched daemonPort, help the
+	// operator debug why: the daemon may own the tunnel under a different
+	// local port, or the state file may be stale. Surface whatever we did see.
+	if !lastHostHit && lastSummary != "" {
+		suffix = fmt.Sprintf("; no tunnel owned by daemon on port %d; daemon reports: %s", daemonPort, lastSummary)
+	}
+	if lastErr != "" {
+		return fmt.Errorf("tunnel for %s did not reach connected state within %s (status=%s, last error: %s)%s", host, connectTunnelUpTimeout, status, lastErr, suffix)
+	}
+	return fmt.Errorf("tunnel for %s did not reach connected state within %s (status=%s)%s", host, connectTunnelUpTimeout, status, suffix)
+}
+
+// summarizeTunnelStatesForHost renders a compact "host@local->remote=status"
+// list of every saved state matching host (regardless of local port) for use
+// in diagnostic error messages. Returns "" when no matching state is seen so
+// callers can omit the suffix entirely in the common case.
+func summarizeTunnelStatesForHost(states []*tunnel.TunnelState, host string) string {
+	parts := make([]string, 0, len(states))
+	for _, s := range states {
+		if s == nil {
+			continue
+		}
+		if !strings.EqualFold(s.Config.Host, host) {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s@%d->%d=%s", s.Config.Host, s.Config.LocalPort, s.Config.RemotePort, s.Status))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ", ")
 }
 
 type tokenOnlyFallbackCleanupOps struct {
-	removeManagedHostConfig func(string) error
-	releasePeer             func() error
+	removePersistentTunnel func(host string, localPort int) error
+	releasePeer            func() error
 }
 
-func cleanupCreatedTokenOnlyFallback(host string, ops tokenOnlyFallbackCleanupOps) error {
+func cleanupCreatedTokenOnlyFallback(host string, localPort int, ops tokenOnlyFallbackCleanupOps) error {
 	var errs []error
-	if ops.removeManagedHostConfig != nil {
-		if err := ops.removeManagedHostConfig(host); err != nil {
-			errs = append(errs, fmt.Errorf("remove Host %s cc-clip config: %w", host, err))
+	if ops.removePersistentTunnel != nil {
+		if err := ops.removePersistentTunnel(host, localPort); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove persistent tunnel for %s: %w", host, err))
 		}
 	}
 	if ops.releasePeer != nil {
@@ -2225,7 +2496,13 @@ func bestEffortReleasePeer(session *shim.SSHSession, remoteBin, peerID string, a
 	if !allowRelease {
 		return
 	}
-	_, _ = cleanupAndReleasePeer(session, remoteBin, peerID)
+	// Surface release failures via Printf so operators can correlate a stuck
+	// remote reservation with the failing connect. We deliberately swallow
+	// the error (rollback is best-effort) but a silent swallow makes the next
+	// connect's "port already reserved" confusing.
+	if _, err := cleanupAndReleasePeer(session, remoteBin, peerID); err != nil {
+		log.Printf("      warning: rollback could not release remote peer reservation: %v", err)
+	}
 }
 
 // runConnectCodex executes steps 8-11 of the Codex deploy flow.

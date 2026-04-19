@@ -3,19 +3,18 @@ package doctor
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/peer"
-	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/shellutil"
 	"github.com/shunmei/cc-clip/internal/shim"
 	"github.com/shunmei/cc-clip/internal/token"
+	"github.com/shunmei/cc-clip/internal/tunnel"
 )
 
 // remoteExecTimeout bounds each SSH doctor probe. A firewalled or unreachable
@@ -28,19 +27,48 @@ const remoteExecTimeout = 15 * time.Second
 // that a high-latency link or slow auth (e.g. pinentry, U2F touch) succeeds.
 const sshConnectTimeout = 5
 
-var sshConfigQuery = func(candidate string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), remoteExecTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "ssh", "-G", candidate)
-	hideConsoleWindow(cmd)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+// loadTunnelStatesForHost is a package-level indirection so tests can stub
+// the saved-state lookup without touching the user's real state directory.
+// Nil slots (from malformed state files that somehow slipped past
+// LoadStatesForHost) are filtered so callers can assume every slice element
+// is dereferenceable.
+var loadTunnelStatesForHost = func(host string) ([]*tunnel.TunnelState, error) {
+	states, err := tunnel.LoadStatesForHost(tunnel.DefaultStateDir(), host)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*tunnel.TunnelState, 0, len(states))
+	for _, s := range states {
+		if s != nil {
+			out = append(out, s)
+		}
+	}
+	return out, nil
 }
 
-var readManagedTunnelPorts = setup.ReadManagedTunnelPorts
+// readLocalSSHConfig is a package-level indirection so tests can stub the
+// user's ~/.ssh/config without touching the real file.
+var readLocalSSHConfig = func() ([]byte, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(home, ".ssh", "config"))
+}
 
 func RunRemote(host string, port int) []CheckResult {
 	var results []CheckResult
+
+	// Defense-in-depth: validate host before any exec.Command("ssh", host, …)
+	// downstream. The CLI is the ostensible source of truth for --host, but
+	// the tunnel manager already runs this check at every boundary; keeping
+	// the doctor consistent means a typo or pasted "-oProxyCommand=…" yields
+	// a clean error instead of a malformed ssh invocation.
+	if err := tunnel.ValidateSSHHost(host); err != nil {
+		results = append(results, CheckResult{"ssh", false, fmt.Sprintf("invalid --host %q: %v", host, err)})
+		return results
+	}
+
 	ident, identErr := peer.LoadOrCreateLocalIdentity()
 	var reg *peer.Registration
 	var (
@@ -59,6 +87,16 @@ func RunRemote(host string, port int) []CheckResult {
 		return results
 	}
 	results = append(results, CheckResult{"ssh", true, fmt.Sprintf("connected to %s", host)})
+
+	// Passive advisory: surface a leftover "# >>> cc-clip managed host: …"
+	// block in the local ~/.ssh/config. cc-clip no longer reads or writes
+	// that file, but interactive `ssh <host>` sessions will still try to
+	// bind the legacy reverse forward and print a confusing
+	// "Warning: remote port forwarding failed" line. We do NOT auto-clean
+	// — that is intentionally a manual step per CLAUDE.md.
+	if r := checkLegacyManagedBlock(host); r != nil {
+		results = append(results, *r)
+	}
 
 	// Check remote binary
 	out, err = remoteExecNoForward(host, "~/.local/bin/cc-clip version")
@@ -103,25 +141,24 @@ func RunRemote(host string, port int) []CheckResult {
 		results = append(results, CheckResult{"path-order", false, fmt.Sprintf("%s resolves to %s (shim not first)", checkTarget, strings.TrimSpace(out))})
 	}
 
-	managedResults, managedPorts := checkManagedPortAlignment(host, reg)
-	results = append(results, managedResults...)
-
-	aliasLocalPort := port
-	if managedPorts != nil && managedPorts.LocalPort > 0 {
-		aliasLocalPort = managedPorts.LocalPort
-	}
-	results = append(results, checkAliasPort(host, reg, aliasLocalPort)...)
+	tunnelStateResults, savedState := checkTunnelStateAlignment(host, reg, port)
+	results = append(results, tunnelStateResults...)
 
 	// Check tunnel from remote side
-	remotePort := port
+	remotePort := 0
 	if reg != nil && reg.ReservedPort != 0 {
 		remotePort = reg.ReservedPort
+	} else if savedState != nil && savedState.Config.RemotePort != 0 {
+		remotePort = savedState.Config.RemotePort
 	}
 	// Use a POSIX-sh probe that tries, in order: curl (most portable, common
 	// on Linux/macOS), nc (BSD or GNU), bash /dev/tcp (bash-only fallback).
 	// The previous bash-only /dev/tcp probe silently reported failure on
 	// dash/busybox/alpine hosts even when the tunnel was healthy.
-	probeScript := fmt.Sprintf(`sh -c '
+	if remotePort == 0 {
+		results = append(results, CheckResult{"tunnel", false, "cannot determine remote tunnel port (missing peer registration and no matching saved tunnel state)"})
+	} else {
+		probeScript := fmt.Sprintf(`sh -c '
 p=%d
 if command -v curl >/dev/null 2>&1; then
   if curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:$p/health"; then echo tunnel ok; exit 0; fi
@@ -134,11 +171,12 @@ if command -v bash >/dev/null 2>&1; then
 fi
 echo tunnel fail
 '`, remotePort)
-	out, err = remoteExecNoForward(host, probeScript)
-	if strings.Contains(out, "tunnel ok") {
-		results = append(results, CheckResult{"tunnel", true, fmt.Sprintf("port %d forwarded", remotePort)})
-	} else {
-		results = append(results, CheckResult{"tunnel", false, fmt.Sprintf("port %d not reachable from remote (%s)", remotePort, strings.TrimSpace(out))})
+		out, err = remoteExecNoForward(host, probeScript)
+		if strings.Contains(out, "tunnel ok") {
+			results = append(results, CheckResult{"tunnel", true, fmt.Sprintf("port %d forwarded", remotePort)})
+		} else {
+			results = append(results, CheckResult{"tunnel", false, fmt.Sprintf("port %d not reachable from remote (%s)", remotePort, strings.TrimSpace(out))})
+		}
 	}
 
 	// Check token on remote
@@ -373,91 +411,120 @@ func isLegacyPeerLookupError(err error) bool {
 		strings.Contains(msg, "peer show failed: peer ") && strings.Contains(msg, " not found")
 }
 
-func checkManagedPortAlignment(host string, reg *peer.Registration) ([]CheckResult, *setup.ManagedTunnelPorts) {
+// checkTunnelStateAlignment validates that the locally-saved tunnel state for
+// the host is consistent with the remote peer registration. The saved state
+// is now the canonical local record of (host, remote-port, daemon local port);
+// it replaces the old managed-block-in-~/.ssh/config check. The second return
+// value is the matching tunnel state (if any) so the caller can derive the
+// remote port from saved state even when the peer registration is missing.
+func checkTunnelStateAlignment(host string, reg *peer.Registration, localPort int) ([]CheckResult, *tunnel.TunnelState) {
+	states, err := loadTunnelStatesForHost(host)
+	if err != nil {
+		return []CheckResult{{"tunnel-state", false, fmt.Sprintf("cannot read local tunnel state: %v", err)}}, nil
+	}
 	if reg == nil || reg.ReservedPort == 0 {
-		return []CheckResult{{"ssh-managed", true, "peer SSH forwarding not configured; skipping managed block check"}}, nil
+		savedState, ok := selectSavedTunnelState(states, localPort)
+		if ok {
+			return []CheckResult{{"tunnel-state", true, fmt.Sprintf("peer SSH forwarding not configured; using saved tunnel state (remote:%d -> local:%d)", savedState.Config.RemotePort, savedState.Config.LocalPort)}}, savedState
+		}
+		if len(states) == 0 {
+			return []CheckResult{{"tunnel-state", true, "peer SSH forwarding not configured; skipping local tunnel state check"}}, nil
+		}
+		if localPort > 0 {
+			return []CheckResult{{"tunnel-state", false, fmt.Sprintf("peer SSH forwarding not configured and no saved tunnel state for %s on local port %d", host, localPort)}}, nil
+		}
+		return []CheckResult{{"tunnel-state", false, fmt.Sprintf("peer SSH forwarding not configured and multiple saved tunnel states exist for %s; rerun doctor with --port <local-port>", host)}}, nil
 	}
-
-	ports, err := readManagedTunnelPorts(host)
-	if err != nil {
-		return []CheckResult{{"ssh-managed", false, managedBlockReadError(host, err)}}, nil
+	if len(states) == 0 {
+		return []CheckResult{{"tunnel-state", false, fmt.Sprintf("no local tunnel state for %s; run 'cc-clip connect %s' to record it", host, host)}}, nil
 	}
-	if ports.RemotePort == 0 || ports.LocalPort == 0 {
-		return []CheckResult{{"ssh-managed", false, fmt.Sprintf("local managed block for %s is missing RemoteForward; run 'cc-clip connect %s'", host, host)}}, &ports
+	if localPort > 0 {
+		savedState, ok := selectSavedTunnelState(states, localPort)
+		if !ok || savedState == nil {
+			return []CheckResult{{"tunnel-state", false, fmt.Sprintf("no local tunnel state for %s on local port %d; rerun doctor with --port <local-port> or run 'cc-clip connect %s' to record it", host, localPort, host)}}, nil
+		}
+		if savedState.Config.RemotePort == reg.ReservedPort {
+			return []CheckResult{{"tunnel-state", true, fmt.Sprintf("saved tunnel state matches remote register (remote:%d -> local:%d)", savedState.Config.RemotePort, savedState.Config.LocalPort)}}, savedState
+		}
+		return []CheckResult{{"tunnel-state", false, fmt.Sprintf("saved tunnel state for %s on local port %d uses remote port %d, but remote register uses %d; rerun 'cc-clip connect %s' to resync", host, savedState.Config.LocalPort, savedState.Config.RemotePort, reg.ReservedPort, host)}}, nil
 	}
-	if ports.RemotePort != reg.ReservedPort {
-		return []CheckResult{{"ssh-managed", false, fmt.Sprintf("remote register port %d != managed block remote port %d; rerun `cc-clip connect %s` to resync", reg.ReservedPort, ports.RemotePort, host)}}, &ports
-	}
-	return []CheckResult{{"ssh-managed", true, fmt.Sprintf("remote register port %d matches managed block remote port %d (target 127.0.0.1:%d)", reg.ReservedPort, ports.RemotePort, ports.LocalPort)}}, &ports
-}
-
-func managedBlockReadError(host string, err error) string {
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return "cannot compare remote register to local managed block: ~/.ssh/config not found"
-	case errors.Is(err, setup.ErrSSHHostBlockNotFound):
-		return fmt.Sprintf("cannot compare remote register to local managed block: Host %s not found in ~/.ssh/config", host)
-	default:
-		return fmt.Sprintf("cannot compare remote register to local managed block: %v", err)
-	}
-}
-
-func checkAliasPort(host string, reg *peer.Registration, localPort int) []CheckResult {
-	if reg == nil || reg.ReservedPort == 0 {
-		return []CheckResult{{"ssh-alias", true, "peer SSH forwarding not configured; skipping effective ssh config check"}}
-	}
-
-	out, err := sshConfigQuery(host)
-	if err != nil {
-		return []CheckResult{{"ssh-alias", false, fmt.Sprintf("ssh -G %s failed: %v; cannot verify effective RemoteForward", host, err)}}
-	}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if matchesRemoteForward(line, reg.ReservedPort, "127.0.0.1", localPort) {
-			return []CheckResult{{"ssh-alias", true, fmt.Sprintf("effective ssh config forwards %d 127.0.0.1:%d", reg.ReservedPort, localPort)}}
+	for _, s := range states {
+		if s != nil && s.Config.RemotePort == reg.ReservedPort {
+			return []CheckResult{{"tunnel-state", true, fmt.Sprintf("saved tunnel state matches remote register (remote:%d -> local:%d)", s.Config.RemotePort, s.Config.LocalPort)}}, s
 		}
 	}
-	return []CheckResult{{"ssh-alias", false, fmt.Sprintf("effective ssh config missing RemoteForward %d 127.0.0.1:%d", reg.ReservedPort, localPort)}}
+	// On mismatch, return nil rather than an arbitrary states[0]: picking an
+	// unrelated saved tunnel's RemotePort here would mislead the downstream
+	// reachability probe in RunRemote if the peer registration ever stops
+	// overriding savedState (a change that is one-line away, see RunRemote's
+	// "else if savedState != nil" branch).
+	return []CheckResult{{"tunnel-state", false, fmt.Sprintf("remote register port %d not found in saved tunnel states for %s; rerun 'cc-clip connect %s' to resync", reg.ReservedPort, host, host)}}, nil
 }
 
-func matchesRemoteForward(line string, listenPort int, targetHost string, targetPort int) bool {
-	fields := strings.Fields(strings.TrimSpace(line))
-	if len(fields) < 3 || fields[0] != "remoteforward" {
-		return false
-	}
-
-	if fields[1] != fmt.Sprintf("%d", listenPort) {
-		return false
-	}
-
-	host, port, ok := parseForwardTarget(fields[2])
-	return ok && host == targetHost && port == targetPort
-}
-
-func parseForwardTarget(s string) (string, int, bool) {
-	if strings.HasPrefix(s, "[") {
-		end := strings.Index(s, "]")
-		if end == -1 || end+2 > len(s) || s[end+1] != ':' {
-			return "", 0, false
-		}
-		host := s[1:end]
-		port, err := strconv.Atoi(s[end+2:])
-		if err != nil {
-			return "", 0, false
-		}
-		return host, port, true
-	}
-
-	idx := strings.LastIndex(s, ":")
-	if idx <= 0 || idx+1 >= len(s) {
-		return "", 0, false
-	}
-	host := s[:idx]
-	port, err := strconv.Atoi(s[idx+1:])
+// checkLegacyManagedBlock reads the local ~/.ssh/config and emits a passive
+// advisory if a leftover "# >>> cc-clip managed host: …" block is still
+// present. Returns nil when the file is absent, unreadable, or clean —
+// emitting a passing check for a non-existent file would be noise.
+//
+// The check is intentionally non-fatal and reports OK=true: the presence of
+// a legacy block does not mean anything is broken, only that an interactive
+// `ssh <host>` will print a cosmetic "remote port forwarding failed"
+// warning. Flipping `cc-clip doctor --host` to exit 1 on a cosmetic issue
+// would break any CI/script that gates on doctor's exit code. We never
+// auto-clean the file (per CLAUDE.md — migration is deliberately manual).
+//
+// When the block specifically names `host`, the message is precise. When it
+// matches a different alias, the advisory still fires so users notice, but
+// the wording is generic so they understand the mismatch.
+func checkLegacyManagedBlock(host string) *CheckResult {
+	data, err := readLocalSSHConfig()
 	if err != nil {
-		return "", 0, false
+		// Missing or unreadable ssh config — nothing to advise about.
+		return nil
 	}
-	return host, port, true
+	const markerPrefix = "# >>> cc-clip managed host:"
+	s := string(data)
+	if !strings.Contains(s, markerPrefix) {
+		return nil
+	}
+	specificMarker := markerPrefix + " " + host
+	var message string
+	if strings.Contains(s, specificMarker) {
+		message = fmt.Sprintf(
+			"leftover '%s …' block in ~/.ssh/config; cc-clip no longer manages this file — delete the block manually (see docs/troubleshooting.md 'Upgrade Leftover: Legacy Managed Block')",
+			specificMarker,
+		)
+	} else {
+		message = fmt.Sprintf(
+			"leftover '%s …' block in ~/.ssh/config for a different host alias; cc-clip no longer manages this file — delete the block manually (see docs/troubleshooting.md 'Upgrade Leftover: Legacy Managed Block')",
+			markerPrefix,
+		)
+	}
+	// OK=true: cosmetic advisory. The doctor exit code must not flip on a
+	// leftover block that does not actually break the daemon-owned tunnel.
+	return &CheckResult{
+		Name:    "ssh-config-legacy",
+		OK:      true,
+		Message: message,
+	}
+}
+
+// selectSavedTunnelState picks the saved state that best matches the caller's
+// localPort, if any. loadTunnelStatesForHost guarantees no nil slots so this
+// function does not defensively re-check for them.
+func selectSavedTunnelState(states []*tunnel.TunnelState, localPort int) (*tunnel.TunnelState, bool) {
+	if localPort > 0 {
+		for _, s := range states {
+			if s.Config.LocalPort == localPort {
+				return s, true
+			}
+		}
+		return nil, false
+	}
+	if len(states) == 1 {
+		return states[0], true
+	}
+	return nil, false
 }
 
 func shellQuote(s string) string {
