@@ -276,6 +276,11 @@ ssh -N -v -o BatchMode=yes -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
     -o ControlMaster=no -o ControlPath=none \
     -R <remote-port>:127.0.0.1:<local-port> myserver
+# Note: the `-o ControlMaster=no -o ControlPath=none` flags above come
+# from the daemon's argv (it builds the tunnel ssh invocation itself),
+# NOT from your ~/.ssh/config. cc-clip does not write those directives
+# to your ssh config. See "Daemon-owned Tunnel vs ssh_config" below.
+#
 # Interpret the output:
 # - "Permission denied"         → see "Stuck in connecting" (auth)
 # - "remote port forwarding failed for listen port" → stale sshd on remote (kill it with `sudo kill <pid>` using `sudo ss -tlnp | grep <remote-port>`)
@@ -372,8 +377,97 @@ The plugin's dropdown maps common error strings (401, 404, connection refused) t
 
 ---
 
-## Troubleshooting Assumes cc-clip Does Not Edit `~/.ssh/config`
+## `~/.ssh/config` Edits: Scope and Limits
 
-As of the current release, `cc-clip setup` / `connect` / `uninstall --host` do **not** read or write `~/.ssh/config` at all. The local cc-clip daemon owns the reverse tunnel directly (it spawns `ssh -N -R <remote>:127.0.0.1:<local> <host>` with `BatchMode=yes`, `ControlMaster=no`, `ControlPath=none`), so no SSH-config directives are needed. If a check below suggests running a specific `cc-clip` command, it is safe to do so — none of them will rewrite your SSH config.
+`cc-clip setup` / `connect` / `connect --token-only` writes exactly **one** thing to `~/.ssh/config`: a cc-clip-managed `SetEnv` block wrapped in marker comments, inserted inside your existing `Host <alias>` entry when that host does not already contain a user-authored `SetEnv`. This block is what makes multi-laptop-on-shared-account work (see README: "Multi-laptop on a Shared Remote Account"):
+
+```
+Host myalias
+  HostName srv.example.com
+  User shareduser
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/shareduser/.cache/cc-clip/peers/<peerID>
+  # <<< cc-clip SetEnv (do not edit) <<<
+```
+
+The self-release path `cc-clip uninstall --host <host> --peer` removes this marker block after the remote cleanup succeeds. Plain `cc-clip uninstall --host <host>` preserves the local block because it only removes the remote PATH marker and does not tear down the workstation's peer reservation. If the SSH cleanup step fails, cc-clip warns and preserves the local block so it does not desynchronize a still-installed remote shim. cc-clip does not rewrite unrelated `SetEnv` lines you already manage by hand.
+
+The local daemon still owns the **reverse tunnel** itself: it spawns `ssh -N -R <remote>:127.0.0.1:<local> <host>` with `BatchMode=yes`, `ControlMaster=no`, `ControlPath=none`, independently of your `~/.ssh/config`. cc-clip does **not** write `RemoteForward`, `ControlMaster`, `ControlPath`, or any other tunnel-related directive to your SSH config.
 
 Users upgrading from a pre-daemon-tunnel release must delete the legacy `# >>> cc-clip managed host: … >>>` block manually — see "Upgrade Leftover: Legacy Managed Block in `~/.ssh/config`" above. cc-clip ships no migration scaffolding for this.
+
+### `cc-clip setup` / `connect` / `connect --token-only` warns: "no `Host <alias>` block found"
+
+`cc-clip setup <host>`, `cc-clip connect <host>`, and `cc-clip connect <host> --token-only` require that `~/.ssh/config` already contains a literal `Host <host>` entry. If it doesn't, the rest of the flow still succeeds but prints a warning and skips the SetEnv injection — which means a single-laptop run works, but a second laptop sharing the same remote Unix account will trample the first laptop's shim port. Add the entry and re-run:
+
+```
+Host myalias
+  HostName srv.example.com
+  User shareduser
+```
+
+Then `cc-clip setup myalias`, `cc-clip connect myalias`, or `cc-clip connect myalias --token-only` again — the SetEnv block will be appended inside it.
+
+### `cc-clip setup` / `connect` warns: "no literal `Host <alias>` block in top-level ssh_config; cc-clip does not walk Include directives"
+
+This variant of the missing-Host warning fires when the top-level `~/.ssh/config` contains `Include` directives (e.g. `Include ~/.ssh/config.d/*`) but no literal `Host <alias>` block that matches the alias. cc-clip deliberately does **not** follow `Include` chains — walking them would let a path-traversal exploit in an included file rewrite an unrelated one. The alias might legitimately live in an included fragment, but cc-clip cannot safely confirm that, so it fails loud.
+
+The fix is one of:
+
+- **Inline the Host block** into `~/.ssh/config` itself so cc-clip can see it:
+
+  ```
+  Host myalias
+    HostName srv.example.com
+    User shareduser
+  ```
+
+- **Move the SetEnv block manually** into the included fragment. You can read the exact SetEnv line cc-clip would emit with `cc-clip doctor --host myalias` (after a successful `connect`) and paste it into your included file yourself. This is a one-time manual step; subsequent `cc-clip setup` / `connect` runs will keep warning unless the Host block moves into the top-level file.
+
+- **Disable the Include** and re-run setup. Not recommended if your included files carry other hosts you need.
+
+### `cc-clip setup` / `connect` warns: "Host is matched only by a wildcard or negation pattern"
+
+cc-clip refuses to inject `SetEnv` into `Host` blocks whose only applicable token is a wildcard (`Host *`, `Host *.example.com`, `Host srv?`) or a negation (`!alias`). Wildcard patterns match multiple hosts; writing per-peer `CC_CLIP_*` there would leak your laptop's token path and port to every host that matches. Negation blocks have semantics that don't map cleanly to a per-alias injection. The fix is to add a **literal** `Host <alias>` entry alongside (or before) the existing block:
+
+```
+# NEW — literal entry for cc-clip to inject into
+Host myalias
+  HostName srv.example.com
+
+# existing — still applies to everything that matches the glob
+Host *.example.com
+  User shareduser
+```
+
+OpenSSH processes all matching `Host` blocks and applies the first value it sees for each option, so layering a literal block over a glob is safe.
+
+`Match host <alias>` blocks are also skipped: `SetEnv` inside a `Match` block has surprising scoping rules, and cc-clip restricts injection to plain `Host` blocks to keep the behaviour predictable.
+
+### `cc-clip setup` / `connect` warns: "Host already has a user-authored SetEnv directive"
+
+OpenSSH only honors the first `SetEnv` directive it sees for a host. If your target `Host <alias>` stanza already has a `SetEnv`, cc-clip refuses to inject its own second `SetEnv` line because that would either shadow your existing vars or be shadowed by them. In this case, merge the two cc-clip vars into your existing first `SetEnv` manually:
+
+```sshconfig
+Host myalias
+  HostName srv.example.com
+  SetEnv FOO=bar CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/shareduser/.cache/cc-clip/peers/<peerID>
+```
+
+---
+
+## Notifications Silently Drop — Inspect `notify-health.log` and `CC_CLIP_STRICT`
+
+The remote `cc-clip-hook` script is fire-and-forget by design: any failure posting to the local daemon's `/notify` endpoint is logged but never blocks Claude Code. If notifications aren't arriving on your workstation:
+
+```bash
+# On the remote: inspect the last few hook failures.
+# Each line is: <UTC timestamp> FAIL http=<status>
+# http=401 → notify nonce mismatch (re-run `cc-clip connect <host>` to resync)
+# http=404 → daemon is running an old build without /notify (upgrade cc-clip)
+# http=000 → connection never reached the daemon (tunnel down, daemon down,
+#            curl missing on the remote, or another transport failure)
+tail -n 20 "${CC_CLIP_STATE_DIR:-$HOME/.cache/cc-clip}/notify-health.log"
+```
+
+If you want the hook to fail loudly for debugging (non-2xx → exit 1 + stdout line), set `CC_CLIP_STRICT=1` in the environment Claude Code invokes the hook from. A normal `cc-clip connect <host>` run with notifications enabled and the tunnel active uses the same strict probe once during setup; `--no-notify` and `--no-tunnel` skip that validation.

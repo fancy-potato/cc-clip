@@ -30,6 +30,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/setup"
 	"github.com/shunmei/cc-clip/internal/shellutil"
 	"github.com/shunmei/cc-clip/internal/shim"
+	"github.com/shunmei/cc-clip/internal/sshconfig"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
 	"github.com/shunmei/cc-clip/internal/x11bridge"
@@ -112,8 +113,12 @@ Remote:
     --target         auto|xclip|wl-paste (default: auto; auto removes the installed shim when exactly one exists)
     --path           Install directory (default: ~/.local/bin)
     --host           Clean up PATH marker on remote host instead of local shim
-    --peer           Release the remote peer lease AND local tunnel state for --host (bare; auto-discovers your peer id)
-    --peer-id <id>   Release a specific peer id (overrides the local identity lookup; rare)
+    --peer           Release the remote peer lease, remote PATH shim, AND local tunnel state for --host (bare; auto-discovers your peer id)
+    --peer-id <id|self> Release a specific peer id (or literal "self" to force
+                     this workstation's cleanup path; rare).
+                     When <id> != your local peer, the remote lease is released but
+                     THIS workstation's tunnel state (under ~/.cache/cc-clip/tunnels/) is
+                     left intact — only the "bare --peer / --peer-id self" case wipes local state.
     --codex          Remove Codex support (local-only, or --host for remote)
     # For a complete removal run in order:
     #   cc-clip uninstall --host <host> --peer      # remote shim + peer + local tunnel state
@@ -576,6 +581,15 @@ func cmdUninstall() {
 	targetStr := getFlag("target", "auto")
 	installPath := getFlag("path", "")
 	host := getFlag("host", "")
+	// Validate host early (only when set — empty host means local-only
+	// uninstall). Consistent with cmdConnect / cmdSetup / cmdUninstallPeer,
+	// which all reject malformed aliases before spawning ssh or touching
+	// ~/.ssh/config via internal/sshconfig.
+	if host != "" {
+		if err := tunnel.ValidateSSHHost(host); err != nil {
+			log.Fatalf("uninstall failed: invalid host: %v", err)
+		}
+	}
 	// --peer is a boolean trigger ("also release the peer lease for this host")
 	// so the README example `cc-clip uninstall --host myserver --peer` works.
 	// --peer-id <id> remains the escape hatch for releasing a non-local peer
@@ -612,8 +626,9 @@ func cmdUninstall() {
 	}
 
 	if err := runShimUninstall(target, installPath, host, uninstallOps{
-		uninstallLocalShim: shim.Uninstall,
-		removeRemotePath:   shim.RemoveRemotePath,
+		uninstallLocalShim:     shim.Uninstall,
+		removeRemotePath:       shim.RemoveRemotePath,
+		countRemoteActivePeers: countRemoteActivePeersOverSSH,
 	}); err != nil {
 		log.Fatalf("uninstall failed: %v", err)
 	}
@@ -622,16 +637,75 @@ func cmdUninstall() {
 type uninstallOps struct {
 	uninstallLocalShim func(shim.Target, string) error
 	removeRemotePath   func(string) error
+	// countRemoteActivePeers queries the remote cc-clip peer registry and
+	// returns how many peers are still registered. The host-mode uninstall
+	// (`cc-clip uninstall --host H`) uses this to skip the shared PATH
+	// marker cleanup when other laptops on the same Unix account still
+	// depend on it. A non-nil error preserves the PATH marker (fail safe).
+	countRemoteActivePeers func(host string) (int, error)
+}
+
+// countRemoteActivePeersOverSSH opens a short-lived SSH session to the
+// host to invoke `cc-clip peer list`. Lives in cmd/cc-clip because it
+// bridges the internal/shim SSHSession type with the injectable hook on
+// uninstallOps — adding it to internal/shim would force shim to carry
+// the uninstallOps wiring it doesn't otherwise need.
+func countRemoteActivePeersOverSSH(host string) (int, error) {
+	session, err := shim.NewSSHSession(host)
+	if err != nil {
+		return 0, fmt.Errorf("open ssh session: %w", err)
+	}
+	defer session.Close()
+	return countRemoteActivePeers(session, "~/.local/bin/cc-clip")
+}
+
+// legacyManagedBlockAdvisor is a package-level indirection so tests can stub
+// the ~/.ssh/config advisory without touching the real file. Real callers
+// delegate to the doctor package, which already owns the detection logic.
+var legacyManagedBlockAdvisor = doctor.LegacyManagedBlockAdvisory
+var loadLocalPeerIdentity = peer.LoadLocalIdentity
+
+// printLegacyManagedBlockAdvisoryIfAny prints the same advisory that
+// `cc-clip doctor` emits when the user's ~/.ssh/config still carries a
+// pre-daemon-tunnel `# >>> cc-clip managed host: …` block. Silent if clean.
+// Users who run `uninstall` without also running `doctor` would otherwise
+// never see the manual-cleanup guidance.
+func printLegacyManagedBlockAdvisoryIfAny(host string) {
+	if msg := legacyManagedBlockAdvisor(host); msg != "" {
+		fmt.Printf("Note: %s\n", msg)
+	}
 }
 
 func runShimUninstall(target shim.Target, installPath, host string, ops uninstallOps) error {
 	if host != "" {
+		// Gate the PATH-marker deletion on the remote peer registry: the
+		// marker block is shared by every laptop on the same Unix account,
+		// so yanking it while another peer is still using `~/.local/bin`
+		// would silently disable THEIR Claude Code clipboard shim. On any
+		// error resolving "am I the last peer?" we fail safe and preserve
+		// the marker — operators can rerun `cc-clip doctor` or remove it
+		// manually if the registry is corrupted.
+		if ops.countRemoteActivePeers != nil {
+			count, err := ops.countRemoteActivePeers(host)
+			switch {
+			case err != nil:
+				fmt.Printf("Preserving shared PATH marker on %s: unable to confirm this is the last peer (%v); rerun `cc-clip uninstall --host %s --peer` once the registry is healthy\n", host, err, host)
+				printLegacyManagedBlockAdvisoryIfAny(host)
+				return nil
+			case count > 0:
+				fmt.Printf("Preserving shared PATH marker on %s: %d other peer(s) still registered on this remote host\n", host, count)
+				printLegacyManagedBlockAdvisoryIfAny(host)
+				return nil
+			}
+		}
 		fmt.Printf("Removing PATH marker from remote %s...\n", host)
 		if err := ops.removeRemotePath(host); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to remove PATH marker: %v\n", err)
 		} else {
 			fmt.Println("PATH marker removed from remote shell rc file.")
+			fmt.Printf("Note: preserving local ~/.ssh/config SetEnv block for Host %s; remove it with `cc-clip uninstall --host %s --peer` when you are tearing down this workstation's peer as well\n", host, host)
 		}
+		printLegacyManagedBlockAdvisoryIfAny(host)
 		return nil
 	}
 
@@ -640,11 +714,12 @@ func runShimUninstall(target shim.Target, installPath, host string, ops uninstal
 	}
 
 	fmt.Println("Shim removed successfully.")
+	printLegacyManagedBlockAdvisoryIfAny("")
 	return nil
 }
 
 func cmdUninstallPeer(host, peerArg string) {
-	ident, err := peer.LoadOrCreateLocalIdentity()
+	ident, err := loadIdentityForUninstallPeer(peerArg)
 	if err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
 	}
@@ -660,6 +735,12 @@ func cmdUninstallPeer(host, peerArg string) {
 	if err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
 	}
+	if err := peer.ValidateID(peerID); err != nil {
+		log.Fatalf("uninstall peer failed: invalid peer id: %v", err)
+	}
+	if err := tunnel.ValidateSSHHost(host); err != nil {
+		log.Fatalf("uninstall peer failed: invalid host: %v", err)
+	}
 
 	session, err := shim.NewSSHSession(host)
 	if err != nil {
@@ -667,33 +748,193 @@ func cmdUninstallPeer(host, peerArg string) {
 	}
 	defer session.Close()
 
+	// INVARIANT: the remote peer lease, remote PATH marker, and local
+	// tunnel-state cleanup ALL run BEFORE removeLaptopSSHConfigSetEnv.
+	// A log.Fatalf on cleanup failure aborts the process without touching
+	// ssh_config, preserving the SetEnv block for a safe retry. See
+	// removeLaptopSSHConfigSetEnv doc for the matching contract.
+	//
+	// `cc-clip uninstall --host H --peer` is documented (see main.go help
+	// around line 123) as the single-command "remote shim + peer + local
+	// tunnel state" cleanup. The PATH-marker step here is what makes the
+	// "remote shim" part true — without it, operators following the README
+	// would be left with an orphan `~/.local/bin` PATH marker pointing at
+	// a now-unreachable daemon port.
 	if err := uninstallPeerRemoteAndConfig(managedHost, func() (*peer.Registration, error) {
 		return cleanupAndReleasePeer(session, "~/.local/bin/cc-clip", peerID)
+	}, func() error {
+		return shim.RemoveRemotePathSession(session)
+	}, func(reg *peer.Registration) error {
+		stateDir := legacyPeerStateDir(peerID)
+		if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
+			stateDir = strings.TrimSpace(reg.StateDir)
+		}
+		return connectNotifyDisable(session, stateDir)
+	}, func() (int, error) {
+		// Count peers remaining AFTER our release: the release already
+		// removed our own entry, so any survivors are other laptops
+		// sharing this remote Unix account. Used to gate the
+		// shared-asset cleanup inside uninstallPeerRemoteAndConfig.
+		return countRemoteActivePeers(session, "~/.local/bin/cc-clip")
 	}); err != nil {
 		log.Fatalf("uninstall peer failed: %v", err)
 	}
+	// managedHost != "" means the self-release path: we own this laptop's
+	// lease for `host`, so the matching ~/.ssh/config SetEnv block is ours
+	// to clean up. Cleaning a foreign peer-id's lease does not grant
+	// permission to edit this laptop's ssh config.
+	if managedHost != "" {
+		removeLaptopSSHConfigSetEnv(managedHost)
+	}
+	printLegacyManagedBlockAdvisoryIfAny(host)
+}
+
+// loadIdentityForUninstallPeer resolves the local peer identity for an
+// uninstall command. Return-value contract — read carefully before
+// refactoring, because the caller (cmdUninstallPeer) depends on the
+// asymmetry:
+//
+//   - peerArg != "" AND local identity files are missing → returns
+//     (peer.Identity{}, nil). The explicit --peer-id <id> form remains
+//     usable for foreign-peer cleanup, and the explicit `--peer-id self`
+//     form is resolved later via resolveSelfUninstallPeerTarget. The
+//     empty ident.ID signals "no managed ssh_config SetEnv block belongs
+//     to this laptop for the target peer" so the caller skips
+//     removeLaptopSSHConfigSetEnv unless the later resolver proves this
+//     is the self-cleanup path. Contract: callers MUST gate any ssh_config
+//     edit on managedHost != "", never on ident.ID != "".
+//   - peerArg == "" AND local identity missing → returns ErrLocalIdentityNotFound
+//     wrapped with an actionable hint, so bare `--peer` fails closed
+//     rather than inventing a fresh identity and orphaning the real
+//     remote reservation.
+//   - peerArg == "" AND ident.ID == "" despite no error → returns an
+//     actionable error rather than silently resolving to empty-string
+//     peerID (would match every row in the registry).
+//   - otherwise → returns the loaded identity as-is.
+//
+// The zero-value fallback on the peerArg != "" path is intentional and
+// pinned by resolveUninstallPeerTarget's explicit-peer branch.
+func loadIdentityForUninstallPeer(peerArg string) (peer.Identity, error) {
+	ident, err := loadLocalPeerIdentity()
+	if err != nil {
+		if peerArg != "" && errors.Is(err, peer.ErrLocalIdentityNotFound) {
+			return peer.Identity{}, nil
+		}
+		if errors.Is(err, peer.ErrLocalIdentityNotFound) {
+			return peer.Identity{}, fmt.Errorf("bare `--peer` requires the existing local peer identity; pass --peer-id <id> explicitly if the local identity files are gone")
+		}
+		return peer.Identity{}, err
+	}
+	if peerArg == "" && ident.ID == "" {
+		return peer.Identity{}, fmt.Errorf("local peer identity has empty ID; restore the saved identity or pass --peer-id <id> explicitly")
+	}
+	return ident, nil
 }
 
 func resolveUninstallPeerTarget(host, peerArg string, ident peer.Identity) (string, string, error) {
 	if host == "" {
 		return "", "", fmt.Errorf("--host is required; pair --peer (or --peer-id <id>) with --host <host>")
 	}
-	if peerArg == "" || peerArg == ident.ID {
+	if peerArg == "" {
+		if ident.ID == "" {
+			return "", "", fmt.Errorf("bare `--peer` requires the existing local peer identity; pass --peer-id <id> explicitly if the local identity files are gone")
+		}
+		return ident.ID, host, nil
+	}
+	if strings.EqualFold(peerArg, "self") {
+		return resolveSelfUninstallPeerTarget(host, ident)
+	}
+	if peerArg == ident.ID {
 		// "Self" case — releasing the local identity's lease for this host.
 		// Return managedHost=host so the caller tears down the local tunnel
 		// state for this (host, localPort) in addition to releasing the peer.
-		return ident.ID, host, nil
+		return peerArg, host, nil
+	}
+	if ident.ID == "" {
+		if inferred := managedPeerIDForHost(host); inferred != "" && peerArg == inferred {
+			return peerArg, host, nil
+		}
 	}
 	return peerArg, "", nil
 }
 
-func uninstallPeerRemoteAndConfig(managedHost string, remoteCleanup func() (*peer.Registration, error)) error {
+func resolveSelfUninstallPeerTarget(host string, ident peer.Identity) (string, string, error) {
+	if ident.ID != "" {
+		return ident.ID, host, nil
+	}
+	if inferred := managedPeerIDForHost(host); inferred != "" {
+		return inferred, host, nil
+	}
+	return "", "", fmt.Errorf("cannot resolve `--peer-id self` for Host %s; restore the local peer identity or the managed SetEnv block first", host)
+}
+
+func managedPeerIDForHost(host string) string {
+	path, err := sshconfig.LocalConfigPath()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	env, err := sshconfig.ReadManagedEnvFromBytes(data, host)
+	if err != nil || env == nil {
+		return ""
+	}
+	stateDir := strings.TrimSpace(env["CC_CLIP_STATE_DIR"])
+	if stateDir == "" {
+		return ""
+	}
+	parts := strings.Split(strings.TrimRight(stateDir, "/"), "/")
+	if len(parts) < 2 || parts[len(parts)-2] != "peers" {
+		return ""
+	}
+	peerID := parts[len(parts)-1]
+	if err := peer.ValidateID(peerID); err != nil {
+		return ""
+	}
+	return peerID
+}
+
+func uninstallPeerRemoteAndConfig(
+	managedHost string,
+	remoteCleanup func() (*peer.Registration, error),
+	removeRemotePath func() error,
+	removeNotify func(*peer.Registration) error,
+	countRemainingPeers func() (int, error),
+) error {
 	return uninstallPeerRemoteAndConfigWithOps(managedHost, remoteCleanup, uninstallPeerCleanupOps{
+		removeNotify:           removeNotify,
+		removeRemotePath:       removeRemotePath,
+		countRemainingPeers:    countRemainingPeers,
 		removePersistentTunnel: removePersistentTunnel,
 	})
 }
 
 type uninstallPeerCleanupOps struct {
+	// removeNotify removes host-scoped notification assets (hook script,
+	// clipcc wrapper, notify nonce/log, Codex notify config). Runs after the
+	// peer release AND only when countRemainingPeers reports zero — these
+	// assets are shared across every laptop that ever ran `cc-clip connect`
+	// against the same remote Unix account, so they must outlive every
+	// individual peer's uninstall. Optional — nil skips the step.
+	removeNotify func(*peer.Registration) error
+	// removeRemotePath strips the `~/.local/bin` PATH marker from the
+	// remote shell rc file. Same multi-peer contract as removeNotify: shared
+	// across laptops, runs only when no other peers remain. Optional — a
+	// nil value skips the step (used by tests that focus on the
+	// peer-registry + tunnel-state half of the flow).
+	removeRemotePath func() error
+	// countRemainingPeers returns the number of peers still registered on
+	// the remote host AFTER the caller's release has completed. Used to
+	// gate the shared-asset cleanup (removeNotify + removeRemotePath):
+	// zero → safe to delete; >0 → preserve. A non-nil error triggers the
+	// safe default (preserve) and is logged, not propagated, because we'd
+	// rather leak a hook script on the remote than break another laptop's
+	// active session. Optional — nil short-circuits the shared cleanup to
+	// "treat as last peer", which preserves the pre-multi-peer behavior
+	// for any test that pre-dates this op.
+	countRemainingPeers func() (int, error)
 	// removePersistentTunnel tears down every saved tunnel state for the host
 	// across all daemon local ports (passing 0 as localPort).
 	removePersistentTunnel func(host string, localPort int) error
@@ -701,25 +942,106 @@ type uninstallPeerCleanupOps struct {
 
 func uninstallPeerRemoteAndConfigWithOps(managedHost string, remoteCleanup func() (*peer.Registration, error), ops uninstallPeerCleanupOps) error {
 	reg, remoteErr := remoteCleanup()
+
+	// Resolve "am I the last peer?" once, after our release, and reuse the
+	// answer for every shared-asset branch below. The decision is
+	// best-effort: if the remote registry can't be read, fail safe by
+	// PRESERVING the shared assets rather than deleting them — a leftover
+	// hook script is recoverable, a wiped one on an active peer is not.
+	safeToRemoveShared, sharedSkipReason := resolveSafeToRemoveSharedAssets(remoteErr, managedHost, ops.countRemainingPeers)
+
+	var notifyErr error
+	notifyAttempted := false
+	notifySkipped := false
+	if remoteErr == nil && managedHost != "" && ops.removeNotify != nil {
+		if safeToRemoveShared {
+			notifyAttempted = true
+			notifyErr = ops.removeNotify(reg)
+		} else {
+			notifySkipped = true
+		}
+	}
+
+	var pathErr error
+	pathAttempted := false
+	pathSkipped := false
+	if remoteErr == nil && managedHost != "" && ops.removeRemotePath != nil {
+		if safeToRemoveShared {
+			pathAttempted = true
+			pathErr = ops.removeRemotePath()
+		} else {
+			pathSkipped = true
+		}
+	}
+
 	var tunnelErr error
-	if managedHost != "" && ops.removePersistentTunnel != nil {
+	if remoteErr == nil && managedHost != "" && ops.removePersistentTunnel != nil {
 		// localPort=0 means "every saved local_port for this host";
-		// removePersistentTunnel handles the enumeration internally.
+		// removePersistentTunnel handles the enumeration internally. The
+		// local tunnel state is per-laptop, so this is never gated on
+		// remaining-peer count.
 		tunnelErr = ops.removePersistentTunnel(managedHost, 0)
 	}
 
 	if remoteErr == nil && reg != nil {
 		fmt.Printf("Released peer %s on remote port %d\n", reg.Label, reg.ReservedPort)
+	} else if remoteErr == nil && reg == nil {
+		fmt.Println("Peer already released on remote (idempotent)")
+	}
+	if notifyAttempted && notifyErr == nil {
+		fmt.Println("Notification bridge assets removed from remote host.")
+	}
+	if pathAttempted && pathErr == nil {
+		fmt.Println("PATH marker removed from remote shell rc file.")
+	}
+	if notifySkipped || pathSkipped {
+		fmt.Printf("Preserving shared remote assets (clipcc wrapper, cc-clip-hook, Codex notify config, PATH marker): %s\n", sharedSkipReason)
 	}
 
 	var errs []error
 	if remoteErr != nil {
 		errs = append(errs, remoteErr)
 	}
+	if notifyErr != nil {
+		errs = append(errs, fmt.Errorf("failed to remove notification bridge assets: %w", notifyErr))
+	}
+	if pathErr != nil {
+		errs = append(errs, fmt.Errorf("failed to remove PATH marker: %w", pathErr))
+	}
 	if managedHost != "" && tunnelErr != nil {
 		errs = append(errs, fmt.Errorf("failed to remove persistent tunnel for Host %s: %w", managedHost, tunnelErr))
 	}
 	return errors.Join(errs...)
+}
+
+// resolveSafeToRemoveSharedAssets decides whether this uninstall run may
+// delete assets shared across every laptop on the same remote Unix
+// account (clipcc wrapper, cc-clip-hook, Codex notify config, PATH marker).
+//
+//   - remoteErr != "" or managedHost == "": the caller already won't run
+//     shared cleanup, so the returned values don't matter — we return
+//     safe=true with no reason so no "preserving" banner prints.
+//   - countRemainingPeers == nil: treated as "this is the last peer",
+//     preserving the pre-multi-peer test baseline so older test suites
+//     that don't set this op continue to see the shared cleanup fire.
+//   - count query fails: preserve (fail safe).
+//   - count > 0: preserve with a user-facing reason listing remaining peers.
+//   - count == 0: proceed with deletion.
+func resolveSafeToRemoveSharedAssets(remoteErr error, managedHost string, countRemainingPeers func() (int, error)) (bool, string) {
+	if remoteErr != nil || managedHost == "" {
+		return true, ""
+	}
+	if countRemainingPeers == nil {
+		return true, ""
+	}
+	count, err := countRemainingPeers()
+	if err != nil {
+		return false, fmt.Sprintf("unable to confirm this is the last peer (query failed: %v); other laptops sharing this remote account may still depend on them", err)
+	}
+	if count > 0 {
+		return false, fmt.Sprintf("%d other peer(s) still registered on this remote host", count)
+	}
+	return true, ""
 }
 
 func removePersistentTunnel(host string, localPort int) error {
@@ -909,10 +1231,14 @@ type connectOpts struct {
 
 func cmdConnect() {
 	if len(os.Args) < 3 {
-		log.Fatal("usage: cc-clip connect <host> [--port PORT] [--force] [--token-only] [--no-notify] [--no-tunnel]")
+		log.Fatal("usage: cc-clip connect <host> [--port PORT] [--codex] [--local-bin PATH] [--force] [--token-only] [--no-notify] [--no-tunnel]")
+	}
+	host := os.Args[2]
+	if err := tunnel.ValidateSSHHost(host); err != nil {
+		log.Fatalf("invalid host: %v", err)
 	}
 	runConnect(connectOpts{
-		host:      os.Args[2],
+		host:      host,
 		port:      getPort(),
 		force:     hasFlag("force"),
 		tokenOnly: hasFlag("token-only"),
@@ -1068,6 +1394,9 @@ func runConnect(opts connectOpts) {
 		if err != nil {
 			failTokenOnly("%v", err)
 		}
+		if reg.StateDir, err = resolveRemoteStateDirForSSHConfig(session, reg.StateDir); err != nil {
+			failTokenOnly("failed to resolve remote state dir: %v", err)
+		}
 		if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
 			failTokenOnly("failed to record tunnel state for Host %s: %v", host, err)
 		}
@@ -1088,6 +1417,7 @@ func runConnect(opts connectOpts) {
 		if err := connectActivateTunnel(session, opts, host, localPort, reg.ReservedPort); err != nil {
 			failTokenOnly("%v", err)
 		}
+		applyLaptopSSHConfigSetEnv(host, reg.ReservedPort, reg.StateDir)
 		return
 	}
 
@@ -1101,6 +1431,10 @@ func runConnect(opts connectOpts) {
 	reg, err := shim.ReservePeerViaSession(session, remoteBin, ident.ID, ident.Label, peer.DefaultRangeStart, peer.DefaultRangeEnd)
 	if err != nil {
 		log.Fatalf("      failed to reserve peer port: %v", err)
+	}
+	if reg.StateDir, err = resolveRemoteStateDirForSSHConfig(session, reg.StateDir); err != nil {
+		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		log.Fatalf("      failed to resolve remote state dir: %v", err)
 	}
 	if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
 		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
@@ -1116,10 +1450,10 @@ func runConnect(opts connectOpts) {
 	// the state in place — the tunnel is already live and the state file
 	// accurately reflects reality.
 	failAfterSave := func(format string, args ...any) {
-		if rmErr := tunnel.RemoveState(tunnel.DefaultStateDir(), host, localPort); rmErr != nil {
-			log.Printf("      warning: rollback could not remove tunnel state file: %v", rmErr)
-		}
-		bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation)
+		rollbackConnectReservation(
+			func() error { return tunnel.RemoveState(tunnel.DefaultStateDir(), host, localPort) },
+			func() { bestEffortReleasePeer(session, remoteBin, ident.ID, !hadExistingPeerReservation) },
+		)
 		log.Fatalf(format, args...)
 	}
 	fmt.Printf("      host: %s\n", host)
@@ -1218,6 +1552,22 @@ func runConnect(opts connectOpts) {
 		failAfterSave("%v", err)
 	}
 
+	// Multi-laptop on shared account: push per-peer env via ~/.ssh/config.
+	// Failure here is a warning, not fatal — the rest of the setup is valid.
+	//
+	// CONTRACT: this call is intentionally placed AFTER connectActivateTunnel
+	// and is NOT reverted by any later failure (Codex setup, notification
+	// bridge, etc.). The tunnel is live at this point, the remote port is
+	// the correct one for the just-reserved peer, and the ssh_config block
+	// accurately reflects the remote state. A late failure in Codex or
+	// notifications does not invalidate CC_CLIP_PORT / CC_CLIP_STATE_DIR —
+	// Claude Code pasting still works end-to-end on the next interactive
+	// ssh session regardless. Contributors MUST NOT add the SetEnv call
+	// into a `failAfterSave`/rollback closure; doing so would make a
+	// transient Codex preflight glitch strip the user's working SetEnv
+	// block. Pinned by TestApplyLaptopSSHConfigSetEnvIsNotInRollback.
+	applyLaptopSSHConfigSetEnv(host, reg.ReservedPort, reg.StateDir)
+
 	// Notification bridge setup (unless --no-notify)
 	if opts.noNotify {
 		// Notify assets are host-scoped, so --no-notify must remain a pure skip.
@@ -1247,13 +1597,13 @@ func runConnect(opts connectOpts) {
 }
 
 // connectNotifySetup performs notification bridge setup:
-// 1. Generate nonce and register with local daemon
-// 2. Write nonce to remote
-// 3. Install hook script on remote
-// 4. Install clipcc wrapper or print Claude Code hook config
-// 5. Detect and configure Codex notify (if ~/.codex exists)
-// 6. Run health probe (only when tunnelActive — otherwise the probe has no
-//    path to reach the local /notify endpoint and would always fail).
+//  1. Generate nonce and register with local daemon
+//  2. Write nonce to remote
+//  3. Install hook script on remote
+//  4. Install clipcc wrapper or print Claude Code hook config
+//  5. Detect and configure Codex notify (if ~/.codex exists)
+//  6. Run health probe (only when tunnelActive — otherwise the probe has no
+//     path to reach the local /notify endpoint and would always fail).
 func connectNotifySetup(session *shim.SSHSession, localPort, remotePort int, stateDir string, tunnelActive bool) *shim.NotifyDeployState {
 	fmt.Println()
 	fmt.Println("Notification bridge setup:")
@@ -1445,7 +1795,12 @@ func runRemoteNotificationHealthProbe(session remoteExecutor, remotePort int, st
 
 	payload := `{"hook_event_name":"notification","type":"idle_prompt","title":"cc-clip","body":"Notification bridge connected"}`
 	cmd := fmt.Sprintf(
-		"printf %%s %s | CC_CLIP_PORT=%d CC_CLIP_STATE_DIR=%s CC_CLIP_STRICT=1 %s",
+		// stateDir must use shimShellQuote (RemoteShellPath) so a `~/`
+		// prefix expands to `"$HOME/…"` on the remote. Single-quoting
+		// the whole `CC_CLIP_STATE_DIR=~/…` token keeps the literal `~`
+		// and the remote hook reads the wrong per-peer nonce. Pinned by
+		// TestRunRemoteNotificationHealthProbeUsesStrictRemoteHookPath.
+		"printf %%s %s | env CC_CLIP_PORT=%d CC_CLIP_STATE_DIR=%s CC_CLIP_STRICT=1 %s",
 		shellutil.ShellQuote(payload),
 		remotePort,
 		shimShellQuote(stateDir),
@@ -1453,8 +1808,19 @@ func runRemoteNotificationHealthProbe(session remoteExecutor, remotePort int, st
 	)
 	out, err := session.Exec(cmd)
 	if err != nil {
-		if strings.TrimSpace(out) != "" {
-			return fmt.Errorf("%s: %w", strings.TrimSpace(out), err)
+		if trimmed := strings.TrimSpace(out); trimmed != "" {
+			return fmt.Errorf("%s: %w", trimmed, err)
+		}
+		// SSHSession.Exec captures only stdout; on a script-level failure with
+		// no stdout (e.g. missing binary, permission denied, ssh transport
+		// error), the diagnostic is usually in stderr via *exec.ExitError.
+		// Surface it so the user sees a real hint instead of just the ssh
+		// error string.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+				return fmt.Errorf("%s: %w", stderr, err)
+			}
 		}
 		return fmt.Errorf("remote hook execution failed: %w", err)
 	}
@@ -1522,6 +1888,9 @@ func cmdSetup() {
 		log.Fatal("usage: cc-clip setup <host> [--port PORT] [--force] [--token-only] [--codex] [--no-notify] [--no-tunnel]")
 	}
 	host := os.Args[2]
+	if err := tunnel.ValidateSSHHost(host); err != nil {
+		log.Fatalf("invalid host: %v", err)
+	}
 	localPort := getPort()
 
 	// Step 1: Dependencies
@@ -1567,11 +1936,12 @@ func cmdSetup() {
 		log.Fatal("      daemon not running. Start it first: cc-clip serve")
 	}
 
-	// Step 3: Deploy to the remote and record local tunnel state.
-	// cc-clip no longer touches `~/.ssh/config`; the daemon spawns its own
-	// `ssh -N -R` and tracks the (host, remote-port, daemon-port) mapping
-	// under ~/.cache/cc-clip/tunnels/. Forward the orchestration flags the
-	// user passed to `setup` so that e.g. `cc-clip setup host --force
+	// Step 3: Deploy to the remote and record local tunnel state. The daemon
+	// still owns the reverse tunnel itself via `ssh -N -R` and tracks the
+	// (host, remote-port, daemon-port) mapping under ~/.cache/cc-clip/tunnels/.
+	// runConnect may also refresh the local ~/.ssh/config SetEnv marker block
+	// for the shared-account multi-laptop flow. Forward the orchestration flags
+	// the user passed to `setup` so that e.g. `cc-clip setup host --force
 	// --token-only` redeploys instead of reusing the deploy-state cache.
 	// Previously these flags were silently dropped, leaving scripts that
 	// added --force puzzled when nothing redeployed.
@@ -1995,13 +2365,55 @@ func cmdService() {
 }
 
 func classifyError(err error) int {
+	if err == nil {
+		return exitcode.Success
+	}
 	if errors.Is(err, tunnel.ErrTokenInvalid) {
 		return exitcode.TokenInvalid
 	}
 	if errors.Is(err, tunnel.ErrNoImage) {
 		return exitcode.NoImage
 	}
+	// A mid-request transport failure (daemon crashed between Probe and
+	// fetch, reverse tunnel flapped, deadline elapsed) surfaces here as a
+	// net.OpError or context.DeadlineExceeded, not as a daemon protocol
+	// error. Previously these collapsed into DownloadFailed (13), which
+	// hid the tunnel-unreachable signal from operators and tooling. The
+	// shim treats both 11 and 13 as business-level fallback codes so the
+	// user-visible xclip behavior is unchanged, but preserving the
+	// distinction is load-bearing for diagnostics and for the
+	// TunnelUnreachable exit-code contract. ErrTunnelNotFound is not
+	// reachable from the fetch path today but adding it here keeps the
+	// classifier honest if a future client surface calls into it.
+	if errors.Is(err, tunnel.ErrTunnelNotFound) {
+		return exitcode.TunnelUnreachable
+	}
+	if isTunnelTransportError(err) {
+		return exitcode.TunnelUnreachable
+	}
 	return exitcode.DownloadFailed
+}
+
+// isTunnelTransportError reports whether err looks like a TCP/HTTP transport
+// failure against the local daemon rather than an application-level response
+// (4xx/5xx JSON). Matches net.OpError (Go wraps connection refused / reset /
+// closed / DNS failure in this type), context deadlines, and unexpected-EOF
+// which net/http returns when the daemon closes mid-response body.
+func isTunnelTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -2079,6 +2491,9 @@ func resolveTokenOnlyPeerReservation(existingReg *peer.Registration, lookupErr e
 
 func legacyPeerStateDir(peerID string) string {
 	if strings.TrimSpace(peerID) == "" {
+		return ""
+	}
+	if err := peer.ValidateID(peerID); err != nil {
 		return ""
 	}
 	return legacyStateDir + "/peers/" + peerID
@@ -2312,6 +2727,210 @@ func syncRemoteNotificationNonce(session *shim.SSHSession, nonce, stateDir strin
 	return nil
 }
 
+func resolveRemoteStateDirForSSHConfig(session remoteExecutor, stateDir string) (string, error) {
+	stateDir = strings.TrimSpace(stateDir)
+	switch {
+	case stateDir == "":
+		return "", nil
+	case strings.HasPrefix(stateDir, "/"):
+		return stateDir, nil
+	case strings.HasPrefix(stateDir, "~/"):
+		out, err := session.Exec(fmt.Sprintf(`printf %%s "$HOME/%s"`, shellutil.EscapeDoubleQuoted(strings.TrimPrefix(stateDir, "~/"))))
+		if err != nil {
+			return "", fmt.Errorf("expand remote home-relative state dir %q: %w", stateDir, err)
+		}
+		out = strings.TrimSpace(out)
+		if out == "" {
+			return "", fmt.Errorf("expand remote home-relative state dir %q: empty result", stateDir)
+		}
+		return out, nil
+	default:
+		return stateDir, nil
+	}
+}
+
+// localSSHConfigDisplayPath returns the resolved ~/.ssh/config path
+// for user-facing messages, falling back to the literal string when
+// $HOME can't be resolved so we never print an empty path.
+//
+// On macOS/Linux the resolved path looks like `/Users/alice/.ssh/config`
+// or `/home/alice/.ssh/config`. On Windows, `os.UserHomeDir()` resolves
+// to `%USERPROFILE%` and the returned path uses backslashes (e.g.
+// `C:\Users\alice\.ssh\config`). The literal `~/.ssh/config` fallback is
+// a POSIX-style hint; if we ever hit it on Windows we'd rather show a
+// slightly-unfamiliar path than an empty string or a raw error.
+func localSSHConfigDisplayPath() string {
+	path, err := sshconfig.LocalConfigPath()
+	if err != nil || path == "" {
+		return "~/.ssh/config"
+	}
+	return path
+}
+
+// validateRemoteStateDirForSSHConfig enforces that a peer-registry-supplied
+// state directory path is safe to persist into ~/.ssh/config's SetEnv block.
+// The path flows from the remote peer registry → ssh_config value → env var
+// on the remote shell → interpolation into bash shim/hook scripts. The
+// strictest hop is the bash interpolation: even inside double-quoted strings,
+// `$(…)` command substitution still expands, so a hostile remote could
+// smuggle arbitrary code via StateDir. Fail closed here so the privilege
+// boundary is enforced at the one place where remote-origin data crosses
+// into local persisted state.
+//
+// Rules (intentionally conservative — widen only with a review):
+//   - non-empty, <= 4 KiB
+//   - absolute POSIX path (starts with `/`) — cc-clip always writes
+//     `$HOME/.cache/cc-clip/peers/<id>` on the remote, which resolves to an
+//     absolute path on the remote before being returned
+//   - no control chars / NUL / CR / LF
+//   - no `..` path segments (path-traversal)
+//   - no shell metacharacters that could expand inside a double-quoted
+//     bash string: `$`, “ ` “, `"`, `\`, `!` (history in interactive
+//     shells), `*`, `?`, `[`, `]`
+//   - characters restricted to printable ASCII
+func validateRemoteStateDirForSSHConfig(p string) error {
+	if p == "" {
+		return fmt.Errorf("empty CC_CLIP_STATE_DIR")
+	}
+	if len(p) > 4096 {
+		return fmt.Errorf("CC_CLIP_STATE_DIR exceeds 4096 bytes")
+	}
+	if !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("CC_CLIP_STATE_DIR must be an absolute POSIX path, got %q", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("CC_CLIP_STATE_DIR contains a control character")
+		}
+		if r > 0x7e {
+			return fmt.Errorf("CC_CLIP_STATE_DIR contains non-ASCII character %q", r)
+		}
+		switch r {
+		case '$', '`', '"', '\\', '!', '*', '?', '[', ']', '\'', ';', '|', '&', '<', '>', '(', ')', '{', '}', '\n', '\r':
+			return fmt.Errorf("CC_CLIP_STATE_DIR contains shell metacharacter %q", r)
+		}
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf("CC_CLIP_STATE_DIR contains `..` path segment")
+		}
+	}
+	return nil
+}
+
+// applyLaptopSSHConfigSetEnv injects the per-peer CC_CLIP_PORT and
+// CC_CLIP_STATE_DIR into the user's existing `Host <host>` block in
+// ~/.ssh/config. This is what makes shared-Unix-account multi-laptop
+// work: each laptop's ssh session to the shared account pushes its
+// own port + state dir so the remote shim scripts pick the right
+// per-peer token/nonce at runtime.
+//
+// Non-fatal by design: if the user has no matching Host block or the
+// match is a wildcard pattern, we surface an actionable warning but
+// do not abort the setup flow. The rest of the install is valid; the
+// user can still use clipcc with manual env or add a Host block later.
+//
+// Warnings go to stderr — matching `runShimUninstall`'s warning routing
+// and the usual UNIX convention that non-error step confirmations land on
+// stdout and anything the user must notice-or-else lands on stderr. The
+// success line stays on stdout. Scripted operators that tee only stdout
+// into a runbook can still re-run `cc-clip doctor` to resurface any missed
+// warning; teeing both streams (`2>&1`) captures warnings alongside the
+// step log.
+func applyLaptopSSHConfigSetEnv(host string, remotePort int, remoteStateDir string) {
+	// sshconfig.validateEnvValue only guards against newline/NUL, but
+	// CC_CLIP_STATE_DIR originates from the remote peer registry — a
+	// compromised or misbehaving remote could push path-traversal strings
+	// or `$(…)`-bearing values that survive into the user's ~/.ssh/config
+	// and later into bash interpolation on the next ssh session. Reject
+	// anything that isn't a conventional absolute POSIX path before we
+	// hand it to Apply so the privilege boundary between "remote says" and
+	// "local writes" is explicit.
+	if err := validateRemoteStateDirForSSHConfig(remoteStateDir); err != nil {
+		fmt.Fprintf(os.Stderr, "      warning: refusing to write CC_CLIP_STATE_DIR to ~/.ssh/config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "               (peer registry returned %q; run `cc-clip doctor --host %s` to inspect)\n", remoteStateDir, host)
+		return
+	}
+	// strconv.Itoa on an int is shell-safe today, but pin the bounds so a
+	// future refactor that changes the port type (or passes through a
+	// remote-supplied value) cannot smuggle anything non-numeric into the
+	// ~/.ssh/config SetEnv block.
+	if remotePort <= 0 || remotePort > 65535 {
+		fmt.Fprintf(os.Stderr, "      warning: refusing to write CC_CLIP_PORT to ~/.ssh/config: invalid port %d\n", remotePort)
+		return
+	}
+	env := map[string]string{
+		"CC_CLIP_PORT":      strconv.Itoa(remotePort),
+		"CC_CLIP_STATE_DIR": remoteStateDir,
+	}
+	err := sshconfig.Apply(host, env)
+	switch {
+	case err == nil:
+		fmt.Printf("      applied cc-clip SetEnv block in %s for Host %s\n", localSSHConfigDisplayPath(), host)
+	case errors.Is(err, sshconfig.ErrHostBlockMissing):
+		fmt.Fprintf(os.Stderr, "      warning: no `Host %s` block found in ~/.ssh/config;\n", host)
+		fmt.Fprintf(os.Stderr, "               add one and re-run `cc-clip setup %s` (see README: Multi-laptop on a Shared Remote Account)\n", host)
+	case errors.Is(err, sshconfig.ErrOnlyGlobMatch):
+		fmt.Fprintf(os.Stderr, "      warning: Host %s is matched only by a wildcard or negation pattern in ~/.ssh/config;\n", host)
+		fmt.Fprintf(os.Stderr, "               cc-clip refuses to inject SetEnv into such a block. Add a literal `Host %s` entry and re-run setup\n", host)
+	case errors.Is(err, sshconfig.ErrHostBlockInInclude):
+		fmt.Fprintf(os.Stderr, "      warning: no literal `Host %s` block was found in the top-level ~/.ssh/config, but an Include directive is present;\n", host)
+		fmt.Fprintf(os.Stderr, "               cc-clip does not walk Include directives. Add a literal `Host %s` block to ~/.ssh/config and re-run setup\n", host)
+	case errors.Is(err, sshconfig.ErrSetEnvConflict):
+		fmt.Fprintf(os.Stderr, "      warning: Host %s already has a user-authored SetEnv directive in ~/.ssh/config;\n", host)
+		fmt.Fprintf(os.Stderr, "               OpenSSH honors only the first SetEnv directive, so cc-clip will not inject a second one. Merge CC_CLIP_PORT/CC_CLIP_STATE_DIR into that first SetEnv manually\n")
+	case errors.Is(err, sshconfig.ErrSymlinkConfig):
+		fmt.Fprintf(os.Stderr, "      warning: ~/.ssh/config is a symlink; cc-clip refuses to rewrite symlinked SSH configs.\n")
+		fmt.Fprintf(os.Stderr, "               use a regular ~/.ssh/config file or manage the cc-clip SetEnv block manually for Host %s\n", host)
+	case errors.Is(err, os.ErrNotExist):
+		fmt.Fprintf(os.Stderr, "      warning: ~/.ssh/config not found; add it with a `Host %s` block and re-run setup\n", host)
+	case errors.Is(err, sshconfig.ErrInvalidHost):
+		// ErrInvalidHost most commonly fires for non-ASCII or
+		// wildcard-bearing aliases. The generic "failed to update"
+		// message buried the real reason; surface the validator's
+		// message verbatim so the user can see which character got
+		// rejected. cc-clip's alias validator is intentionally stricter
+		// than OpenSSH's (ASCII-only) to keep the SetEnv block
+		// ssh -G round-trip safe.
+		fmt.Fprintf(os.Stderr, "      warning: Host alias %q cannot be used for the cc-clip SetEnv block: %v\n", host, err)
+		fmt.Fprintf(os.Stderr, "               cc-clip only supports ASCII Host aliases (letters, digits, `.`, `_`, `-`, `@`, `:`). Rename the Host block and re-run setup.\n")
+	default:
+		fmt.Fprintf(os.Stderr, "      warning: failed to update ~/.ssh/config SetEnv block: %v\n", err)
+	}
+}
+
+// removeLaptopSSHConfigSetEnv removes the cc-clip-managed SetEnv block
+// for the given host from the user's ~/.ssh/config. Non-fatal.
+//
+// CONTRACT: callers MUST invoke this ONLY after the remote cleanup
+// (PATH marker removal and/or peer-lease release) has succeeded. If
+// the remote still has cc-clip artifacts but the SetEnv block is gone,
+// the next `ssh <host>` session loses the CC_CLIP_PORT/CC_CLIP_STATE_DIR
+// push and the user's remote shims silently fail to route. Pinned by
+// the caller-side ordering in runShimUninstall and cmdUninstallPeer;
+// do not reshuffle either without updating this comment.
+//
+// Silently does nothing when ~/.ssh/config is absent or when the
+// marker block is missing; both are "already clean" outcomes. All
+// other error branches print a warning to stderr (matching
+// applyLaptopSSHConfigSetEnv / runShimUninstall) and return without
+// aborting the calling command.
+func removeLaptopSSHConfigSetEnv(host string) {
+	if err := sshconfig.Remove(host); err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// Nothing to clean.
+		case errors.Is(err, sshconfig.ErrSymlinkConfig):
+			fmt.Fprintf(os.Stderr, "warning: ~/.ssh/config is a symlink; cc-clip refuses to rewrite symlinked SSH configs for Host %s\n", host)
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "warning: failed to clean ~/.ssh/config SetEnv block for %s: %v\n", host, err)
+			return
+		}
+	}
+	fmt.Printf("Removed cc-clip SetEnv block from %s for Host %s (if present).\n", localSSHConfigDisplayPath(), host)
+}
+
 func parsePeerRegistration(out string) (*peer.Registration, error) {
 	out = strings.TrimSpace(out)
 	if out == "" {
@@ -2375,6 +2994,13 @@ type remoteExecutor interface {
 func removeRemoteNotifyState(session remoteExecutor, stateDir string) error {
 	var errs []error
 
+	// Only touch the current peer's own notify state. Earlier revisions also
+	// ran a `find ~/.cache/cc-clip/peers … -delete` sweep to catch
+	// "peer-scoped leftovers", but on hosts where several laptops share a
+	// remote Unix account that sweep would wipe every other active peer's
+	// notify nonce, silently breaking their notification path until their
+	// next `cc-clip connect`. The multi-peer invariant is: one laptop's
+	// uninstall MUST NOT mutate another laptop's runtime state.
 	for _, dir := range compatStateDirs(stateDir) {
 		cmd := fmt.Sprintf("rm -f %s %s",
 			shimShellQuote(dir+"/notify.nonce"),
@@ -2383,12 +3009,6 @@ func removeRemoteNotifyState(session remoteExecutor, stateDir string) error {
 		if _, err := session.Exec(cmd); err != nil {
 			errs = append(errs, fmt.Errorf("remove notify state from %s: %w", dir, err))
 		}
-	}
-
-	// Notifications are host-scoped because the hook script, clipcc wrapper,
-	// and Codex config are shared. Remove any peer-scoped leftovers as well.
-	if _, err := session.Exec(`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 \( -name 'notify.nonce' -o -name 'notify-health.log' \) -delete 2>/dev/null || true`); err != nil {
-		errs = append(errs, fmt.Errorf("remove peer notify state: %w", err))
 	}
 
 	return errors.Join(errs...)
@@ -2458,6 +3078,25 @@ func sedPatternEscape(s string) string {
 	return replacer.Replace(s)
 }
 
+// countRemoteActivePeers returns the number of peers still registered in
+// the remote cc-clip peer registry. The uninstall path calls this after
+// releasing its own peer to decide whether the shared assets
+// (~/.local/bin/clipcc, cc-clip-hook, PATH marker, Codex notify config)
+// should be deleted or preserved for other laptops still using them.
+//
+// Extracted so tests can swap shim.ListPeersViaSession — and so the
+// "count" semantics stay colocated with the one call site that relies on
+// them, since the semantics ("how many OTHER peers remain") are entirely
+// a property of when this is called (post-release) rather than what the
+// underlying list returns (all peers).
+func countRemoteActivePeers(session *shim.SSHSession, remoteBin string) (int, error) {
+	regs, err := shim.ListPeersViaSession(session, remoteBin)
+	if err != nil {
+		return 0, err
+	}
+	return len(regs), nil
+}
+
 func cleanupPeerRemoteState(session remoteExecutor, stateDir string) error {
 	codexStateDir := stateDir + "/codex"
 	stopBridgeRemote(session, codexStateDir)
@@ -2471,25 +3110,102 @@ func cleanupPeerRemoteState(session remoteExecutor, stateDir string) error {
 }
 
 func cleanupAndReleasePeer(session *shim.SSHSession, remoteBin, peerID string) (*peer.Registration, error) {
-	reg, err := shim.LookupPeerViaSession(session, remoteBin, peerID)
+	return cleanupAndReleasePeerWith(
+		peerID,
+		func() (peer.Registration, error) {
+			return shim.LookupPeerViaSession(session, remoteBin, peerID)
+		},
+		func() (peer.Registration, error) {
+			return shim.ReleasePeerViaSession(session, remoteBin, peerID)
+		},
+		func(stateDir string) error {
+			return cleanupPeerRemoteState(session, stateDir)
+		},
+	)
+}
+
+func cleanupAndReleasePeerWith(
+	peerID string,
+	lookupPeer func() (peer.Registration, error),
+	releasePeer func() (peer.Registration, error),
+	cleanupState func(string) error,
+) (*peer.Registration, error) {
+	stateDir := legacyPeerStateDir(peerID)
+	if stateDir == "" {
+		return nil, fmt.Errorf("invalid peer id %q for legacy peer state cleanup", peerID)
+	}
+	reg, err := lookupPeer()
 	if err != nil {
+		if errors.Is(err, peer.ErrPeerNotFound) {
+			// The per-peer state path is deterministic (~/.cache/cc-clip/peers/<id>)
+			// even when the registry entry is already gone, so the idempotent
+			// cleanup path still tears down the remote runtime before returning
+			// success to the caller. Warn about the legacy-path fallback: if the
+			// user had a registration with a custom (non-default) StateDir that
+			// is now gone from the registry, we cannot discover the real path
+			// and the custom dir will be left behind. Operators seeing this warn
+			// can rm -rf the leftover dir manually.
+			log.Printf("      note: peer %q not in registry; tearing down legacy state path %s (a custom StateDir from a prior registration would not be discoverable and may need manual cleanup)", peerID, stateDir)
+			if err := cleanupState(stateDir); err != nil {
+				return nil, fmt.Errorf("cleanup peer state: %w", err)
+			}
+			return nil, nil
+		}
 		return nil, fmt.Errorf("lookup peer lease: %w", err)
 	}
-	stateDir := strings.TrimSpace(reg.StateDir)
-	if stateDir == "" {
-		stateDir = legacyPeerStateDir(peerID)
+	if trimmed := strings.TrimSpace(reg.StateDir); trimmed != "" {
+		stateDir = trimmed
 	}
-	if err := cleanupPeerRemoteState(session, stateDir); err != nil {
+	if err := cleanupState(stateDir); err != nil {
 		return nil, fmt.Errorf("cleanup peer state: %w", err)
 	}
-	released, err := shim.ReleasePeerViaSession(session, remoteBin, peerID)
+	released, err := releasePeer()
 	if err != nil {
+		if errors.Is(err, peer.ErrPeerNotFound) {
+			// Release raced against a concurrent uninstall (or a stale-after-
+			// lookup registry entry). The lookup above succeeded, so we already
+			// know the port/label the user reserved — surface that rather than
+			// reporting "already released", which would confuse operators
+			// running multi-host cleanup.
+			snapshot := reg
+			if strings.TrimSpace(snapshot.StateDir) == "" {
+				snapshot.StateDir = stateDir
+			}
+			return &snapshot, nil
+		}
 		return nil, fmt.Errorf("release peer lease: %w", err)
 	}
 	if strings.TrimSpace(released.StateDir) == "" {
 		released.StateDir = stateDir
 	}
 	return &released, nil
+}
+
+// rollbackConnectReservation undoes the reservation half of a `cc-clip connect`
+// run when a later step fails. Best-effort on both halves:
+//
+//   - removeState removes the local tunnel-state file; on failure we warn
+//     and continue (a leftover state file is non-critical — subsequent
+//     runs overwrite it).
+//   - releasePeer is `func()` (not `func() error`); callers such as
+//     bestEffortReleasePeer log their own internal failures. We deliberately
+//     do NOT propagate release errors so a persistently-wedged remote
+//     registry can't deadlock the failed-connect cleanup path. Worst case
+//     the remote reservation leaks until the next explicit uninstall picks
+//     it up.
+//
+// Extracted so both effects can be pinned in tests — a partial refactor
+// that drops one side would otherwise silently leak a remote port or a
+// stale state file.
+func rollbackConnectReservation(removeState func() error, releasePeer func()) {
+	if removeState != nil {
+		if err := removeState(); err != nil {
+			log.Printf("      warning: rollback could not remove tunnel state file: %v", err)
+		}
+	}
+	if releasePeer != nil {
+		releasePeer()
+	}
 }
 
 func bestEffortReleasePeer(session *shim.SSHSession, remoteBin, peerID string, allowRelease bool) {
@@ -2790,10 +3506,35 @@ func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
 
 func cmdPeer() {
 	if len(os.Args) < 3 {
-		log.Fatal("usage: cc-clip peer <reserve|release|show> [flags]")
+		log.Fatal("usage: cc-clip peer <reserve|release|show|list> [flags]")
 	}
 
 	subcmd := os.Args[2]
+
+	// `list` is a read-only scan of the registry with no --peer-id, so
+	// short-circuit before the flag-set requires one. Keeping it in the
+	// same entry point (rather than a sibling dispatch) preserves the
+	// existing SSH-invocation pattern `cc-clip peer …`.
+	if subcmd == "list" {
+		baseDir, err := peer.BaseDir()
+		if err != nil {
+			log.Fatalf("peer list failed: %v", err)
+		}
+		regs, err := peer.ListAll(baseDir)
+		if err != nil {
+			log.Fatalf("peer list failed: %v", err)
+		}
+		if regs == nil {
+			regs = []peer.Registration{}
+		}
+		data, err := json.Marshal(regs)
+		if err != nil {
+			log.Fatalf("peer list failed: %v", err)
+		}
+		fmt.Println(string(data))
+		return
+	}
+
 	fs := flag.NewFlagSet("peer", flag.ExitOnError)
 	peerID := fs.String("peer-id", "", "stable local peer id")
 	label := fs.String("label", "", "peer label")
@@ -2803,6 +3544,9 @@ func cmdPeer() {
 
 	if *peerID == "" {
 		log.Fatal("peer failed: --peer-id is required")
+	}
+	if err := peer.ValidateID(*peerID); err != nil {
+		log.Fatalf("peer failed: invalid --peer-id: %v", err)
 	}
 
 	baseDir, err := peer.BaseDir()
@@ -2825,6 +3569,18 @@ func cmdPeer() {
 		log.Fatalf("unknown peer subcommand: %s", subcmd)
 	}
 	if err != nil {
+		// Surface "peer not found" via a dedicated exit code so the remote
+		// SSH caller (LookupPeerViaSession) can classify it into
+		// peer.ErrPeerNotFound without brittle stderr substring matching.
+		// Emit the stable sentinel on its own line so the caller can
+		// require BOTH the exit code AND the sentinel — defense in depth
+		// against a transport component that happens to exit 22 for
+		// unrelated reasons.
+		if errors.Is(err, peer.ErrPeerNotFound) {
+			fmt.Fprintln(os.Stderr, exitcode.PeerNotFoundSentinel)
+			fmt.Fprintf(os.Stderr, "peer %s failed: %v\n", subcmd, err)
+			os.Exit(exitcode.PeerNotFound)
+		}
 		log.Fatalf("peer %s failed: %v", subcmd, err)
 	}
 

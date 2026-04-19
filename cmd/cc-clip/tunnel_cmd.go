@@ -248,35 +248,86 @@ func cmdTunnelUp() {
 // CLI adopts whatever daemon port the saved tunnel points at (the one daemon
 // that owns the forward for that host). If --port was explicit and diverges
 // from the saved value, the call errors rather than silently crossing to a
-// different daemon.
+// different daemon. Passing --remote-port explicitly bypasses only the saved
+// remote-port lookup: when daemon ownership is unambiguous, the CLI still
+// adopts the saved local port so recovery requests reach the daemon that owns
+// the tunnel.
 func resolveTunnelUpPorts(host string, remotePort, daemonPort int, daemonPortExplicit bool) (int, int, error) {
-	s, err := loadSavedTunnelForUp(host)
+	states, err := tunnel.LoadStatesForHost(tunnel.DefaultStateDir(), host)
 	if err != nil {
-		if errors.Is(err, tunnel.ErrAmbiguousTunnelState) {
-			return 0, daemonPort, fmt.Errorf("%w; pass --port <local-port> to select one, or --remote-port <remote-port> to bypass saved-state lookup", err)
-		}
 		return 0, daemonPort, fmt.Errorf("load tunnel state for %s: %w", host, err)
 	}
-	if s == nil {
+	ownerStates := tunnelOwnerStates(states)
+	switch len(ownerStates) {
+	case 0:
+		if len(states) == 0 {
+			return remotePort, daemonPort, nil
+		}
+		// Legacy or corrupt states with local_port == 0 cannot identify an
+		// owning daemon. Explicit --remote-port can only bypass the saved
+		// remote-port lookup after the caller has explicitly selected a daemon
+		// with --port; otherwise the default/current daemon might be wrong on a
+		// multi-daemon machine.
+		if remotePort != 0 {
+			if !daemonPortExplicit {
+				return 0, daemonPort, fmt.Errorf("saved tunnel for %s has no local_port, so daemon ownership is ambiguous; pass --port <local-port> explicitly when using --remote-port <port>", host)
+			}
+			return remotePort, daemonPort, nil
+		}
+		return 0, daemonPort, fmt.Errorf("saved tunnel for %s has no local_port; re-run `cc-clip connect %s` to rewrite the state file, or pass both --port <local-port> and --remote-port <remote-port> explicitly (both are required here because legacy state cannot identify the owning daemon)", host, host)
+	case 1:
+		s := ownerStates[0]
+		if !daemonPortExplicit {
+			daemonPort = s.Config.LocalPort
+		} else if daemonPort != s.Config.LocalPort {
+			return 0, daemonPort, fmt.Errorf("saved tunnel for %s uses local port %d (remote port %d); rerun with --port %d to target the owning daemon", host, s.Config.LocalPort, s.Config.RemotePort, s.Config.LocalPort)
+		}
+		if remotePort == 0 && s.Config.RemotePort > 0 {
+			remotePort = s.Config.RemotePort
+		}
+		return remotePort, daemonPort, nil
+	default:
+		if !daemonPortExplicit {
+			if remotePort != 0 {
+				return 0, daemonPort, fmt.Errorf("%w: %s; multiple saved daemon owners exist, so pass --port <local-port> explicitly along with --remote-port <remote-port>", tunnel.ErrAmbiguousTunnelState, host)
+			}
+			return 0, daemonPort, fmt.Errorf("%w: %s; pass --port <local-port> to select the owning daemon", tunnel.ErrAmbiguousTunnelState, host)
+		}
+		var match *tunnel.TunnelState
+		for _, s := range ownerStates {
+			if s != nil && s.Config.LocalPort == daemonPort {
+				match = s
+				break
+			}
+		}
+		if match == nil {
+			return 0, daemonPort, fmt.Errorf("saved tunnels for %s use local ports %s; rerun with --port one of those values", host, joinTunnelStatePorts(ownerStates))
+		}
+		if remotePort == 0 && match.Config.RemotePort > 0 {
+			remotePort = match.Config.RemotePort
+		}
 		return remotePort, daemonPort, nil
 	}
-	// A legacy or corrupt state file with LocalPort == 0 cannot be honored —
-	// neither adopt nor validate, since "owning daemon port" is ill-defined.
-	// Reject rather than silently using whatever --port the user passed; the
-	// next `cc-clip connect <host>` run will rewrite the state with a real
-	// local port.
-	if s.Config.LocalPort == 0 {
-		return 0, daemonPort, fmt.Errorf("saved tunnel for %s has no local_port; re-run `cc-clip connect %s` to rewrite the state file, or pass --remote-port <port> to bypass saved-state lookup", host, host)
+}
+
+func tunnelOwnerStates(states []*tunnel.TunnelState) []*tunnel.TunnelState {
+	owners := make([]*tunnel.TunnelState, 0, len(states))
+	for _, s := range states {
+		if s != nil && s.Config.LocalPort > 0 {
+			owners = append(owners, s)
+		}
 	}
-	if !daemonPortExplicit {
-		daemonPort = s.Config.LocalPort
-	} else if daemonPort != s.Config.LocalPort {
-		return 0, daemonPort, fmt.Errorf("saved tunnel for %s uses local port %d (remote port %d); rerun with --port %d to use it, or pass --remote-port %d explicitly", host, s.Config.LocalPort, s.Config.RemotePort, s.Config.LocalPort, s.Config.RemotePort)
+	return owners
+}
+
+func joinTunnelStatePorts(states []*tunnel.TunnelState) string {
+	ports := make([]int, 0, len(states))
+	for _, s := range states {
+		if s != nil && s.Config.LocalPort > 0 {
+			ports = append(ports, s.Config.LocalPort)
+		}
 	}
-	if remotePort == 0 && s.Config.RemotePort > 0 {
-		remotePort = s.Config.RemotePort
-	}
-	return remotePort, daemonPort, nil
+	return joinPorts(ports)
 }
 
 func cmdTunnelDown() {
@@ -867,8 +918,13 @@ func stopTunnelWithRetryPolicy(
 // when the CLI was pointed at requestedPort but no saved tunnel exists
 // there. It inspects the saved-state directory for other tunnels owned by
 // the same host and returns the single-candidate port if unambiguous.
-// Ambiguity (multiple saved ports, none matching requestedPort) is
-// surfaced as an error instructing the user to pick one via --port.
+//
+// INVARIANT: fallbackDaemonPort is only called when `--port` was implicit
+// (see stopTunnel/removeTunnel, which gate the fallback branch on
+// `!daemonPortExplicit`). If one saved state already uses requestedPort,
+// keep targeting that daemon and let the caller continue with offline
+// persistence there. Only error when multiple saved ports exist and none
+// matches requestedPort — that is the genuinely ambiguous case.
 func fallbackDaemonPort(host string, requestedPort int) (int, bool, error) {
 	states, err := tunnel.LoadStatesForHost(tunnel.DefaultStateDir(), host)
 	if err != nil {

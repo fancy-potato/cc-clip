@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
 	"io"
+	"log"
 	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -21,6 +28,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/peer"
 	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/shim"
+	"github.com/shunmei/cc-clip/internal/sshconfig"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
 )
@@ -296,6 +304,33 @@ func TestRunRemoteNotificationHealthProbeSurfacesRemoteFailure(t *testing.T) {
 	}
 }
 
+// TestRunRemoteNotificationHealthProbeSurfacesStderrWhenStdoutEmpty pins the
+// fallback path for script-level failures that produce no stdout (missing
+// hook binary, permission denied, ssh transport error). Without the fallback
+// the user just sees the ssh err string with no hint at the real cause.
+func TestRunRemoteNotificationHealthProbeSurfacesStderrWhenStdoutEmpty(t *testing.T) {
+	// Build a real *exec.ExitError so we can attach a Stderr payload — the
+	// struct's ProcessState field has unexported state that only a real run
+	// can populate.
+	realFail := exec.Command("sh", "-c", "exit 1")
+	runErr := realFail.Run()
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected *exec.ExitError, got %T", runErr)
+	}
+	exitErr.Stderr = []byte("bash: cc-clip-hook: No such file or directory\n")
+
+	session := &fixedRemoteExecutor{err: exitErr} // empty stdout
+
+	err := runRemoteNotificationHealthProbe(session, 19001, "~/.cache/cc-clip/peers/peer-a")
+	if err == nil {
+		t.Fatal("expected remote health probe failure")
+	}
+	if !strings.Contains(err.Error(), "No such file or directory") {
+		t.Fatalf("err = %v; want stderr payload surfaced", err)
+	}
+}
+
 // TestRunRemoteNotificationHealthProbeRejectsEmptyStateDir pins the new
 // contract that an empty stateDir is a programming error — the probe's
 // purpose is to exercise the run's specific nonce via that peer-scoped
@@ -334,6 +369,153 @@ func TestRunShimUninstallWithHostSkipsLocalShim(t *testing.T) {
 	}
 	if remoteHost != "dev-success-cc-clip-wavehi-local" {
 		t.Fatalf("expected remote cleanup host to be used, got %q", remoteHost)
+	}
+}
+
+func TestRunShimUninstallWithHostPreservesLocalSetEnvBlockWhenRemoteCleanupFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	prevAdvisor := legacyManagedBlockAdvisor
+	legacyManagedBlockAdvisor = func(string) string { return "" }
+	t.Cleanup(func() { legacyManagedBlockAdvisor = prevAdvisor })
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	original := `Host example
+  HostName example.com
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/me/.cache/cc-clip/peers/peer-a
+  # <<< cc-clip SetEnv (do not edit) <<<
+`
+	configPath := filepath.Join(sshDir, "config")
+	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+		t.Fatalf("write ssh config: %v", err)
+	}
+
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath:   func(string) error { return errors.New("ssh down") },
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read ssh config: %v", err)
+	}
+	if string(got) != original {
+		t.Fatalf("local SetEnv block should be preserved on remote failure:\n--- got\n%s\n--- want\n%s", got, original)
+	}
+}
+
+func TestRunShimUninstallInvokesLegacyBlockAdvisor(t *testing.T) {
+	// The uninstall flow must call the legacy-block advisor so users upgrading
+	// from a pre-daemon-tunnel release see the "delete the managed block"
+	// guidance without having to additionally run `cc-clip doctor`.
+	prev := legacyManagedBlockAdvisor
+	t.Cleanup(func() { legacyManagedBlockAdvisor = prev })
+
+	var gotHosts []string
+	legacyManagedBlockAdvisor = func(host string) string {
+		gotHosts = append(gotHosts, host)
+		return ""
+	}
+
+	// Remote branch — advisor must run with the caller's host alias.
+	if err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath:   func(string) error { return nil },
+	}); err != nil {
+		t.Fatalf("runShimUninstall(remote) returned error: %v", err)
+	}
+
+	// Local branch — advisor must still run with empty host.
+	if err := runShimUninstall(shim.TargetWlPaste, "/tmp/local-bin", "", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath:   func(string) error { return nil },
+	}); err != nil {
+		t.Fatalf("runShimUninstall(local) returned error: %v", err)
+	}
+
+	if got, want := gotHosts, []string{"example", ""}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("advisor host args: got %q, want %q", got, want)
+	}
+}
+
+// TestRunShimUninstallWithHostPreservesPATHWhenOtherPeersRemain is the
+// multi-peer safety pin for the plain `cc-clip uninstall --host H` path
+// (the one that does NOT release the peer). When another laptop still
+// holds a reservation in the remote registry, the PATH marker is shared
+// infrastructure — deleting it would unhook `~/.local/bin/clipcc` from
+// the other laptop's Claude Code sessions. Preserve it.
+func TestRunShimUninstallWithHostPreservesPATHWhenOtherPeersRemain(t *testing.T) {
+	pathCalls := 0
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath: func(string) error {
+			pathCalls++
+			return nil
+		},
+		countRemoteActivePeers: func(host string) (int, error) {
+			if host != "example" {
+				t.Fatalf("peer-count query host = %q, want %q", host, "example")
+			}
+			return 2, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0 while other peers remain", pathCalls)
+	}
+}
+
+// TestRunShimUninstallWithHostRemovesPATHWhenLastPeer pins the
+// complementary case: when the registry has zero peers, the shared PATH
+// marker is safe to delete.
+func TestRunShimUninstallWithHostRemovesPATHWhenLastPeer(t *testing.T) {
+	pathCalls := 0
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath: func(string) error {
+			pathCalls++
+			return nil
+		},
+		countRemoteActivePeers: func(host string) (int, error) { return 0, nil },
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if pathCalls != 1 {
+		t.Fatalf("removeRemotePath called %d times, want 1 when no peers remain", pathCalls)
+	}
+}
+
+// TestRunShimUninstallWithHostFailsSafeOnCountQueryError: when the remote
+// registry can't be reached, preserve the PATH marker rather than risk
+// breaking a concurrent peer.
+func TestRunShimUninstallWithHostFailsSafeOnCountQueryError(t *testing.T) {
+	pathCalls := 0
+	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+		uninstallLocalShim: func(shim.Target, string) error { return nil },
+		removeRemotePath: func(string) error {
+			pathCalls++
+			return nil
+		},
+		countRemoteActivePeers: func(host string) (int, error) {
+			return 0, errors.New("ssh handshake failed")
+		},
+	})
+	if err != nil {
+		t.Fatalf("runShimUninstall returned error: %v", err)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0 on count query failure (fail safe)", pathCalls)
 	}
 }
 
@@ -505,6 +687,54 @@ func TestResolveUninstallPeerTargetUsesAliasForLocalPeerID(t *testing.T) {
 	}
 	if managedHost != "myserver" {
 		t.Fatalf("unexpected managed host %q", managedHost)
+	}
+}
+
+// TestResolveUninstallPeerTargetBareFlagUsesLocalIdentity pins the bare
+// `uninstall --peer --host H` code path that cmdUninstallPeer takes after
+// auto-filling peerArg from ident.ID. A regression where peerArg=="" is
+// treated as "foreign" would silently skip local tunnel cleanup.
+func TestResolveUninstallPeerTargetBareFlagUsesLocalIdentity(t *testing.T) {
+	ident := peer.Identity{ID: "local-peer", Label: "macbook"}
+
+	peerID, managedHost, err := resolveUninstallPeerTarget("myserver", "", ident)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "local-peer" {
+		t.Fatalf("bare --peer must resolve to ident.ID, got %q", peerID)
+	}
+	if managedHost != "myserver" {
+		t.Fatalf("bare --peer must tear down local tunnel state, got host=%q", managedHost)
+	}
+}
+
+func TestLoadIdentityForUninstallPeerBareRequiresExistingIdentity(t *testing.T) {
+	prev := loadLocalPeerIdentity
+	t.Cleanup(func() { loadLocalPeerIdentity = prev })
+	loadLocalPeerIdentity = func() (peer.Identity, error) {
+		return peer.Identity{}, peer.ErrLocalIdentityNotFound
+	}
+
+	_, err := loadIdentityForUninstallPeer("")
+	if err == nil || !strings.Contains(err.Error(), "pass --peer-id <id> explicitly") {
+		t.Fatalf("err = %v, want actionable missing-identity error", err)
+	}
+}
+
+func TestLoadIdentityForUninstallPeerExplicitPeerToleratesMissingIdentity(t *testing.T) {
+	prev := loadLocalPeerIdentity
+	t.Cleanup(func() { loadLocalPeerIdentity = prev })
+	loadLocalPeerIdentity = func() (peer.Identity, error) {
+		return peer.Identity{}, peer.ErrLocalIdentityNotFound
+	}
+
+	ident, err := loadIdentityForUninstallPeer("foreign-peer")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ident != (peer.Identity{}) {
+		t.Fatalf("ident = %#v, want zero identity when local identity is absent", ident)
 	}
 }
 
@@ -1000,6 +1230,112 @@ func TestConnectStartPersistentTunnelWithFastFailsOnOtherDaemonPort(t *testing.T
 	}
 }
 
+// TestRollbackConnectReservationRunsBothEffectsInOrder pins the contract
+// that the `failAfterSave` rollback path in runConnect always removes the
+// local tunnel-state file AND releases the remote peer, in that order, even
+// if the state removal fails. A partial refactor that forgot to wire one
+// side would silently leak either a remote port reservation or a stale
+// local state file that only `cc-clip tunnel remove` would clean.
+func TestRollbackConnectReservationRunsBothEffectsInOrder(t *testing.T) {
+	cases := []struct {
+		name       string
+		removeErr  error
+		wantOrder  []string
+		wantLogSub string
+	}{
+		{
+			name:      "happy_path",
+			removeErr: nil,
+			wantOrder: []string{"removeState", "releasePeer"},
+		},
+		{
+			name:       "state_remove_failure_still_releases_peer",
+			removeErr:  errors.New("disk gone"),
+			wantOrder:  []string{"removeState", "releasePeer"},
+			wantLogSub: "disk gone",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			var logBuf bytes.Buffer
+			oldOut := log.Writer()
+			oldFlags := log.Flags()
+			log.SetOutput(&logBuf)
+			log.SetFlags(0)
+			t.Cleanup(func() {
+				log.SetOutput(oldOut)
+				log.SetFlags(oldFlags)
+			})
+
+			rollbackConnectReservation(
+				func() error {
+					calls = append(calls, "removeState")
+					return tc.removeErr
+				},
+				func() {
+					calls = append(calls, "releasePeer")
+				},
+			)
+
+			if !reflect.DeepEqual(calls, tc.wantOrder) {
+				t.Fatalf("call order = %v, want %v", calls, tc.wantOrder)
+			}
+			if tc.wantLogSub != "" && !strings.Contains(logBuf.String(), tc.wantLogSub) {
+				t.Fatalf("log output = %q, want substring %q", logBuf.String(), tc.wantLogSub)
+			}
+		})
+	}
+}
+
+// TestRollbackConnectReservationHandlesNilEffects pins the defensive nil
+// guards: a caller that omits either side (e.g. tests) must not panic.
+func TestRollbackConnectReservationHandlesNilEffects(t *testing.T) {
+	// Should not panic.
+	rollbackConnectReservation(nil, nil)
+}
+
+// TestConnectStartPersistentTunnelWithReportsUnknownWhenHostMissing pins the
+// "daemon reachable, but our host never appears in /tunnels" branch: the
+// poll must still return a timeout-style error with status=unknown and no
+// diagnostic suffix (there is nothing else to report). Without this test a
+// future refactor could silently swallow the branch or misreport a stale
+// lastStatus from a prior iteration.
+func TestConnectStartPersistentTunnelWithReportsUnknownWhenHostMissing(t *testing.T) {
+	oldTimeout := connectTunnelUpTimeout
+	oldInterval := connectTunnelUpPollInterval
+	connectTunnelUpTimeout = 30 * time.Millisecond
+	connectTunnelUpPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		connectTunnelUpTimeout = oldTimeout
+		connectTunnelUpPollInterval = oldInterval
+	})
+
+	// /tunnels returns an empty list — daemon is up, but our host is nowhere.
+	fetch := func(int) ([]*tunnel.TunnelState, error) {
+		return nil, nil
+	}
+	err := connectStartPersistentTunnelWith(18339, "myserver", 19001,
+		func(int, string, int) error { return nil }, fetch)
+	if err == nil {
+		t.Fatal("expected timeout error when host never appears")
+	}
+	if !strings.Contains(err.Error(), "did not reach connected state") {
+		t.Fatalf("err = %v, want timeout message", err)
+	}
+	if !strings.Contains(err.Error(), "status=unknown") {
+		t.Fatalf("err = %v, want status=unknown for never-seen host", err)
+	}
+	// No diagnostic suffix is appropriate here: there is no other state to
+	// report. A regression that fabricates one would surface as extra text.
+	if strings.Contains(err.Error(), "daemon reports:") {
+		t.Fatalf("err = %v, expected no 'daemon reports:' suffix when host never appeared", err)
+	}
+	if strings.Contains(err.Error(), "no tunnel owned by daemon on port") {
+		t.Fatalf("err = %v, expected no wrong-port suffix when host never appeared", err)
+	}
+}
+
 // TestSummarizeTunnelStatesForHostRendersEveryMatch pins the compact
 // summary format used in connect error messages. A refactor that flips
 // field order or drops status would silently degrade diagnostics.
@@ -1242,6 +1578,111 @@ func TestCleanupPeerRemoteStateStopsCodexProcessesBeforeRemovingStateDir(t *test
 	}
 }
 
+func TestCleanupAndReleasePeerWithCleansLegacyStateWhenLookupMissing(t *testing.T) {
+	var cleaned []string
+	releaseCalls := 0
+
+	reg, err := cleanupAndReleasePeerWith(
+		"peer-a",
+		func() (peer.Registration, error) {
+			return peer.Registration{}, fmt.Errorf("lookup failed: %w", peer.ErrPeerNotFound)
+		},
+		func() (peer.Registration, error) {
+			releaseCalls++
+			return peer.Registration{}, nil
+		},
+		func(stateDir string) error {
+			cleaned = append(cleaned, stateDir)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg != nil {
+		t.Fatalf("expected nil registration on idempotent lookup miss, got %#v", reg)
+	}
+	if releaseCalls != 0 {
+		t.Fatalf("release called %d times, want 0 after lookup miss", releaseCalls)
+	}
+	if got, want := cleaned, []string{legacyPeerStateDir("peer-a")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %v, want %v", got, want)
+	}
+}
+
+func TestCleanupAndReleasePeerWithRejectsUnsafePeerIDOnLookupMiss(t *testing.T) {
+	cleanupCalls := 0
+	reg, err := cleanupAndReleasePeerWith(
+		"../../.ssh",
+		func() (peer.Registration, error) {
+			return peer.Registration{}, fmt.Errorf("lookup failed: %w", peer.ErrPeerNotFound)
+		},
+		func() (peer.Registration, error) {
+			return peer.Registration{}, nil
+		},
+		func(string) error {
+			cleanupCalls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid peer id") {
+		t.Fatalf("err = %v, want invalid peer id error", err)
+	}
+	if reg != nil {
+		t.Fatalf("expected nil registration, got %#v", reg)
+	}
+	if cleanupCalls != 0 {
+		t.Fatalf("cleanup called %d times, want 0", cleanupCalls)
+	}
+}
+
+// TestCleanupAndReleasePeerWithSurfacesLookupRegOnReleaseRace pins that
+// when lookup returns a real reservation but release races to
+// ErrPeerNotFound (concurrent uninstall or stale-after-lookup), the caller
+// still gets the registration snapshot from lookup. Without this, the
+// user-facing message would degrade to "Peer already released on remote
+// (idempotent)" even though we know exactly which port/label was reserved,
+// which is confusing during multi-host cleanup.
+func TestCleanupAndReleasePeerWithSurfacesLookupRegOnReleaseRace(t *testing.T) {
+	var cleaned []string
+	releaseCalls := 0
+
+	reg, err := cleanupAndReleasePeerWith(
+		"peer-a",
+		func() (peer.Registration, error) {
+			return peer.Registration{
+				PeerID:       "peer-a",
+				Label:        "laptop-a",
+				ReservedPort: 18339,
+				StateDir:     "~/.cache/cc-clip/peers/peer-a-custom",
+			}, nil
+		},
+		func() (peer.Registration, error) {
+			releaseCalls++
+			return peer.Registration{}, fmt.Errorf("release failed: %w", peer.ErrPeerNotFound)
+		},
+		func(stateDir string) error {
+			cleaned = append(cleaned, stateDir)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg == nil {
+		t.Fatalf("expected lookup reg snapshot on release race, got nil")
+	}
+	if reg.ReservedPort != 18339 || reg.Label != "laptop-a" {
+		t.Fatalf("reg = %#v, want port=18339 label=laptop-a", reg)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("release called %d times, want 1", releaseCalls)
+	}
+	if got, want := cleaned, []string{"~/.cache/cc-clip/peers/peer-a-custom"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanup calls = %v, want %v", got, want)
+	}
+}
+
 func TestBridgeConfiguredForPort(t *testing.T) {
 	session := &recordingRemoteExecutor{
 		responses: map[string]remoteExecResponse{
@@ -1315,7 +1756,6 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 	for _, needle := range []string{
 		`rm -f "$HOME/.cache/cc-clip/peers/peer-a/notify.nonce" "$HOME/.cache/cc-clip/peers/peer-a/notify-health.log"`,
 		`rm -f "$HOME/.cache/cc-clip/notify.nonce" "$HOME/.cache/cc-clip/notify-health.log"`,
-		`find "$HOME/.cache/cc-clip/peers" -mindepth 2 -maxdepth 2 \( -name 'notify.nonce' -o -name 'notify-health.log' \) -delete 2>/dev/null || true`,
 		`rm -f "$HOME/.local/bin/cc-clip-hook"`,
 		`rm -f "$HOME/.local/bin/clipcc"`,
 		`sed -i.cc-clip-bak '/# >>> cc-clip notify \(do not edit\) >>>/,/# <<< cc-clip notify \(do not edit\) <<</d' ~/.codex/config.toml 2>/dev/null || true; rm -f ~/.codex/config.toml.cc-clip-bak`,
@@ -1323,6 +1763,15 @@ func TestConnectNotifyDisableRemovesManagedAssets(t *testing.T) {
 		if session.indexOfCommandContaining(needle) < 0 {
 			t.Fatalf("expected command containing %q, got %v", needle, session.commands)
 		}
+	}
+
+	// Multi-peer safety pin: removeRemoteNotifyState no longer issues the
+	// global `find ~/.cache/cc-clip/peers … -delete` sweep that earlier
+	// versions ran. If this re-appears, it will silently wipe other
+	// laptops' notify nonces on shared-account servers. See
+	// cmd/cc-clip/main.go:removeRemoteNotifyState for the rationale.
+	if session.indexOfCommandContaining(`find "$HOME/.cache/cc-clip/peers"`) >= 0 {
+		t.Fatalf("removeRemoteNotifyState must not sweep other peers' notify state, got %v", session.commands)
 	}
 }
 
@@ -1385,6 +1834,80 @@ func TestUninstallPeerRemoteAndConfigSkipsTunnelCleanupWhenManagedHostEmpty(t *t
 	}
 }
 
+// TestUninstallPeerRemoteAndConfigInvokesPATHCleanup pins the contract that
+// `cc-clip uninstall --host H --peer` also strips the remote PATH marker, so
+// the documented "remote shim + peer + local tunnel state" sequence does not
+// leave behind an orphan ~/.local/bin/cc-clip shim pointing at a
+// now-unreachable daemon.
+func TestUninstallPeerRemoteAndConfigInvokesPATHCleanup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	pathCalls := 0
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removeRemotePath: func() error {
+			pathCalls++
+			return nil
+		},
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pathCalls != 1 {
+		t.Fatalf("removeRemotePath called %d times, want 1", pathCalls)
+	}
+}
+
+// TestUninstallPeerRemoteAndConfigSurfacesPATHCleanupErrors pins the
+// SetEnv-preservation invariant: a PATH-cleanup failure must surface as a
+// non-nil error so cmdUninstallPeer's log.Fatalf preserves the local
+// ~/.ssh/config SetEnv block for a safe retry.
+func TestUninstallPeerRemoteAndConfigSurfacesPATHCleanupErrors(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removeRemotePath: func() error {
+			return errors.New("rc file missing")
+		},
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), "PATH marker") {
+		t.Fatalf("err = %v, want PATH marker failure", err)
+	}
+}
+
+func TestUninstallPeerRemoteAndConfigSkipsFollowOnCleanupWhenRemoteCleanupFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	pathCalls := 0
+	tunnelCalls := 0
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return nil, errors.New("remote cleanup failed")
+	}, uninstallPeerCleanupOps{
+		removeRemotePath: func() error {
+			pathCalls++
+			return nil
+		},
+		removePersistentTunnel: func(string, int) error {
+			tunnelCalls++
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "remote cleanup failed") {
+		t.Fatalf("err = %v, want remote cleanup failure", err)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0", pathCalls)
+	}
+	if tunnelCalls != 0 {
+		t.Fatalf("removePersistentTunnel called %d times, want 0", tunnelCalls)
+	}
+}
+
 func TestUninstallPeerRemoteAndConfigRemovesPersistentTunnelState(t *testing.T) {
 	calls := []string{}
 
@@ -1414,6 +1937,170 @@ func TestUninstallPeerRemoteAndConfigSurfacesTunnelCleanupErrors(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "persistent tunnel") {
 		t.Fatalf("err = %v, want tunnel cleanup failure", err)
+	}
+}
+
+// TestUninstallPeerRemoteAndConfigPreservesSharedAssetsWhenOtherPeersRemain
+// is the multi-peer safety pin: when the remote peer registry still lists
+// another laptop's reservation after our release, cc-clip must NOT delete
+// the shared `~/.local/bin/clipcc`, `cc-clip-hook`, Codex notify config,
+// or PATH marker — doing so would silently break the other laptop's
+// clipboard / notification path until its next `cc-clip connect`.
+func TestUninstallPeerRemoteAndConfigPreservesSharedAssetsWhenOtherPeersRemain(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	notifyCalls := 0
+	pathCalls := 0
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removeNotify: func(*peer.Registration) error {
+			notifyCalls++
+			return nil
+		},
+		removeRemotePath: func() error {
+			pathCalls++
+			return nil
+		},
+		countRemainingPeers: func() (int, error) {
+			return 1, nil
+		},
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if notifyCalls != 0 {
+		t.Fatalf("removeNotify called %d times, want 0 while another peer remains", notifyCalls)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0 while another peer remains", pathCalls)
+	}
+}
+
+// TestUninstallPeerRemoteAndConfigRemovesSharedAssetsWhenLastPeer pins the
+// complementary case: once our release leaves zero peers, the shared
+// assets are safe to delete and the cleanup should fire.
+func TestUninstallPeerRemoteAndConfigRemovesSharedAssetsWhenLastPeer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	notifyCalls := 0
+	pathCalls := 0
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removeNotify: func(*peer.Registration) error {
+			notifyCalls++
+			return nil
+		},
+		removeRemotePath: func() error {
+			pathCalls++
+			return nil
+		},
+		countRemainingPeers: func() (int, error) {
+			return 0, nil
+		},
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if notifyCalls != 1 {
+		t.Fatalf("removeNotify called %d times, want 1", notifyCalls)
+	}
+	if pathCalls != 1 {
+		t.Fatalf("removeRemotePath called %d times, want 1", pathCalls)
+	}
+}
+
+// TestUninstallPeerRemoteAndConfigFailsSafeOnCountQueryError pins the
+// "preserve on doubt" rule: if we can't confirm this is the last peer
+// (registry unreadable, ssh flake, …), the shared assets stay put. We'd
+// rather leak a hook script on the remote than wipe one another laptop
+// is actively using.
+func TestUninstallPeerRemoteAndConfigFailsSafeOnCountQueryError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	notifyCalls := 0
+	pathCalls := 0
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removeNotify: func(*peer.Registration) error {
+			notifyCalls++
+			return nil
+		},
+		removeRemotePath: func() error {
+			pathCalls++
+			return nil
+		},
+		countRemainingPeers: func() (int, error) {
+			return 0, errors.New("registry unreadable")
+		},
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if notifyCalls != 0 {
+		t.Fatalf("removeNotify called %d times, want 0 on count failure (fail safe)", notifyCalls)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0 on count failure (fail safe)", pathCalls)
+	}
+}
+
+// TestUninstallPeerPreservesLegacySSHConfigBlock pins the "no auto-migration"
+// contract documented in CLAUDE.md: cc-clip must never silently delete a
+// user's leftover `# >>> cc-clip managed host: ... >>>` block from
+// ~/.ssh/config. If a future contributor adds a cleanup shim, this test will
+// fail because the fake HOME's ssh/config is byte-compared before/after.
+func TestUninstallPeerPreservesLegacySSHConfigBlock(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Defensive: stub the legacy-block advisor so a future refactor that
+	// routes this test through printLegacyManagedBlockAdvisoryIfAny cannot
+	// reach the real user's ~/.ssh/config even if HOME override is leaky.
+	prevAdvisor := legacyManagedBlockAdvisor
+	legacyManagedBlockAdvisor = func(string) string { return "" }
+	t.Cleanup(func() { legacyManagedBlockAdvisor = prevAdvisor })
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	legacy := `Host example.com
+  HostName example.com
+  User me
+
+# >>> cc-clip managed host: example.com >>>
+Host example.com
+  RemoteForward 18339 127.0.0.1:18339
+  ControlMaster no
+  ControlPath none
+# <<< cc-clip managed host: example.com <<<
+`
+	configPath := filepath.Join(sshDir, "config")
+	if err := os.WriteFile(configPath, []byte(legacy), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	err := uninstallPeerRemoteAndConfigWithOps("example.com", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("uninstall returned error: %v", err)
+	}
+
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config after: %v", err)
+	}
+	if string(after) != legacy {
+		t.Fatalf("cc-clip uninstall must not modify ~/.ssh/config.\nbefore:\n%s\nafter:\n%s", legacy, after)
 	}
 }
 
@@ -1858,6 +2545,548 @@ func TestConfiguredPortFlagWinsOverEnv(t *testing.T) {
 			}
 			if explicit != tt.wantExpl {
 				t.Errorf("explicit = %v, want %v", explicit, tt.wantExpl)
+			}
+		})
+	}
+}
+
+// captureStdioMu serialises access to captureStdio. The helper swaps
+// os.Stdout and os.Stderr process-wide, so any t.Parallel() introduced
+// in this package would race on those globals without this guard. The
+// mutex is cheap: the helper is used only in a handful of setup tests.
+var captureStdioMu sync.Mutex
+
+// captureStdio captures both stdout and stderr produced by fn. Used by
+// the applyLaptopSSHConfigSetEnv / removeLaptopSSHConfigSetEnv tests to
+// pin the user-facing success and warning lines separately.
+func captureStdio(t *testing.T, fn func()) (stdout, stderr string) {
+	t.Helper()
+
+	captureStdioMu.Lock()
+	defer captureStdioMu.Unlock()
+
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stdout, os.Stderr = wOut, wErr
+	defer func() {
+		os.Stdout, os.Stderr = oldStdout, oldStderr
+	}()
+
+	fn()
+
+	_ = wOut.Close()
+	_ = wErr.Close()
+	outBytes, _ := io.ReadAll(rOut)
+	errBytes, _ := io.ReadAll(rErr)
+	_ = rOut.Close()
+	_ = rErr.Close()
+	return string(outBytes), string(errBytes)
+}
+
+// TestApplyLaptopSSHConfigSetEnvHappyPath pins that a literal Host block
+// receives the SetEnv marker pair and the success line is printed to
+// stdout (not stderr — operators grep stderr for warnings).
+func TestApplyLaptopSSHConfigSetEnvHappyPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	cfgPath := filepath.Join(sshDir, "config")
+	if err := os.WriteFile(cfgPath, []byte("Host myalias\n  HostName srv.example.com\n"), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	stdout, stderr := captureStdio(t, func() {
+		applyLaptopSSHConfigSetEnv("myalias", 18340, "/home/shared/.cache/cc-clip/peers/peer-a")
+	})
+
+	if stderr != "" {
+		t.Errorf("stderr should be empty on happy path, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "applied cc-clip SetEnv block") || !strings.Contains(stdout, "Host myalias") {
+		t.Errorf("stdout missing success line, got %q", stdout)
+	}
+
+	got, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	for _, want := range []string{
+		sshconfig.MarkerBegin,
+		"SetEnv CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/shared/.cache/cc-clip/peers/peer-a",
+		sshconfig.MarkerEnd,
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("config missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+// TestApplyLaptopSSHConfigSetEnvQuotesStateDirWithSpaces pins the
+// end-to-end behavior when the remote peer registry returns a state dir
+// containing whitespace. `applyLaptopSSHConfigSetEnv` delegates quoting
+// to `sshconfig.Apply`, which must emit the value inside a quoted
+// SetEnv token so `ssh -G` round-trips it verbatim. Without this test
+// a future refactor that splits the SetEnv into two directives (one
+// per var) or bypasses sshconfig's quoting would silently break the
+// remote `clipcc` resolver.
+func TestApplyLaptopSSHConfigSetEnvQuotesStateDirWithSpaces(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	cfgPath := filepath.Join(sshDir, "config")
+	if err := os.WriteFile(cfgPath, []byte("Host myalias\n  HostName srv.example.com\n"), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	spacey := `/home/shared user/.cache/cc-clip/peers/peer a`
+	stdout, stderr := captureStdio(t, func() {
+		applyLaptopSSHConfigSetEnv("myalias", 18340, spacey)
+	})
+	if stderr != "" {
+		t.Errorf("stderr should be empty on happy path with spaced state dir, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "applied cc-clip SetEnv block") {
+		t.Errorf("stdout missing success line, got %q", stdout)
+	}
+	got, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	// sshconfig.Apply emits the value inside quotes when it needs
+	// quoting; the unquoted raw path would round-trip as three tokens
+	// through ssh -G. Assert both halves end up on a single SetEnv line.
+	wantLine := `SetEnv CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR="/home/shared user/.cache/cc-clip/peers/peer a"`
+	if !strings.Contains(string(got), wantLine) {
+		t.Fatalf("ssh_config missing expected quoted SetEnv line %q; got:\n%s", wantLine, got)
+	}
+
+	// ssh -G proves the round-trip: if quoting is wrong, the state dir
+	// arrives as truncated or as multiple setenv entries. Skip on hosts
+	// without ssh (CI containers without the client package).
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skipf("ssh not available: %v", err)
+	}
+	out, err := exec.Command("ssh", "-G", "-F", cfgPath, "myalias").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ssh -G failed: %v\noutput: %s", err, out)
+	}
+	// Historic ssh -G lower-cases the keyword and prints `setenv KEY=VALUE`
+	// per pair; the quoted value is emitted without surrounding quotes.
+	want := "setenv CC_CLIP_STATE_DIR=" + spacey
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("ssh -G did not round-trip spaced state dir; want %q in:\n%s", want, out)
+	}
+}
+
+// TestApplyLaptopSSHConfigSetEnvWarnings exercises every user-facing
+// error branch in applyLaptopSSHConfigSetEnv. Each case pins:
+//   - the warning goes to stderr (matching runShimUninstall and the UNIX
+//     convention that step confirmations land on stdout and anything the
+//     user must notice-or-else lands on stderr; scripted operators grep
+//     stderr for warnings and would miss them on stdout)
+//   - stdout does NOT carry the warning
+//   - the host name appears in the warning (operators need to know which
+//     alias failed)
+//   - a distinctive phrase identifies which branch fired (so a refactor
+//     that collapses two branches into one generic message is caught)
+//   - the success line is NOT emitted on stdout (helper returned from
+//     the warn branch)
+func TestApplyLaptopSSHConfigSetEnvWarnings(t *testing.T) {
+	cases := []struct {
+		name        string
+		setupConfig func(t *testing.T, cfgPath string) // nil = no config file
+		host        string
+		wantPhrase  string // substring that must appear in stdout
+	}{
+		{
+			name: "host_block_missing",
+			setupConfig: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte("Host other\n  HostName other.example\n"), 0600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			},
+			host:       "myalias",
+			wantPhrase: "no `Host myalias` block found",
+		},
+		{
+			name: "only_glob_match",
+			setupConfig: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte("Host *.example.com\n  User shared\n"), 0600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			},
+			host:       "box.example.com",
+			wantPhrase: "matched only by a wildcard or negation pattern",
+		},
+		{
+			name: "host_block_in_include",
+			setupConfig: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte("Include ~/.ssh/conf.d/*.conf\nHost other\n  HostName other.example\n"), 0600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			},
+			host:       "myalias",
+			wantPhrase: "does not walk Include directives",
+		},
+		{
+			name: "symlinked_config",
+			setupConfig: func(t *testing.T, p string) {
+				real := p + ".real"
+				if err := os.WriteFile(real, []byte("Host myalias\n  HostName srv\n"), 0600); err != nil {
+					t.Fatalf("write real: %v", err)
+				}
+				if err := os.Symlink(real, p); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+			},
+			host:       "myalias",
+			wantPhrase: "~/.ssh/config is a symlink",
+		},
+		{
+			name:        "missing_config_file",
+			setupConfig: nil, // leave ~/.ssh/config absent
+			host:        "myalias",
+			wantPhrase:  "~/.ssh/config not found",
+		},
+		{
+			name: "existing_setenv_conflict",
+			setupConfig: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte("Host myalias\n  HostName srv\n  SetEnv FOO=bar\n"), 0600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			},
+			host:       "myalias",
+			wantPhrase: "already has a user-authored SetEnv directive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			sshDir := filepath.Join(home, ".ssh")
+			if err := os.MkdirAll(sshDir, 0700); err != nil {
+				t.Fatalf("mkdir .ssh: %v", err)
+			}
+			cfgPath := filepath.Join(sshDir, "config")
+			if tc.setupConfig != nil {
+				tc.setupConfig(t, cfgPath)
+			}
+
+			stdout, stderr := captureStdio(t, func() {
+				applyLaptopSSHConfigSetEnv(tc.host, 18340, "/tmp/state")
+			})
+
+			if !strings.Contains(stderr, tc.wantPhrase) {
+				t.Errorf("stderr missing %q; got:\n%s", tc.wantPhrase, stderr)
+			}
+			if !strings.Contains(stderr, tc.host) {
+				t.Errorf("stderr missing host %q; got:\n%s", tc.host, stderr)
+			}
+			if strings.Contains(stdout, tc.wantPhrase) {
+				t.Errorf("stdout should not carry warning; got:\n%s", stdout)
+			}
+			if strings.Contains(stdout, "applied cc-clip SetEnv block") {
+				t.Errorf("unexpected success line on stdout: %q", stdout)
+			}
+		})
+	}
+}
+
+// TestApplyLaptopSSHConfigSetEnvIsNotInRollback pins the intentional
+// late-failure contract: once runConnect has called
+// applyLaptopSSHConfigSetEnv, a subsequent Codex/notification-bridge
+// failure does NOT revert the ssh_config SetEnv block. The tunnel is
+// already live and the block accurately reflects remote state;
+// reverting would strip working config on a transient late-stage glitch.
+//
+// A regression would be a refactor that moves applyLaptopSSHConfigSetEnv
+// into a `rollback` / `failAfterSave` closure. We detect that source-level
+// via the Go AST: every CallExpr of applyLaptopSSHConfigSetEnv must have
+// the enclosing FuncDecl `runConnect` as its nearest function ancestor,
+// NOT any intervening FuncLit (closure) — because a FuncLit inside
+// runConnect is exactly the shape of a rollback callback.
+//
+// Using go/parser + ast.Inspect rather than a hand-rolled brace counter
+// avoids false positives from raw string literals, rune literals that
+// happen to contain `{` or `}`, or reformatted source.
+func TestApplyLaptopSSHConfigSetEnvIsNotInRollback(t *testing.T) {
+	fset := gotoken.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	var runConnectDecl *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fd.Recv == nil && fd.Name != nil && fd.Name.Name == "runConnect" {
+			runConnectDecl = fd
+			break
+		}
+	}
+	if runConnectDecl == nil {
+		t.Fatal("func runConnect(...) not found; rename or move broke the test")
+	}
+
+	foundInRunConnect := 0
+	var stack []ast.Node
+	ast.Inspect(runConnectDecl, func(n ast.Node) bool {
+		if n == nil {
+			// Pop on ascent.
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			return false
+		}
+		// Check BEFORE we push: a CallExpr at this point has `stack` equal to
+		// its ancestors within runConnectDecl.
+		if call, ok := n.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "applyLaptopSSHConfigSetEnv" {
+				pos := fset.Position(call.Pos())
+				if insideFuncLit(stack) {
+					t.Errorf("applyLaptopSSHConfigSetEnv call at %s is inside a nested FuncLit (rollback/closure) — it must live directly in runConnect so late failures don't revert the ssh_config SetEnv block", pos)
+				}
+				foundInRunConnect++
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+
+	if foundInRunConnect == 0 {
+		t.Fatal("no applyLaptopSSHConfigSetEnv calls found in runConnect; the test is stale or the wiring regressed")
+	}
+
+	// Second invariant: the ONLY calls to applyLaptopSSHConfigSetEnv in
+	// this package must live inside runConnect. A hidden rollback closure
+	// defined in a sibling function would otherwise slip past the first
+	// assertion. We do a full-file walk and count occurrences across all
+	// function bodies; the count must equal what we counted inside
+	// runConnect.
+	totalCalls := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "applyLaptopSSHConfigSetEnv" {
+				totalCalls++
+			}
+		}
+		return true
+	})
+	if totalCalls != foundInRunConnect {
+		t.Errorf("found %d total applyLaptopSSHConfigSetEnv calls in main.go but only %d inside runConnect; the extra call(s) likely live in a rollback/closure elsewhere", totalCalls, foundInRunConnect)
+	}
+}
+
+// insideFuncLit reports whether any ancestor in `stack` is a *ast.FuncLit
+// — i.e. a function literal (closure) created inside the top-level
+// FuncDecl being inspected. Used by TestApplyLaptopSSHConfigSetEnvIsNotInRollback.
+func insideFuncLit(stack []ast.Node) bool {
+	for _, n := range stack {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunConnectCallsApplyLaptopSSHConfigSetEnvOnBothPaths is an
+// anti-regression guard for the P2 finding that the wiring between
+// runConnect / --token-only and applyLaptopSSHConfigSetEnv was unpinned.
+// Without this, a refactor that deletes either call site compiles and
+// passes every unit test, even though interactive ssh sessions would
+// then silently stop pushing CC_CLIP_PORT / CC_CLIP_STATE_DIR — breaking
+// the multi-laptop shared-account feature.
+//
+// The guard is source-level (same shape as internal/setup's anti-feature
+// test): locate runConnect's body and verify it contains at least two
+// call sites, one inside a `return`-terminated branch (the token-only
+// fast path) and one outside (the full-deploy path). A single call is
+// insufficient — either branch missing the call would silently break
+// that path, and both matter.
+func TestRunConnectCallsApplyLaptopSSHConfigSetEnvOnBothPaths(t *testing.T) {
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	lines := strings.Split(string(data), "\n")
+
+	startIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "func runConnect(") {
+			startIdx = i
+			break
+		}
+	}
+	if startIdx < 0 {
+		t.Fatal("func runConnect(...) not found in main.go; test is stale if runConnect was renamed")
+	}
+	endIdx := -1
+	for i := startIdx + 1; i < len(lines); i++ {
+		if lines[i] == "}" {
+			endIdx = i
+			break
+		}
+	}
+	if endIdx < 0 {
+		t.Fatal("closing brace for runConnect not found; runConnect must end with a `}` at column 0")
+	}
+
+	body := lines[startIdx : endIdx+1]
+	var callLines []int
+	for i, line := range body {
+		if strings.Contains(line, "applyLaptopSSHConfigSetEnv(") {
+			callLines = append(callLines, i)
+		}
+	}
+
+	if len(callLines) < 2 {
+		t.Fatalf("runConnect must contain at least two calls to applyLaptopSSHConfigSetEnv (one inside `if tokenOnly` branch, one in the full-deploy path); got %d at line offsets %v", len(callLines), callLines)
+	}
+
+	// At least one call must be followed by a `return` within a few lines —
+	// that is the token-only fast-path signature. Without it the test would
+	// pass trivially on a refactor that kept only the full-path call site.
+	foundReturnAfter := false
+	for _, ci := range callLines {
+		for j := ci + 1; j < len(body) && j <= ci+10; j++ {
+			trimmed := strings.TrimSpace(body[j])
+			if trimmed == "return" {
+				foundReturnAfter = true
+				break
+			}
+			// Stop scanning if we hit another top-level directive.
+			if strings.HasPrefix(trimmed, "fmt.Println(") || strings.HasPrefix(trimmed, "if ") {
+				break
+			}
+		}
+		if foundReturnAfter {
+			break
+		}
+	}
+	if !foundReturnAfter {
+		t.Errorf("expected at least one applyLaptopSSHConfigSetEnv call followed closely by `return` (the token-only fast path); call offsets = %v", callLines)
+	}
+}
+
+// TestRemoveLaptopSSHConfigSetEnvSymlinkRefused pins that Remove also
+// surfaces the symlink warning (not just Apply) and leaves the symlink
+// intact — replacing it with a regular file would detach a user's
+// dotfiles silently.
+func TestRemoveLaptopSSHConfigSetEnvSymlinkRefused(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	real := filepath.Join(sshDir, "config.real")
+	if err := os.WriteFile(real, []byte("Host myalias\n  HostName srv\n"), 0600); err != nil {
+		t.Fatalf("write real: %v", err)
+	}
+	link := filepath.Join(sshDir, "config")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	stdout, stderr := captureStdio(t, func() {
+		removeLaptopSSHConfigSetEnv("myalias")
+	})
+
+	if !strings.Contains(stderr, "~/.ssh/config is a symlink") {
+		t.Errorf("expected symlink warning on stderr; got %q", stderr)
+	}
+	if strings.Contains(stdout, "~/.ssh/config is a symlink") {
+		t.Errorf("stdout should not carry warning; got %q", stdout)
+	}
+	// Symlink must survive unchanged.
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat after remove: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink was replaced with a regular file")
+	}
+}
+
+// TestRemoveLaptopSSHConfigSetEnvMissingConfigIsSilent pins that
+// removing when ~/.ssh/config is absent prints the success line (idempotent
+// cleanup) with no warning on stderr — uninstall must not scare users who
+// never had a config file.
+func TestRemoveLaptopSSHConfigSetEnvMissingConfigIsSilent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// No ~/.ssh dir at all.
+
+	stdout, stderr := captureStdio(t, func() {
+		removeLaptopSSHConfigSetEnv("myalias")
+	})
+
+	if stderr != "" {
+		t.Errorf("stderr should be empty for missing config, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "Removed cc-clip SetEnv block") {
+		t.Errorf("stdout should print success line, got %q", stdout)
+	}
+}
+
+// TestLocalSSHConfigDisplayPathFallsBackWhenHomeUnresolvable pins the
+// defensive "~/.ssh/config" fallback so success messages never print an
+// empty path if $HOME is somehow unset.
+func TestLocalSSHConfigDisplayPathFallsBackWhenHomeUnresolvable(t *testing.T) {
+	// os.UserHomeDir returns an error when HOME is empty on Unix.
+	if runtime.GOOS == "windows" {
+		t.Skip("HOME semantics differ on Windows")
+	}
+	t.Setenv("HOME", "")
+	got := localSSHConfigDisplayPath()
+	if got == "" {
+		t.Fatal("localSSHConfigDisplayPath returned empty string; should fall back to ~/.ssh/config")
+	}
+}
+
+// TestClassifyErrorPreservesExitCodeSegments pins the P1-2 review fix: the
+// error classifier must surface distinct exit codes for business-level
+// failures (TokenInvalid=12, NoImage=10), tunnel/transport issues
+// (TunnelUnreachable=11), and everything else (DownloadFailed=13). Before
+// this fix, every non-business error collapsed to DownloadFailed, hiding
+// tunnel flap signals from operators and tooling.
+func TestClassifyErrorPreservesExitCodeSegments(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"nil", nil, 0},
+		{"token-invalid-wrapped", fmt.Errorf("wrap: %w", tunnel.ErrTokenInvalid), 12},
+		{"no-image-wrapped", fmt.Errorf("wrap: %w", tunnel.ErrNoImage), 10},
+		{"tunnel-not-found", fmt.Errorf("wrap: %w", tunnel.ErrTunnelNotFound), 11},
+		{"context-deadline", fmt.Errorf("wrap: %w", context.DeadlineExceeded), 11},
+		{"net-op-error", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}, 11},
+		{"io-unexpected-eof", fmt.Errorf("wrap: %w", io.ErrUnexpectedEOF), 11},
+		{"plain-string", errors.New("some daemon response garbage"), 13},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyError(tc.err)
+			if got != tc.want {
+				t.Fatalf("classifyError(%v) = %d, want %d", tc.err, got, tc.want)
 			}
 		})
 	}

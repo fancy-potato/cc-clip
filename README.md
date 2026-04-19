@@ -81,7 +81,7 @@ Host myserver
     IdentityFile ~/.ssh/id_rsa  # optional, if using key auth
 ```
 
-Use a stable alias such as `myserver` for the cc-clip commands (`cc-clip setup`, `cc-clip connect`, `cc-clip tunnel up`). cc-clip does **not** modify `~/.ssh/config`; it only needs the alias to resolve via `ssh -G` and to know how to reach the remote. The reverse tunnel used for clipboard and notifications is owned by the local cc-clip daemon (`cc-clip serve`, launchd-managed on macOS), not by your interactive SSH session.
+Use a stable alias such as `myserver` for the cc-clip commands (`cc-clip setup`, `cc-clip connect`, `cc-clip tunnel up`). cc-clip does **not** write tunnel directives to `~/.ssh/config`; it only uses the alias to resolve via `ssh -G` and to know how to reach the remote. The one narrow exception is its managed `SetEnv` marker block inside an existing `Host <alias>` entry for the shared-account multi-laptop flow. The reverse tunnel used for clipboard and notifications is still owned by the local cc-clip daemon (`cc-clip serve`, launchd-managed on macOS), not by your interactive SSH session.
 
 If you are on Windows and want the SSH/Claude Code workflow, use the dedicated guide:
 
@@ -133,7 +133,7 @@ This single command handles everything:
 3. Deploys the binary and shim to the remote server
 4. Reserves the peer's remote port, records a local tunnel state file under `~/.cache/cc-clip/tunnels/`, and auto-starts the daemon-managed reverse tunnel
 
-`cc-clip` does **not** write to `~/.ssh/config`. Your interactive `ssh <alias>` sessions are unaffected; the reverse tunnel used for clipboard and notifications is owned entirely by the local cc-clip daemon.
+`cc-clip` does **not** write tunnel directives to `~/.ssh/config`. It may append or update its managed `SetEnv` block inside an existing `Host <alias>` entry, but your reverse tunnel is still owned entirely by the local cc-clip daemon.
 
 Pass `--no-tunnel` to `cc-clip setup` / `cc-clip connect` if you prefer to drive the tunnel yourself (e.g. from systemd, SwiftBar, or a CI runner). The state file is still recorded so `cc-clip tunnel up <host>` later has everything it needs.
 
@@ -141,7 +141,7 @@ Pass `--no-tunnel` to `cc-clip setup` / `cc-clip connect` if you prefer to drive
 
 Before you run setup, make sure:
 - You pass the SSH alias from `~/.ssh/config`, not `user@host`.
-- The alias resolves via `ssh -G <alias>` — cc-clip only reads this; it does not rewrite the file.
+- The alias resolves via `ssh -G <alias>` — cc-clip reads this to reach the remote and may manage its own `SetEnv` marker block inside that alias's `Host` entry.
 - Your SSH key is in `ssh-agent` (or password-less). The daemon-managed tunnel uses `BatchMode=yes` and cannot prompt for a passphrase.
 
 <details>
@@ -370,7 +370,7 @@ echo '{"hook_event_name":"Stop","stop_hook_reason":"stop_at_end_of_turn","last_a
 # Expected: local Mac shows notification popup
 
 # 5. Check health log for failures:
-cat ~/.cache/cc-clip/notify-health.log
+cat "${CC_CLIP_STATE_DIR:-$HOME/.cache/cc-clip}/notify-health.log"
 # If exists: shows timestamps and HTTP error codes
 ```
 
@@ -461,8 +461,16 @@ cc-clip tunnel remove myserver
 
 - The local daemon port defaults to `18339`. Override per-command with `--port`, or globally with `CC_CLIP_PORT`.
 - A persistent tunnel's `local_port` (the endpoint of `ssh -R <remote>:127.0.0.1:<local_port>`) is always equal to the owning daemon's HTTP port — the reverse forward is only useful if it lands on a port where a daemon is actually listening. A daemon only manages tunnels whose `local_port` matches its own listening port.
-- `tunnel up` / `down` / `remove` accept a single `--port` flag that selects the daemon to talk to. `tunnel up` will also adopt the daemon port recorded in the tunnel-state file when `--port` is not given, so `cc-clip tunnel up <host>` routes to the right daemon automatically in single-daemon setups.
+- `tunnel up` / `down` / `remove` accept a single `--port` flag that selects the daemon to talk to. When `--port` is not given, `tunnel up` adopts the daemon port recorded in the tunnel-state file whenever ownership is unambiguous, even if you passed `--remote-port`.
 - To act on a specific daemon's tunnel in a multi-daemon setup, point `--port` (or `CC_CLIP_PORT`) at that daemon.
+
+#### One local port, many remote servers
+
+Running `cc-clip setup` / `cc-clip connect` against multiple remote hosts from the same laptop **shares a single local daemon port** (default `18339`) — this is the intended design, not a limitation:
+
+- The local daemon listens once on `127.0.0.1:18339`. Every reverse tunnel (`ssh -N -R <remotePort>:127.0.0.1:18339 <host>`) lands back on that same port.
+- Each host gets its **own** `<remotePort>` allocated by the remote peer registry, recorded in `~/.cache/cc-clip/tunnels/<host>-18339-<hash>.json`. Collisions between hosts are impossible because the remote ports live in different remote namespaces.
+- You do **not** need to pick a different `--port` / `CC_CLIP_PORT` per host. Only use a different port when you deliberately want to run a second daemon instance on the same laptop (rare — e.g. isolating a work vs. personal session).
 
 > **Requirement:** Persistent tunnels use `BatchMode=yes` (no interactive prompts). Your SSH key must be in `ssh-agent` or passwordless. Run `ssh-add` if needed.
 >
@@ -533,11 +541,13 @@ Click the menu bar icon to see per-host details:
 |---------|-------------|
 | `cc-clip setup <host>` | **Full setup**: deps, daemon, deploy, tunnel state |
 | `cc-clip setup <host> --codex` | Full setup with Codex CLI support |
+| `cc-clip setup <host> --no-tunnel` | Full setup but skip auto-starting the tunnel (bring it up later with `cc-clip tunnel up`) |
 | `cc-clip connect <host>` | Deploy to remote (incremental) |
 | `cc-clip connect <host> --token-only` | Sync token only (fast) |
 | `cc-clip connect <host> --force` | Full redeploy ignoring cache |
+| `cc-clip connect <host> --no-tunnel` | Deploy + record tunnel state without auto-starting the tunnel (bring it up later with `cc-clip tunnel up`) |
 | `cc-clip tunnel list` | List persistent tunnels and their status |
-| `cc-clip tunnel up <host>` | Start a persistent tunnel to a host |
+| `cc-clip tunnel up <host>` | Start a persistent tunnel (also the refresh command: re-reads `~/.ssh/config` so edits take effect; explicit `--remote-port` overrides only the remote-port lookup, not daemon ownership) |
 | `cc-clip tunnel down <host>` | Stop a persistent tunnel owned by this daemon (select with `--port` / `CC_CLIP_PORT` if you run several) |
 | `cc-clip tunnel remove <host>` | Stop and delete a persistent tunnel's saved state (select daemon with `--port`) |
 | `cc-clip notify --title T --body B` | Send a notification through the tunnel |
@@ -562,8 +572,10 @@ Click the menu bar icon to see per-host details:
 | `cc-clip connect <host> --codex` | Deploy with Codex support (Xvfb + x11-bridge) |
 | `cc-clip connect <host> --token-only` | Sync token only (fast) |
 | `cc-clip connect <host> --force` | Full redeploy ignoring cache |
+| `cc-clip connect <host> --no-tunnel` | Deploy + persist tunnel state without auto-starting the tunnel |
+| `cc-clip setup <host> --no-tunnel` | Same as connect's `--no-tunnel` for the full setup flow |
 | `cc-clip tunnel list [--json]` | List persistent tunnels |
-| `cc-clip tunnel up <host> [--remote-port N]` | Start a persistent tunnel (remote port auto-detected from saved tunnel state if omitted) |
+| `cc-clip tunnel up <host> [--remote-port N]` | Start a persistent tunnel (remote port auto-detected from saved tunnel state if omitted; explicit `--remote-port` overrides only the remote-port lookup, and `--port` is still required when daemon ownership is ambiguous) |
 | `cc-clip tunnel down <host>` | Stop the tunnel owned by the current daemon (select with `--port` / `CC_CLIP_PORT`) |
 | `cc-clip tunnel remove <host>` | Stop and delete the tunnel's saved state (select daemon with `--port`) |
 | `cc-clip serve` | Start daemon in foreground |
@@ -588,8 +600,8 @@ Click the menu bar icon to see per-host details:
 | `cc-clip install --target <target>` | Install a local `xclip` or `wl-paste` shim |
 | `cc-clip uninstall` | Remove a local shim; `auto` removes the installed shim when exactly one exists |
 | `cc-clip uninstall --target <target>` | Remove the specified local shim explicitly |
-| `cc-clip uninstall --host <host>` | Remove the remote PATH marker (add `--peer` to also release the peer lease and delete local tunnel state). Upgraders: also delete any legacy `~/.ssh/config` managed block by hand — see [Complete uninstall](#complete-uninstall). |
-| `cc-clip uninstall --host <host> --peer` | Remote PATH marker + release the peer lease + delete local tunnel state for this host. Upgraders: also delete any legacy `~/.ssh/config` managed block by hand — see [Complete uninstall](#complete-uninstall). |
+| `cc-clip uninstall --host <host>` | Remove the remote PATH marker only. Add `--peer` when you also want to release this workstation's peer lease, remove host-scoped notification assets, delete local tunnel state, and remove the managed local `SetEnv` block. Upgraders: also delete any legacy `~/.ssh/config` managed block by hand — see [Complete uninstall](#complete-uninstall). |
+| `cc-clip uninstall --host <host> --peer` | Remote PATH marker + release this workstation's peer lease + remove host-scoped notification assets + delete local tunnel state for this host + remove the managed local `SetEnv` block. Upgraders: also delete any legacy `~/.ssh/config` managed block by hand — see [Complete uninstall](#complete-uninstall). |
 | `cc-clip uninstall --codex` | Remove Codex support (local) |
 | `cc-clip uninstall --codex --host <host>` | Remove Codex support from remote |
 
@@ -601,8 +613,9 @@ cc-clip no longer ships `uninstall-all.sh` / `uninstall-local.sh`. For a full re
 
 ```bash
 # Remote: release the peer lease, remove the remote PATH marker, delete local tunnel state for this host.
-# Bare `--peer` auto-discovers your local peer id (see `cc-clip status` for the value);
-# pass --peer-id <id> only when cleaning up a different workstation's lease.
+# Bare `--peer` auto-discovers your local peer id (see `cc-clip status` for the value).
+# If the local identity files are gone, `--peer-id self` forces this workstation's
+# cleanup path. Pass `--peer-id <id>` only when cleaning up a different workstation's lease.
 cc-clip uninstall --host myserver --peer
 
 # Remote Codex assets (only if you set up --codex)
@@ -619,6 +632,58 @@ cc-clip service uninstall
 ```
 
 If you upgraded from a pre-daemon-tunnel release, also delete any leftover `# >>> cc-clip managed host: … >>>` block from `~/.ssh/config` by hand (cc-clip does not auto-clean it).
+
+## Multi-laptop on a Shared Remote Account
+
+If two or more laptops SSH into the **same** Unix account on the remote, each laptop's `cc-clip setup` reserves a unique remote port in the per-peer registry, but the installed `clipcc` / `cc-clip-hook` / xclip shim scripts are single-file and only carry the most recent setup's port as their fallback. The fix is to push per-laptop env vars at SSH login time so each session steers the shared shims at the right port and per-peer state directory.
+
+### Step 1: Server admin — allow env passthrough (one-time)
+
+Edit `/etc/ssh/sshd_config` and add (or merge into an existing `AcceptEnv` line):
+
+```
+AcceptEnv CC_CLIP_PORT CC_CLIP_STATE_DIR
+```
+
+Reload sshd:
+
+```bash
+sudo systemctl reload ssh      # Debian/Ubuntu
+# or: sudo systemctl reload sshd   # RHEL/Fedora
+```
+
+### Step 2: On each laptop — run setup or connect as usual
+
+`cc-clip setup <host>`, `cc-clip connect <host>`, and `cc-clip connect <host> --token-only` automatically append or refresh a managed block **inside your existing `Host <host>` entry** in `~/.ssh/config`:
+
+```
+Host myalias
+  HostName server.example.com
+  User shareduser
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/shareduser/.cache/cc-clip/peers/<peerID>
+  # <<< cc-clip SetEnv (do not edit) <<<
+```
+
+**Preconditions:**
+
+- You already have a `Host <host>` block in `~/.ssh/config`. cc-clip does not create one.
+- The `Host <host>` block must live in the **top-level** `~/.ssh/config` file. cc-clip does not walk `Include` directives (doing so would let a path-traversal exploit in an included file rewrite an unrelated one), so a `Host` block buried inside an `Include ~/.ssh/config.d/*` fragment is invisible to `cc-clip setup` / `connect`. Inline the block into the top-level file, or manage the `SetEnv` block manually inside the fragment — see "cc-clip does not walk Include directives" in `docs/troubleshooting.md`.
+- `~/.ssh/config` must be a regular file on this laptop. **Symlinked SSH configs are unsupported**: cc-clip refuses to rewrite a symlink because replacing it would detach the path from your dotfiles target. Keep the `SetEnv` block in a regular `~/.ssh/config`, or manage the block manually if you insist on a symlinked layout.
+- The block uses a literal alias token — **wildcard entries (`Host *`, `Host *.example.com`, `Host ?foo`) are unsupported**: cc-clip refuses to inject `SetEnv` into a wildcard block because the env vars would leak to every host the pattern matches. Add a literal `Host myalias` entry.
+- If the matching `Host <alias>` already contains a user-authored `SetEnv`, cc-clip warns and refuses to inject its own block. OpenSSH only honors the first `SetEnv` directive, so merge `CC_CLIP_PORT` and `CC_CLIP_STATE_DIR` into that first `SetEnv` manually.
+- `SetEnv` in `ssh_config` requires OpenSSH 7.8+ on the client (released 2018-08).
+
+`cc-clip uninstall --host <host> --peer` removes the marker block from the same entry after the remote PATH cleanup succeeds and the local peer cleanup completes. Plain `cc-clip uninstall --host <host>` preserves the local block so a workstation that is only removing the remote PATH marker does not silently lose its per-peer routing env. If the SSH cleanup step fails, cc-clip warns and leaves the local block intact. Other `SetEnv` lines you added by hand are preserved.
+
+### Step 3: Verify
+
+```bash
+ssh <host> 'echo "$CC_CLIP_PORT $CC_CLIP_STATE_DIR"'
+# should print your reserved port and per-peer state dir
+```
+
+If both are empty: the server's `AcceptEnv` is missing or sshd has not been reloaded. If `CC_CLIP_PORT` is empty but the SetEnv block is present locally, your laptop's OpenSSH is older than 7.8. **Manual workaround (not equivalent to the managed block):** upgrade OpenSSH if possible — the `SendEnv` + shell-export fallback below defeats the point of per-peer automation because you have to keep the exported values in sync with the reserved port yourself, and two concurrent shells exporting different values on the same laptop will race. If you truly cannot upgrade, configure `SendEnv CC_CLIP_PORT CC_CLIP_STATE_DIR` in your laptop's SSH client config (or pass `ssh -o SendEnv=CC_CLIP_PORT -o SendEnv=CC_CLIP_STATE_DIR ...`) and `export CC_CLIP_PORT=… CC_CLIP_STATE_DIR=…` in the local shell before running `ssh` — you are now responsible for keeping those exports in sync with whatever port the registry reserved for this laptop.
 
 ## Configuration
 
@@ -748,7 +813,7 @@ If step 3 fails, the PATH fix didn't take effect. Open a fresh SSH session, or r
 
 **Cause:** You are upgrading from an older `cc-clip` release whose managed block in `~/.ssh/config` still contains a `RemoteForward` directive. The cc-clip daemon already owns that port, so OpenSSH's attempt to bind the forward on your interactive session fails. The warning is harmless — clipboard and notifications continue to work through the daemon-owned tunnel.
 
-**Fix:** delete the stale block by hand. This migration is intentionally manual; cc-clip does not rewrite `~/.ssh/config` for you during `setup`, `connect`, or `uninstall`:
+**Fix:** delete the stale block by hand. This migration is intentionally manual; cc-clip only manages the newer `SetEnv` marker block and will not rewrite this legacy tunnel block for you during `setup`, `connect`, or `uninstall`:
 
 ```
 # >>> cc-clip managed host: myserver >>>

@@ -116,7 +116,7 @@ func TestHookScriptPassesBashSyntaxCheck(t *testing.T) {
 
 // TestHookScriptHostAliasSurvivesQuoteInjection verifies that a hostname
 // containing characters that would break out of a naive single-quoted
-// Python interpolation (`'`, `"`, `$`, `` ` ``) does NOT cause the script
+// Python interpolation (`'`, `"`, `$`, “ ` “) does NOT cause the script
 // to crash and does NOT execute host-supplied code. Runs the emitted
 // script as a standalone file with a poisoned CC_CLIP_HOST_ALIAS and a
 // valid stdin payload; asserts the script exits 0 (fire-and-forget contract),
@@ -132,10 +132,10 @@ func TestHookScriptHostAliasSurvivesQuoteInjection(t *testing.T) {
 	dir := t.TempDir()
 
 	var (
-		mu       sync.Mutex
-		gotBody  []byte
-		gotAuth  string
-		gotHits  int
+		mu      sync.Mutex
+		gotBody []byte
+		gotAuth string
+		gotHits int
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -255,6 +255,17 @@ func TestHookScriptHostAliasMissingPython3FallbackPreservesPayload(t *testing.T)
 		}
 	}
 
+	// Precondition: python3 must NOT be resolvable from the shimmed PATH,
+	// otherwise the test would be exercising the happy path instead of the
+	// fallback it claims to pin.
+	if _, err := os.Stat(filepath.Join(binDir, "python3")); err == nil {
+		t.Fatalf("test setup bug: python3 present in shimmed PATH (%s); cannot exercise fallback", binDir)
+	}
+	// Log the preconditions we rely on so any future skip or precondition
+	// failure is visible in test output — the fallback branch is valuable
+	// coverage, and a silent skip would let a real regression hide.
+	t.Logf("precondition: shimmed PATH=%s (python3 deliberately absent)", binDir)
+
 	scriptPath := filepath.Join(dir, "cc-clip-hook")
 	if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -291,36 +302,280 @@ func TestHookScriptHostAliasMissingPython3FallbackPreservesPayload(t *testing.T)
 	}
 }
 
-// TestHookScriptFallbackPreservesExitCodeWithoutPython pins the degraded
-// behavior when python3 is missing: the hook must still exit 0. Runs with
-// PATH scoped to a directory that has neither python3 nor curl; the POST
-// will fail (no curl) but, because CC_CLIP_STRICT is not set, the script's
-// fire-and-forget contract says it exits 0 anyway.
-func TestHookScriptFallbackPreservesExitCodeWithoutPython(t *testing.T) {
+func TestHookScriptTrimsCRFromNonceFile(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skipf("bash not available: %v", err)
 	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
 	dir := t.TempDir()
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("crlf-nonce\r\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
 	scriptPath := filepath.Join(dir, "cc-clip-hook")
 	if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	// Provide a minimal PATH that resolves `head`, `date`, `cat`, but not
-	// python3 or curl. The script uses `set -euo pipefail`; the python3
-	// branch's `|| echo ...` keeps the pipeline alive, and the curl branch's
-	// `|| _http_code="000"` absorbs the missing binary.
 	cmd := exec.Command("bash", scriptPath)
 	cmd.Env = append(os.Environ(),
-		"PATH=/usr/bin:/bin",
-		"CC_CLIP_HOST_ALIAS=pythonless.example",
 		"CC_CLIP_STATE_DIR="+dir,
+		"CC_CLIP_PORT="+u.Port(),
 	)
 	cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// Note: this test will only catch a regression on systems where the
-		// minimal PATH genuinely lacks python3. On systems where python3 is
-		// at /usr/bin/python3 it still passes (python3 handles the payload).
-		// Either way, exit != 0 is a fire-and-forget contract violation.
-		t.Fatalf("hook script exited nonzero when python3/curl absent: %v\noutput: %s", err, out)
+		t.Fatalf("hook script exited nonzero with CRLF nonce: %v\noutput: %s", err, out)
+	}
+	if gotAuth != "Bearer crlf-nonce" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer crlf-nonce")
+	}
+}
+
+// TestHookScriptFireAndForgetOnHTTP500 pins the fire-and-forget contract:
+// when CC_CLIP_STRICT is unset (the default installed behavior), a remote
+// daemon returning HTTP 500 must still cause the hook to exit 0 and append
+// the real status code to the health log. A regression that starts
+// propagating non-2xx would silently block Claude Code.
+func TestHookScriptFireAndForgetOnHTTP500(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("n\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+	scriptPath := filepath.Join(dir, "cc-clip-hook")
+	if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"CC_CLIP_STATE_DIR="+dir,
+		"CC_CLIP_PORT="+u.Port(),
+		// CC_CLIP_STRICT intentionally unset — fire-and-forget branch.
+	)
+	cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hook script exited nonzero on HTTP 500 without strict mode: %v\noutput: %s", err, out)
+	}
+
+	logPath := filepath.Join(dir, "notify-health.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("health log not written: %v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "FAIL http=500") {
+		t.Fatalf("health log missing real status code; got: %q", body)
+	}
+	if strings.Contains(body, "FAIL http=000") {
+		t.Fatalf("health log reports http=000 instead of real 500 — curl -f clobber regression: %q", body)
+	}
+}
+
+// TestHookScriptStrictModePropagatesHTTP500 pins the strict-mode branch:
+// when CC_CLIP_STRICT=1 and the daemon returns non-2xx, the hook must exit 1
+// and print the real status code to stdout so `cc-clip connect`'s health
+// probe can surface it. Complements the fire-and-forget test above.
+func TestHookScriptStrictModePropagatesHTTP500(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("n\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+	scriptPath := filepath.Join(dir, "cc-clip-hook")
+	if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"CC_CLIP_STATE_DIR="+dir,
+		"CC_CLIP_PORT="+u.Port(),
+		"CC_CLIP_STRICT=1",
+	)
+	cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("strict mode must exit nonzero on HTTP 500; got exit 0\noutput: %s", out)
+	}
+	// Exact literal, not just substring: runRemoteNotificationHealthProbe
+	// greps this wording to surface the failure to the user. A reworded
+	// printf with a matching template string would pass a loose substring
+	// check but silently break the end-to-end probe.
+	const wantLiteral = "cc-clip-hook health probe failed: http=500"
+	if !strings.Contains(string(out), wantLiteral) {
+		t.Fatalf("strict-mode probe stdout missing exact literal %q; got: %q", wantLiteral, out)
+	}
+	if strings.Contains(string(out), "http=000") {
+		t.Fatalf("probe reports http=000 instead of real 500 — curl -f clobber regression: %q", out)
+	}
+}
+
+func TestHookScriptFireAndForgetOnCurlFailureWritesHTTP000(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("n\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.Mkdir(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	for _, tool := range []string{"bash", "cat", "head", "date"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("%s not available: %v", tool, err)
+		}
+		if err := os.Symlink(p, filepath.Join(binDir, tool)); err != nil {
+			t.Fatalf("symlink %s: %v", tool, err)
+		}
+	}
+
+	scriptPath := filepath.Join(dir, "cc-clip-hook")
+	if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cmd := exec.Command(filepath.Join(binDir, "bash"), scriptPath)
+	cmd.Env = []string{
+		"PATH=" + binDir,
+		"HOME=" + dir,
+		"CC_CLIP_STATE_DIR=" + dir,
+		"CC_CLIP_PORT=65534",
+	}
+	cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hook script exited nonzero on curl failure path: %v\noutput: %s", err, out)
+	}
+
+	logPath := filepath.Join(dir, "notify-health.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("health log not written: %v", err)
+	}
+	if !strings.Contains(string(data), "FAIL http=000") {
+		t.Fatalf("health log missing curl-failure marker: %q", data)
+	}
+}
+
+// TestHookScriptHostAliasSurvivesPathologicalInput covers CC_CLIP_HOST_ALIAS
+// values that would break naive string-interpolation of the alias into the
+// Python payload-rewriter: newlines (Python statement separator), trailing
+// backslashes (string-literal continuation in some languages), and mixed
+// single/double quotes. `hostname -s` will never produce these, but an
+// operator could set the env var manually. For each case the emitted script
+// must still exit 0, refuse to execute host-supplied code, and deliver the
+// literal alias as the `_cc_clip_host` JSON field (proving the env-var path
+// is actually read end-to-end, not just silently stripped).
+func TestHookScriptHostAliasSurvivesPathologicalInput(t *testing.T) {
+	// Log the precondition outcome so a silent skip in minimal CI images
+	// (no python3 / curl / bash) is traceable without re-running with -v
+	// on every test ID. Mirrors the sibling test at
+	// TestHookScriptHostAliasMissingPython3FallbackPreservesPayload which
+	// already logs its precondition.
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Logf("precondition: bash not available (%v); skipping pathological-input coverage", err)
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Logf("precondition: curl not available (%v); skipping pathological-input coverage", err)
+		t.Skipf("curl not available: %v", err)
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Logf("precondition: python3 not available (%v); skipping pathological-input coverage — this is the Python-injection defense test; ensure a CI image with python3 covers it", err)
+		t.Skipf("python3 not available: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		poison string
+	}{
+		{"newline", "evil\nimport os; os.system('id')\n#"},
+		{"trailing_backslash", `evil\`},
+		{"double_backslash_and_quote", `evil\\"`},
+		{"mixed_quotes", `x"y'z`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var (
+				mu      sync.Mutex
+				gotBody []byte
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				gotBody = body
+				mu.Unlock()
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+			u, _ := url.Parse(srv.URL)
+
+			if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("n\n"), 0600); err != nil {
+				t.Fatalf("write nonce: %v", err)
+			}
+			scriptPath := filepath.Join(dir, "cc-clip-hook")
+			if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			cmd := exec.Command("bash", scriptPath)
+			cmd.Env = append(os.Environ(),
+				"CC_CLIP_HOST_ALIAS="+tc.poison,
+				"CC_CLIP_STATE_DIR="+dir,
+				"CC_CLIP_PORT="+u.Port(),
+			)
+			cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("hook script exited nonzero with %s alias: %v\noutput: %s", tc.name, err, out)
+			}
+			if strings.Contains(string(out), "uid=") {
+				t.Fatalf("%s alias executed as Python: %s", tc.name, out)
+			}
+			mu.Lock()
+			body := gotBody
+			mu.Unlock()
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("payload is not valid JSON: %v\nbody=%s", err, body)
+			}
+			if got, _ := payload["_cc_clip_host"].(string); got != tc.poison {
+				t.Fatalf("_cc_clip_host = %q; want literal %q (case %s)", got, tc.poison, tc.name)
+			}
+		})
 	}
 }

@@ -579,6 +579,204 @@ func TestResolveTunnelUpPortsRejectsHostWithMultipleSavedTunnels(t *testing.T) {
 	}
 }
 
+// TestResolveTunnelUpPortsAmbiguousErrorIncludesHintSuffix pins the hint
+// appended to the ambiguous-state error: operators hitting this branch need
+// to be told how to proceed (pass --port or an explicit --remote-port) rather
+// than just see the bare error. The suffix lives on the CLI side, not in the
+// tunnel package, so a refactor that rewraps err could silently drop it.
+func TestResolveTunnelUpPortsAmbiguousErrorIncludesHintSuffix(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, local := range []int{18444, 18555} {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "example",
+				LocalPort:  local,
+				RemotePort: 19000 + local,
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", local, err)
+		}
+	}
+
+	_, _, err := resolveTunnelUpPorts("example", 0, 18339, false)
+	if !errors.Is(err, tunnel.ErrAmbiguousTunnelState) {
+		t.Fatalf("err = %v, want ErrAmbiguousTunnelState", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"pass --port <local-port>", "select the owning daemon"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q missing hint %q", msg, want)
+		}
+	}
+}
+
+// TestResolveTunnelUpPortsRejectsCorruptStateWithZeroLocalPort pins the
+// defensive branch that guards against a hand-edited or legacy state file
+// whose LocalPort is 0. The resolver must not silently adopt whatever
+// --port the user passed unless the operator explicitly bypasses saved-state
+// lookup with --remote-port.
+func TestResolveTunnelUpPortsRejectsCorruptStateWithZeroLocalPort(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// SaveState rejects LocalPort=0, so fabricate the file on disk directly.
+	// StateFilePath encodes the zero local port in both the filename and the
+	// filename-vs-contents hash, so LoadAllStates will accept this entry.
+	dir := tunnel.DefaultStateDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := tunnel.StateFilePath(dir, "example", 0)
+	payload := []byte(`{"config":{"host":"example","local_port":0,"remote_port":19001,"enabled":true}}`)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, _, err := resolveTunnelUpPorts("example", 0, 18339, false)
+	if err == nil {
+		t.Fatal("expected error for state with zero local_port")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"no local_port",
+		"cc-clip connect example",
+		"--remote-port",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q missing %q", msg, want)
+		}
+	}
+}
+
+func TestResolveTunnelUpPortsRequiresExplicitDaemonWhenRemotePortExplicitAndOwnerAmbiguous(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, local := range []int{18444, 18555} {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "example",
+				LocalPort:  local,
+				RemotePort: 19000 + local,
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", local, err)
+		}
+	}
+
+	_, _, err := resolveTunnelUpPorts("example", 29999, 18339, false)
+	if err == nil {
+		t.Fatal("expected ambiguity error when explicit --remote-port cannot infer daemon owner")
+	}
+	for _, want := range []string{"--port <local-port>", "multiple saved daemon owners exist"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestResolveTunnelUpPortsRejectsImplicitDaemonWhenZeroLocalPortStateAndRemotePortExplicit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dir := tunnel.DefaultStateDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := tunnel.StateFilePath(dir, "example", 0)
+	payload := []byte(`{"config":{"host":"example","local_port":0,"remote_port":19001,"enabled":true}}`)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, _, err := resolveTunnelUpPorts("example", 29999, 18339, false)
+	if err == nil || !strings.Contains(err.Error(), "--port <local-port> explicitly") {
+		t.Fatalf("err = %v, want explicit daemon guidance", err)
+	}
+}
+
+func TestResolveTunnelUpPortsAllowsExplicitDaemonWhenZeroLocalPortStateAndRemotePortExplicit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dir := tunnel.DefaultStateDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := tunnel.StateFilePath(dir, "example", 0)
+	payload := []byte(`{"config":{"host":"example","local_port":0,"remote_port":19001,"enabled":true}}`)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	remotePort, daemonPort, err := resolveTunnelUpPorts("example", 29999, 18444, true)
+	if err != nil {
+		t.Fatalf("resolveTunnelUpPorts: %v", err)
+	}
+	if remotePort != 29999 || daemonPort != 18444 {
+		t.Fatalf("got remote=%d daemon=%d, want remote=29999 daemon=18444", remotePort, daemonPort)
+	}
+}
+
+func TestResolveTunnelUpPortsAdoptsSavedDaemonWhenRemotePortExplicit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+		Config: tunnel.TunnelConfig{
+			Host:       "example",
+			LocalPort:  18444,
+			RemotePort: 19001,
+			Enabled:    true,
+		},
+		Status: tunnel.StatusConnected,
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	remotePort, daemonPort, err := resolveTunnelUpPorts("example", 29999, 18339, false)
+	if err != nil {
+		t.Fatalf("resolveTunnelUpPorts: %v", err)
+	}
+	if remotePort != 29999 || daemonPort != 18444 {
+		t.Fatalf("got remote=%d daemon=%d, want remote=29999 daemon=18444", remotePort, daemonPort)
+	}
+}
+
+func TestResolveTunnelUpPortsIgnoresZeroLocalPortStateWhenRealOwnerExists(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+		Config: tunnel.TunnelConfig{
+			Host:       "example",
+			LocalPort:  18444,
+			RemotePort: 19001,
+			Enabled:    true,
+		},
+		Status: tunnel.StatusConnected,
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	dir := tunnel.DefaultStateDir()
+	path := tunnel.StateFilePath(dir, "example", 0)
+	payload := []byte(`{"config":{"host":"example","local_port":0,"remote_port":29998,"enabled":true}}`)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	remotePort, daemonPort, err := resolveTunnelUpPorts("example", 0, 18339, false)
+	if err != nil {
+		t.Fatalf("resolveTunnelUpPorts: %v", err)
+	}
+	if remotePort != 19001 || daemonPort != 18444 {
+		t.Fatalf("got remote=%d daemon=%d, want remote=19001 daemon=18444", remotePort, daemonPort)
+	}
+}
+
 func TestResolveTunnelUpPortsRejectsExplicitDaemonPortThatDiffersFromSavedLocalPort(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
@@ -634,7 +832,7 @@ func TestResolveTunnelUpPortsRejectsEnvConfiguredDaemonPortThatDiffersFromSavedL
 	}
 }
 
-func TestResolveTunnelUpPortsRejectsSavedTunnelOnDifferentExplicitDaemonEvenWithExplicitRemotePort(t *testing.T) {
+func TestResolveTunnelUpPortsRejectsSavedTunnelOnDifferentExplicitDaemonWhenRemotePortExplicit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
@@ -650,8 +848,76 @@ func TestResolveTunnelUpPortsRejectsSavedTunnelOnDifferentExplicitDaemonEvenWith
 	}
 
 	_, _, err := resolveTunnelUpPorts("example", 19001, 18339, true)
-	if err == nil || !strings.Contains(err.Error(), "saved tunnel for example uses local port 18444") {
+	if err == nil || !strings.Contains(err.Error(), "uses local port 18444") {
 		t.Fatalf("err = %v, want saved-local-port mismatch error", err)
+	}
+	if strings.Contains(err.Error(), "--remote-port") {
+		t.Fatalf("error should not suggest --remote-port here anymore: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--port 18444") {
+		t.Fatalf("error should point at the owning daemon port, got: %v", err)
+	}
+}
+
+// TestResolveTunnelUpPortsRequiresExplicitPortWhenAmbiguousIncludesDefaultDaemon
+// covers: two saved tunnel states for the same host (daemon ports 18339
+// and 18444), and the operator invokes `cc-clip tunnel up <host>` with no
+// --port flag — so `daemonPortExplicit=false`. Resolution must NOT silently
+// pick 18339 (the builtin default) just because it happens to match one of
+// the saved states; it must error with "pass --port <local-port> explicitly"
+// so the operator picks one deliberately.
+func TestResolveTunnelUpPortsRequiresExplicitPortWhenAmbiguousIncludesDefaultDaemon(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, local := range []int{18339, 18444} {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "example",
+				LocalPort:  local,
+				RemotePort: 19000 + local,
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", local, err)
+		}
+	}
+
+	_, _, err := resolveTunnelUpPorts("example", 29999, 18339, false)
+	if err == nil || !strings.Contains(err.Error(), "pass --port <local-port> explicitly") {
+		t.Fatalf("err = %v, want explicit --port guidance", err)
+	}
+}
+
+func TestResolveTunnelUpPortsAllowsExplicitDaemonWhenAmbiguousAndSelected(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, tc := range []struct {
+		localPort  int
+		remotePort int
+	}{
+		{18339, 19001},
+		{18444, 19002},
+	} {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "example",
+				LocalPort:  tc.localPort,
+				RemotePort: tc.remotePort,
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", tc.localPort, err)
+		}
+	}
+
+	remotePort, daemonPort, err := resolveTunnelUpPorts("example", 29999, 18444, true)
+	if err != nil {
+		t.Fatalf("resolveTunnelUpPorts: %v", err)
+	}
+	if remotePort != 29999 || daemonPort != 18444 {
+		t.Fatalf("got remote=%d daemon=%d, want remote=29999 daemon=18444", remotePort, daemonPort)
 	}
 }
 
@@ -1490,6 +1756,32 @@ func TestFallbackDaemonPortRejectsAmbiguousSavedPorts(t *testing.T) {
 	}
 	if retry {
 		t.Fatal("retry should be false for ambiguous saved ports")
+	}
+}
+
+func TestFallbackDaemonPortKeepsRequestedPortWhenSavedOwnerMatches(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, port := range []int{18339, 18444} {
+		if err := tunnel.SaveState(tunnel.DefaultStateDir(), &tunnel.TunnelState{
+			Config: tunnel.TunnelConfig{
+				Host:       "example",
+				LocalPort:  port,
+				RemotePort: 19001,
+				Enabled:    true,
+			},
+			Status: tunnel.StatusConnected,
+		}); err != nil {
+			t.Fatalf("SaveState(%d): %v", port, err)
+		}
+	}
+
+	_, retry, err := fallbackDaemonPort("example", 18339)
+	if err != nil {
+		t.Fatalf("err = %v, want nil when requested port already owns a saved state", err)
+	}
+	if retry {
+		t.Fatal("retry should be false when requested port already matches a saved owner")
 	}
 }
 
