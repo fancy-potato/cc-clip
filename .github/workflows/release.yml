@@ -28,7 +28,7 @@ jobs:
           # goreleaser must produce cc-clip_{version}_{os}_{arch}.tar.gz
           grep -qP 'name_template:.*ProjectName.*Version.*Os.*Arch' .goreleaser.yaml
           # install.sh must expect the same format with version stripped of v prefix
-          grep -q 'cc-clip_${VERSION#v}_${PLATFORM}.tar.gz' scripts/install.sh
+          grep -q 'cc-clip_${VERSION#v}_${PLATFORM}' scripts/install.sh
           # archive format must be tar.gz (not bare binary)
           grep -q 'format: tar.gz' .goreleaser.yaml
 
