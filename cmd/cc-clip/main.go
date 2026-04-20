@@ -24,6 +24,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/daemon"
 	"github.com/shunmei/cc-clip/internal/doctor"
 	"github.com/shunmei/cc-clip/internal/exitcode"
+	"github.com/shunmei/cc-clip/internal/fileutil"
 	"github.com/shunmei/cc-clip/internal/peer"
 	"github.com/shunmei/cc-clip/internal/service"
 	"github.com/shunmei/cc-clip/internal/session"
@@ -39,6 +40,8 @@ import (
 )
 
 var version = "dev"
+
+var errNotificationNonceRegeneratable = errors.New("notification nonce regeneratable")
 
 // failUsage prints a user-facing argument-validation error and exits with
 // exitcode.UsageError so wrapper scripts can distinguish "you typed it
@@ -3904,19 +3907,13 @@ func parseCodexNotifyPayload(payload string) (daemon.GenericMessagePayload, erro
 }
 
 // postGenericNotification sends a generic notification to the local cc-clip daemon.
-// It reads the notification nonce from ~/.cache/cc-clip/notify.nonce for auth.
+// It reads the notification nonce from the token dir for auth, bootstrapping
+// a fresh nonce via /register-nonce when the file is missing or malformed.
 func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
-	tokenDir, err := token.TokenDir()
+	nonce, err := loadOrRegisterNotificationNonce(port)
 	if err != nil {
-		return fmt.Errorf("cannot determine token dir: %w", err)
+		return err
 	}
-
-	nonceFile := filepath.Join(tokenDir, "notify.nonce")
-	nonceBytes, err := os.ReadFile(nonceFile)
-	if err != nil {
-		return fmt.Errorf("cannot read nonce file %s: %w", nonceFile, err)
-	}
-	nonce := strings.TrimSpace(string(nonceBytes))
 
 	payload := struct {
 		Title   string `json:"title"`
@@ -3953,6 +3950,92 @@ func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
 		return fmt.Errorf("daemon returned HTTP %d", resp.StatusCode)
 	}
 
+	return nil
+}
+
+func loadOrRegisterNotificationNonce(port int) (string, error) {
+	tokenDir, err := token.TokenDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine token dir: %w", err)
+	}
+
+	nonceFile := filepath.Join(tokenDir, "notify.nonce")
+	nonce, err := readNotificationNonceFile(nonceFile)
+	switch {
+	case err == nil:
+		return nonce, nil
+	case !os.IsNotExist(err) && !errors.Is(err, errNotificationNonceRegeneratable):
+		return "", fmt.Errorf("cannot read nonce file %s: %w", nonceFile, err)
+	}
+
+	bearerToken, err := token.ReadTokenFile()
+	if err != nil {
+		return "", fmt.Errorf("cannot read session token for nonce registration: %w", err)
+	}
+	nonce, err = shim.GenerateNotificationNonce()
+	if err != nil {
+		return "", fmt.Errorf("cannot generate notification nonce: %w", err)
+	}
+	if err := registerNonceWithDaemon(port, bearerToken, nonce); err != nil {
+		return "", fmt.Errorf("cannot register notification nonce: %w", err)
+	}
+	if err := writeNotificationNonceFile(nonceFile, nonce); err != nil {
+		return "", fmt.Errorf("cannot persist nonce file %s: %w", nonceFile, err)
+	}
+	return nonce, nil
+}
+
+func readNotificationNonceFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	raw := strings.TrimRight(string(data), "\r\n")
+	if strings.ContainsAny(raw, "\r\n") {
+		return "", fmt.Errorf("%w: notify.nonce must contain exactly one line", errNotificationNonceRegeneratable)
+	}
+	nonce := strings.TrimSpace(raw)
+	if nonce == "" {
+		return "", fmt.Errorf("%w: notify.nonce is empty", errNotificationNonceRegeneratable)
+	}
+	return nonce, nil
+}
+
+func writeNotificationNonceFile(path, nonce string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(strings.TrimSpace(nonce) + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := fileutil.RenameReplace(tmpName, path); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("chmod 0600 %s: %w", path, err)
+	}
+	success = true
 	return nil
 }
 
