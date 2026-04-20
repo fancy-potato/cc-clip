@@ -3930,10 +3930,34 @@ func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
 		return fmt.Errorf("failed to marshal notification: %w", err)
 	}
 
+	status, err := postNotificationRequest(port, nonce, body)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusUnauthorized {
+		bearerToken, err := token.ReadTokenFile()
+		if err != nil {
+			return fmt.Errorf("daemon rejected notification nonce (HTTP 401) and session token reload failed: %w", err)
+		}
+		if err := registerNonceWithDaemon(port, bearerToken, nonce); err != nil {
+			return fmt.Errorf("daemon rejected notification nonce (HTTP 401) and nonce re-registration failed: %w", err)
+		}
+		status, err = postNotificationRequest(port, nonce, body)
+		if err != nil {
+			return fmt.Errorf("failed to resend notification after nonce re-registration: %w", err)
+		}
+	}
+	if status != http.StatusOK && status != http.StatusNoContent {
+		return fmt.Errorf("daemon returned HTTP %d", status)
+	}
+	return nil
+}
+
+func postNotificationRequest(port int, nonce string, body []byte) (int, error) {
 	url := fmt.Sprintf("http://127.0.0.1:%d/notify", port)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+nonce)
 	req.Header.Set("Content-Type", "application/json")
@@ -3942,15 +3966,10 @@ func postGenericNotification(port int, msg daemon.GenericMessagePayload) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send notification: %w", err)
+		return 0, fmt.Errorf("failed to send notification: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("daemon returned HTTP %d", resp.StatusCode)
-	}
-
-	return nil
+	return resp.StatusCode, nil
 }
 
 func loadOrRegisterNotificationNonce(port int) (string, error) {

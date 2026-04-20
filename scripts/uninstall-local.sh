@@ -6,6 +6,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 INSTALL_DIR=${CC_CLIP_INSTALL_DIR:-"$HOME/.local/bin"}
+LOCAL_SHARE_DIR=${CC_CLIP_SHARE_DIR:-"$HOME/.local/share/cc-clip"}
 
 usage() {
 	cat <<EOF
@@ -19,9 +20,9 @@ Options:
 
 Notes:
   - This script is intentionally destructive. It removes local binaries,
-    shims, launchd state, ~/.cache/cc-clip, and the cc-clip-managed blocks
-    from ~/.ssh/config when that file is a regular file. Two block types
-    are removed: the current per-peer SetEnv block
+    shims, launchd state, ~/.cache/cc-clip, ~/.local/share/cc-clip, and
+    the cc-clip-managed blocks from ~/.ssh/config when that file is a
+    regular file. Two block types are removed: the current per-peer SetEnv block
     \`# >>> cc-clip SetEnv (do not edit) >>>\` … \`# <<< cc-clip SetEnv (do not edit) <<<\`
     AND the legacy pre-daemon-tunnel block
     \`# >>> cc-clip managed host: … >>>\` … \`# <<< cc-clip managed host: … <<<\`.
@@ -273,8 +274,10 @@ remove_managed_ssh_config_blocks
 
 log "[4/4] Removing local state..."
 rm -rf "$HOME/.cache/cc-clip"
+rm -rf "$LOCAL_SHARE_DIR"
 
 log
 log "Local purge complete."
 log "  install dir: $INSTALL_DIR"
 log "  cache: removed"
+log "  share dir: removed ($LOCAL_SHARE_DIR)"

@@ -286,6 +286,31 @@ func TestUninstallAllAllowsLastPeerWhenRegistryMatchesLocalIdentity(t *testing.T
 	}
 }
 
+func TestUninstallAllRemovesDefaultLocalShareDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script test")
+	}
+
+	home := t.TempDir()
+	writeLocalPeerID(t, home, "self-peer")
+	shareDir := filepath.Join(home, ".local", "share", "cc-clip")
+	if err := os.MkdirAll(filepath.Join(shareDir, "scripts"), 0700); err != nil {
+		t.Fatalf("mkdir share scripts dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shareDir, "scripts", "uninstall-all.sh"), []byte("marker"), 0600); err != nil {
+		t.Fatalf("write share marker: %v", err)
+	}
+
+	peerJSON := `[{"peer_id":"self-peer","label":"laptop","reserved_port":18339,"state_dir":"~/.cache/cc-clip/peers/self-peer","created_at":"","updated_at":"","last_connect_at":""}]`
+	out, err := runUninstallAllScript(t, home, peerJSON, 0)
+	if err != nil {
+		t.Fatalf("expected uninstall-all.sh to proceed for the last peer, got %v\noutput:\n%s", err, out)
+	}
+	if _, statErr := os.Stat(shareDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected default local share dir %q to be removed, stat err=%v", shareDir, statErr)
+	}
+}
+
 func TestUninstallAllPeerProbeDoesNotForceBatchMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script test")

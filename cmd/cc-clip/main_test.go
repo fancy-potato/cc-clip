@@ -991,6 +991,58 @@ func TestPostGenericNotificationBootstrapsMissingNonceFile(t *testing.T) {
 	}
 }
 
+func TestPostGenericNotificationReRegistersPersistedNonceAfterDaemonRestart(t *testing.T) {
+	tm := token.NewManager(time.Hour)
+	sess, err := tm.Generate()
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+	store := session.NewStore(12 * time.Hour)
+	srv := daemon.NewServer("127.0.0.1:0", &testClipboard{}, tm, store)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	port := extractPort(t, ts.URL)
+
+	tokenDir := t.TempDir()
+	token.TokenDirOverride = tokenDir
+	defer func() { token.TokenDirOverride = "" }()
+
+	if _, err := token.WriteTokenFile(sess.Token, sess.ExpiresAt); err != nil {
+		t.Fatalf("failed to write session token: %v", err)
+	}
+
+	nonce := "test-notify-nonce-reregister-0123456789abcdef0123456789abcdef"
+	if err := os.WriteFile(filepath.Join(tokenDir, "notify.nonce"), []byte(nonce+"\n"), 0600); err != nil {
+		t.Fatalf("failed to write nonce file: %v", err)
+	}
+
+	msg := daemon.GenericMessagePayload{
+		Title:   "Recovered",
+		Body:    "Nonce was re-registered after daemon restart",
+		Urgency: 1,
+	}
+	if err := postGenericNotification(port, msg); err != nil {
+		t.Fatalf("postGenericNotification failed: %v", err)
+	}
+
+	select {
+	case env := <-srv.NotifyChannel():
+		if env.GenericMessage == nil {
+			t.Fatal("expected GenericMessage payload")
+		}
+		if env.GenericMessage.Title != msg.Title {
+			t.Fatalf("expected title %q, got %q", msg.Title, env.GenericMessage.Title)
+		}
+		if env.GenericMessage.Body != msg.Body {
+			t.Fatalf("expected body %q, got %q", msg.Body, env.GenericMessage.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected notification to be enqueued after nonce re-registration")
+	}
+}
+
 func TestRunCmdNotifySoundRequiresTerminalNotifier(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("notify-sound is only supported on macOS")
