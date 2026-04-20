@@ -179,6 +179,31 @@ func TestAcquireConnectStateLockMutualExclusion(t *testing.T) {
 	release3()
 }
 
+func TestSaveConnectTunnelStateFailsWhenLockIsHeld(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	origDeadline := connectLockAcquireDeadline
+	origInterval := connectLockRetryInterval
+	connectLockAcquireDeadline = 100 * time.Millisecond
+	connectLockRetryInterval = 20 * time.Millisecond
+	t.Cleanup(func() {
+		connectLockAcquireDeadline = origDeadline
+		connectLockRetryInterval = origInterval
+	})
+
+	release, err := acquireConnectStateLock("myserver", 18339)
+	if err != nil {
+		t.Fatalf("acquireConnectStateLock: %v", err)
+	}
+	defer release()
+
+	err = saveConnectTunnelState("myserver", 18339, 19001, true)
+	if err == nil || !strings.Contains(err.Error(), "acquire connect state lock") {
+		t.Fatalf("saveConnectTunnelState err = %v, want lock acquisition failure", err)
+	}
+}
+
 // itoaPID is a tiny helper to avoid importing strconv just for this test.
 func itoaPID(pid int) string {
 	if pid <= 0 {

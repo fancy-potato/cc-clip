@@ -862,18 +862,20 @@ cc-clip service uninstall
 
 > **Shared account:** when multiple laptops share a Unix account on the remote, `uninstall --host H --peer` queries the remote peer registry and leaves `~/.local/bin/clipcc`, `~/.local/bin/cc-clip-hook`, the remote PATH marker, and the Codex `# >>> cc-clip notify >>>` block in place until the **last** peer uninstalls. Run the command on every laptop to force full cleanup. If the registry query itself fails (ssh down, corrupt registry), shared assets are also preserved on purpose — fix the registry and rerun.
 
-The repo also ships two destructive purge scripts for complete teardown only:
+The repo also ships two destructive purge scripts for complete teardown only. In a source checkout they live under `scripts/`. The curl installer and release archives also install copies under `~/.local/share/cc-clip/scripts/` (or `$CC_CLIP_SHARE_DIR/scripts` if you overrode the share dir):
 
 ```bash
 # Remove all local cc-clip binaries, shims, cache, launchd state, and every
 # cc-clip-managed block from local ~/.ssh/config when it is a regular file.
 # Symlinked SSH configs are preserved with a warning.
 scripts/uninstall-local.sh
+# or ~/.local/share/cc-clip/scripts/uninstall-local.sh
 
 # Remove all cc-clip state from the target remote Unix account that lives in
 # regular files, then run the same full local purge on this machine.
 # Symlinked remote rc/config files are preserved with a warning.
 scripts/uninstall-all.sh --host <alias>
+# or ~/.local/share/cc-clip/scripts/uninstall-all.sh --host <alias>
 ```
 
 Use these scripts carefully. They are intentionally aggressive and bypass the normal multi-peer preservation behavior so they can wipe all cc-clip installation data.

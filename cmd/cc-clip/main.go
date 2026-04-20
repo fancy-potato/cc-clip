@@ -2917,11 +2917,10 @@ func saveConnectTunnelState(host string, localPort, remotePort int, enabled bool
 	// acquiring the lock, which allowed a concurrent writer to replace
 	// the state between our read and our SaveState.
 	release, lockErr := acquireConnectStateLock(host, localPort)
-	if lockErr == nil {
-		defer release()
-	} else {
-		log.Printf("warning: connect state lock unavailable (%v); proceeding with unlocked save — concurrent connect may race", lockErr)
+	if lockErr != nil {
+		return fmt.Errorf("acquire connect state lock for %s/%d: %w", host, localPort, lockErr)
 	}
+	defer release()
 	// The preserve-live-fields branch only applies when the caller is about
 	// to (re)start the tunnel AND the existing state points at the SAME
 	// remote port. A --no-tunnel re-run of `connect` must not carry Status=

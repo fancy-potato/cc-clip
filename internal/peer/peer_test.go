@@ -330,6 +330,22 @@ func TestListAllEmptyOnFreshRegistry(t *testing.T) {
 	}
 }
 
+func TestListAllFailsClosedOnIncompleteRegistry(t *testing.T) {
+	dir := t.TempDir()
+	registryDir := filepath.Join(dir, "registry")
+	if err := os.MkdirAll(registryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registryDir, "ports.json"), []byte(`{"version":1,"range_start":18339,"range_end":18341,"ports":{"18339":"peer-a"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ListAll(dir)
+	if err == nil || !strings.Contains(err.Error(), "failed to load peers registry") {
+		t.Fatalf("expected incomplete-registry error, got %v", err)
+	}
+}
+
 // TestListAllAfterReleaseReportsSurvivors pins the exact semantics the
 // uninstall path consumes: after peer A releases, a subsequent ListAll
 // sees only peer B. This is what tells the caller "another laptop is
@@ -537,6 +553,9 @@ func TestReservePortFailsOnCorruptRegistry(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(registryDir, "ports.json"), []byte("{broken"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(registryDir, "peers.json"), []byte(`{"version":1,"peers":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	_, err := ReservePort(dir, "peer-a", "macbook", 18339, 18341)
 	if err == nil || !strings.Contains(err.Error(), "failed to load ports registry") {
 		t.Fatalf("expected corrupt registry error, got %v", err)
@@ -554,12 +573,31 @@ func TestReservePortFailsOnEmptyRegistryFile(t *testing.T) {
 	if err := os.MkdirAll(registryDir, 0700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(registryDir, "ports.json"), []byte(`{"version":1,"range_start":18339,"range_end":18341,"ports":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(registryDir, "peers.json"), []byte{}, 0600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := ReservePort(dir, "peer-a", "macbook", 18339, 18341)
 	if err == nil || !strings.Contains(err.Error(), "failed to load peers registry") {
 		t.Fatalf("expected empty-file registry error, got %v", err)
+	}
+}
+
+func TestReservePortFailsOnIncompleteRegistry(t *testing.T) {
+	dir := t.TempDir()
+	registryDir := filepath.Join(dir, "registry")
+	if err := os.MkdirAll(registryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registryDir, "ports.json"), []byte(`{"version":1,"range_start":18339,"range_end":18341,"ports":{"18339":"peer-a"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReservePort(dir, "peer-a", "macbook", 18339, 18341)
+	if err == nil || !strings.Contains(err.Error(), "failed to load peers registry") {
+		t.Fatalf("expected incomplete-registry error, got %v", err)
 	}
 }
 

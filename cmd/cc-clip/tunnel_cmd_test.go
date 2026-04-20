@@ -520,6 +520,19 @@ func TestResolveTunnelHostArgRejectsExtraPositionalArgument(t *testing.T) {
 	}
 }
 
+func TestResolveTunnelHostArgRejectsUnknownTrailingFlag(t *testing.T) {
+	_, err := resolveTunnelHostArg(
+		[]string{"cc-clip", "tunnel", "up", "example", "--remote-prt", "19001"},
+		3,
+		"cc-clip tunnel up <host>",
+		"--port",
+		"--remote-port",
+	)
+	if err == nil || !strings.Contains(err.Error(), `unexpected flag "--remote-prt"`) {
+		t.Fatalf("err = %v, want unknown-flag error", err)
+	}
+}
+
 func TestResolveTunnelUpPortsAdoptsSavedLocalPortWhenDaemonNotExplicit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

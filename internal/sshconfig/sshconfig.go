@@ -45,6 +45,17 @@ const (
 // literal `Host <alias>` block to ~/.ssh/config.
 var ErrHostBlockMissing = errors.New("no `Host <alias>` block found in ~/.ssh/config")
 
+// applyPostLockHookForTest is a test-only injection point that fires
+// between acquireConfigLock and the authoritative post-lock readConfig.
+// Production callers leave it nil. Tests use it to deterministically
+// exercise the pre-lock-vs-post-lock read-drift path — specifically that
+// a concurrent rewrite landing in this window is benign because the
+// post-lock read wins and Apply operates on the fresh bytes.
+//
+// The variable is lowercase/unexported so external callers cannot
+// accidentally hook into Apply from outside this package.
+var applyPostLockHookForTest func(path string)
+
 // ErrOnlyGlobMatch means the only `Host` blocks that would apply to
 // the alias use wildcard (`*`, `?`) or negation (`!`) patterns, OR a
 // Host block contains BOTH a literal matching the alias AND a wildcard
@@ -302,6 +313,9 @@ func ApplyToFile(path, host string, env map[string]string) error {
 		return fmt.Errorf("acquire ssh_config advisory lock: %w", err)
 	}
 	defer release()
+	if applyPostLockHookForTest != nil {
+		applyPostLockHookForTest(path)
+	}
 	data, meta, err = readConfig(path)
 	if err != nil {
 		return err

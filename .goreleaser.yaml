@@ -27,6 +27,8 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - scripts/cc-clip-tunnels.30s.sh
+      - scripts/uninstall-local.sh
+      - scripts/uninstall-all.sh
 
 checksum:
   name_template: "checksums.txt"

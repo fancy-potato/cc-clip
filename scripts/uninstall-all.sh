@@ -80,16 +80,10 @@ remove_marked_block() {
 	# file on every exit path.
 	trap 'rm -f "$TMP_FILE"' EXIT HUP INT TERM
 
-	# Write the rewritten output to the temp file first — NOT directly to
-	# $TARGET — so a mid-awk failure never leaves $TARGET half-written. On
-	# success we `cat "$TMP_FILE" > "$TARGET"` to truncate-and-write the
-	# original file in place. That preserves $TARGET's inode, mode, owner,
-	# and extended attributes exactly, which matters when the operator runs
-	# this script under sudo against a user-owned rc file / config.toml —
-	# a classic `mv temp target` would replace the user's file with
-	# temp-file metadata (root-owned, mktemp-mode), silently breaking
-	# subsequent shell startup.
-	if ! awk -v start_line="$START_LINE" -v end_prefix="$END_PREFIX" '
+		# Write the rewritten output to a temp file first — NOT directly to
+		# $TARGET — so a mid-awk failure never leaves $TARGET half-written.
+		# On success we atomically rename the temp file into place.
+		if ! awk -v start_line="$START_LINE" -v end_prefix="$END_PREFIX" '
 	function flush_buffer(    i) {
 		for (i = 1; i <= buffered_count; i++) {
 			print buffered[i]
@@ -122,30 +116,26 @@ remove_marked_block() {
 		}
 		print raw
 	}
-	END {
-		if (skip) {
-			flush_buffer()
+		END {
+			if (skip) {
+				flush_buffer()
+			}
 		}
-	}
-	' "$TARGET" >"$TMP_FILE"; then
-		printf 'warning: awk failed while rewriting %s; leaving file unchanged\n' "$TARGET" >&2
-		rm -f "$TMP_FILE"
-		trap - EXIT HUP INT TERM
-		return 0
-	fi
+		' "$TARGET" >"$TMP_FILE"; then
+			printf 'warning: awk failed while rewriting %s; leaving file unchanged\n' "$TARGET" >&2
+			rm -f "$TMP_FILE"
+			trap - EXIT HUP INT TERM
+			return 1
+		fi
 
-	# Truncate-and-write the original file in place, preserving inode and
-	# metadata. If this fails (disk full, permission), the original may be
-	# partially written but its inode/owner/mode are still intact.
-	if ! cat "$TMP_FILE" >"$TARGET"; then
-		printf 'warning: failed to write %s in place; file may be partially updated\n' "$TARGET" >&2
-		rm -f "$TMP_FILE"
+		if ! mv "$TMP_FILE" "$TARGET"; then
+			printf 'warning: failed to replace %s\n' "$TARGET" >&2
+			rm -f "$TMP_FILE"
+			trap - EXIT HUP INT TERM
+			return 1
+		fi
 		trap - EXIT HUP INT TERM
-		return 0
-	fi
-	rm -f "$TMP_FILE"
-	trap - EXIT HUP INT TERM
-}
+	}
 
 stop_pid_file() {
 	PID_FILE=$1

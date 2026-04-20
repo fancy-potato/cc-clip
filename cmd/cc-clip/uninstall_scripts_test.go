@@ -46,6 +46,12 @@ func TestInstallScriptInstallsSwiftBarPluginViaSymlink(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(archiveDir, "scripts", "cc-clip-tunnels.30s.sh"), []byte(pluginBody), 0700); err != nil {
 		t.Fatalf("write plugin: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(archiveDir, "scripts", "uninstall-local.sh"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatalf("write uninstall-local: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(archiveDir, "scripts", "uninstall-all.sh"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatalf("write uninstall-all: %v", err)
+	}
 	cmd := exec.Command("tar", "-czf", archivePath, "-C", archiveDir, "cc-clip", "scripts")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("create archive: %v\n%s", err, out)
@@ -105,6 +111,122 @@ func TestInstallScriptInstallsSwiftBarPluginViaSymlink(t *testing.T) {
 	}
 	if target != localPlugin {
 		t.Fatalf("expected symlink target %q, got %q", localPlugin, target)
+	}
+	for _, scriptName := range []string{"uninstall-local.sh", "uninstall-all.sh"} {
+		if _, err := os.Stat(filepath.Join(shareDir, "scripts", scriptName)); err != nil {
+			t.Fatalf("installed maintenance script %s: %v", scriptName, err)
+		}
+	}
+}
+
+func TestInstallScriptFetchesMissingSupportScriptsFromTag(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS shell-script test")
+	}
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	installDir := filepath.Join(home, "bin")
+	shareDir := filepath.Join(home, "share")
+	swiftBarDir := filepath.Join(home, "Documents", "SwiftBar")
+	if err := os.MkdirAll(installDir, 0700); err != nil {
+		t.Fatalf("mkdir install dir: %v", err)
+	}
+	if err := os.MkdirAll(swiftBarDir, 0700); err != nil {
+		t.Fatalf("mkdir swiftbar dir: %v", err)
+	}
+
+	version := "v1.2.3"
+	platformArch := runtime.GOARCH
+	switch platformArch {
+	case "amd64", "arm64":
+	default:
+		t.Fatalf("unsupported GOARCH for installer test: %s", platformArch)
+	}
+	archiveName := "cc-clip_1.2.3_darwin_" + platformArch + ".tar.gz"
+	archivePath := filepath.Join(root, archiveName)
+	checksumsPath := filepath.Join(root, "checksums.txt")
+	archiveDir := filepath.Join(root, "archive")
+	if err := os.MkdirAll(archiveDir, 0700); err != nil {
+		t.Fatalf("mkdir archive dir: %v", err)
+	}
+	writeExecutable(t, filepath.Join(archiveDir, "cc-clip"), "#!/bin/sh\nexit 0\n")
+	cmd := exec.Command("tar", "-czf", archivePath, "-C", archiveDir, "cc-clip")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create archive: %v\n%s", err, out)
+	}
+	sumCmd := exec.Command("shasum", "-a", "256", archivePath)
+	sumOut, err := sumCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("checksum archive: %v\n%s", err, sumOut)
+	}
+	fields := strings.Fields(string(sumOut))
+	if len(fields) < 1 {
+		t.Fatalf("unexpected shasum output: %q", string(sumOut))
+	}
+	if err := os.WriteFile(checksumsPath, []byte(fields[0]+"  "+archiveName+"\n"), 0600); err != nil {
+		t.Fatalf("write checksums.txt: %v", err)
+	}
+
+	rawDir := filepath.Join(root, "raw")
+	if err := os.MkdirAll(filepath.Join(rawDir, "scripts"), 0700); err != nil {
+		t.Fatalf("mkdir raw scripts dir: %v", err)
+	}
+	pluginBody := "#!/bin/bash\necho fallback\n"
+	if err := os.WriteFile(filepath.Join(rawDir, "scripts", "cc-clip-tunnels.30s.sh"), []byte(pluginBody), 0700); err != nil {
+		t.Fatalf("write fallback plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rawDir, "scripts", "uninstall-local.sh"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatalf("write fallback uninstall-local: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rawDir, "scripts", "uninstall-all.sh"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatalf("write fallback uninstall-all: %v", err)
+	}
+
+	scriptPath := filepath.Clean(filepath.Join("..", "..", "scripts", "install.sh"))
+	installCmd := exec.Command("/bin/sh", scriptPath)
+	installCmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH=/usr/bin:/bin",
+		"CC_CLIP_INSTALL_DIR="+installDir,
+		"CC_CLIP_SHARE_DIR="+shareDir,
+		"SWIFTBAR_PLUGIN_DIR="+swiftBarDir,
+		"INSTALL_SWIFTBAR=0",
+		"INSTALL_JQ=0",
+		"CC_CLIP_ALLOW_TEST=1",
+		"CC_CLIP_TEST_VERSION="+version,
+		"CC_CLIP_TEST_DOWNLOAD="+archivePath,
+		"CC_CLIP_TEST_CHECKSUMS="+checksumsPath,
+		"CC_CLIP_TEST_RAW_DIR="+rawDir,
+	)
+	out, err := installCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\noutput:\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "Support script cc-clip-tunnels.30s.sh missing from release archive; fetching from v1.2.3...") {
+		t.Fatalf("expected fallback fetch log, got:\n%s", out)
+	}
+
+	localPlugin := filepath.Join(shareDir, "swiftbar", "cc-clip-tunnels.30s.sh")
+	linkPlugin := filepath.Join(swiftBarDir, "cc-clip-tunnels.30s.sh")
+	localData, readErr := os.ReadFile(localPlugin)
+	if readErr != nil {
+		t.Fatalf("read local plugin: %v", readErr)
+	}
+	if string(localData) != pluginBody {
+		t.Fatalf("unexpected fallback plugin body:\n%s", string(localData))
+	}
+	info, statErr := os.Lstat(linkPlugin)
+	if statErr != nil {
+		t.Fatalf("lstat swiftbar link: %v", statErr)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected swiftbar plugin path to be a symlink, mode=%v", info.Mode())
+	}
+	for _, scriptName := range []string{"uninstall-local.sh", "uninstall-all.sh"} {
+		if _, err := os.Stat(filepath.Join(shareDir, "scripts", scriptName)); err != nil {
+			t.Fatalf("installed maintenance script %s: %v", scriptName, err)
+		}
 	}
 }
 
@@ -391,6 +513,45 @@ func TestUninstallLocalPreservesSymlinkedSSHConfig(t *testing.T) {
 	}
 	if string(got) != target {
 		t.Fatalf("symlink target should remain unchanged, got:\n%s", string(got))
+	}
+}
+
+func TestUninstallLocalHandlesReadOnlySSHConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script test")
+	}
+
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("mkdir .ssh: %v", err)
+	}
+	configPath := filepath.Join(sshDir, "config")
+	config := `Host example
+  HostName example.test
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18339 CC_CLIP_STATE_DIR=/tmp/peer-a
+  # <<< cc-clip SetEnv (do not edit) <<<
+`
+	if err := os.WriteFile(configPath, []byte(config), 0400); err != nil {
+		t.Fatalf("write ssh config: %v", err)
+	}
+
+	installDir := filepath.Join(home, "install")
+	if err := os.MkdirAll(installDir, 0700); err != nil {
+		t.Fatalf("mkdir install dir: %v", err)
+	}
+
+	out, _, err := runUninstallLocalScript(t, home, installDir)
+	if err != nil {
+		t.Fatalf("uninstall-local.sh failed: %v\noutput:\n%s", err, out)
+	}
+	got, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatalf("read ssh config: %v", readErr)
+	}
+	if strings.Contains(string(got), "cc-clip SetEnv") {
+		t.Fatalf("managed block should be removed from read-only config, got:\n%s", string(got))
 	}
 }
 

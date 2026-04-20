@@ -81,6 +81,114 @@ func TestHookScriptSupportsStrictHealthChecks(t *testing.T) {
 	}
 }
 
+func TestHookScriptStrictModeSanitizesCurlErrorWithoutExternalTr(t *testing.T) {
+	got := HookScript(18339)
+	if strings.Contains(got, "| tr -cd") {
+		t.Fatalf("strict-mode curl error sanitization must not depend on external tr; got script:\n%s", got)
+	}
+	if !strings.Contains(got, "_curl_err_safe=") {
+		t.Fatalf("expected strict-mode curl error sanitization helper in script:\n%s", got)
+	}
+}
+
+// TestHookScriptStrictModeScrubsANSIEscapesFromCurlError drives the in-script
+// sanitization loop with hostile inputs — ANSI CSI/OSC escapes, raw control
+// bytes, C1 controls, and high-Unicode — and confirms only printable ASCII
+// (plus TAB) survives. This is a behavioural pin on top of the existing
+// structural test (which only checks the helper exists): a future edit that
+// swaps `[[:print:]]` for, say, `[[:graph:]]` would erase TAB (regression) or
+// swap in `*` (regression: matches anything, defeating the scrub) and pass
+// the structural test. This test exercises the *actual bash logic*.
+func TestHookScriptStrictModeScrubsANSIEscapesFromCurlError(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available; skipping shell-behavior test")
+	}
+	// Harness mirrors the exact scrub loop from HookScript (see the
+	// `for ((_i=0; ...))` block in hook_template.go). Copied rather than
+	// regex-extracted so this test is a deliberate specification: if the
+	// template scrub diverges from the harness, the structural test above
+	// catches the shape regression and this test catches the behavior
+	// regression. Force the C locale so `[[:print:]]` behavior doesn't
+	// drift with the tester's LANG setting (under en_US.UTF-8 bash will
+	// accept many Unicode formatting chars as printable).
+	//
+	// Input arrives on stdin, not argv, because argv bytes can't carry a
+	// NUL (execve rejects it) — and NUL is exactly one of the bytes a
+	// compromised curl-stderr could emit, so we must be able to test it.
+	const harness = `
+set -euo pipefail
+LC_ALL=C
+_curl_err=$(cat)
+_curl_err_safe=""
+for ((_i=0; _i<${#_curl_err}; _i++)); do
+	_ch=${_curl_err:_i:1}
+	case "$_ch" in
+		[[:print:]]|$'\t') _curl_err_safe="${_curl_err_safe}${_ch}" ;;
+	esac
+done
+printf '%s' "$_curl_err_safe"
+`
+	// Scope note: this scrub defends against terminal-rewriting bytes
+	// (ESC, BEL, CR/LF, NUL, C1 CSI 0x9B). Unicode format characters like
+	// U+2028/U+2029/U+202E are NOT this scrub's responsibility — they are
+	// sanitized by internal/daemon/notify_darwin.go (sanitizeForAppleScript).
+	// Keeping the scope narrow avoids locale-dependent `[[:print:]]` drift.
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "plain ASCII preserved",
+			input: "curl: (7) Failed to connect",
+			want:  "curl: (7) Failed to connect",
+		},
+		{
+			name:  "TAB preserved",
+			input: "curl\t(28)\ttimeout",
+			want:  "curl\t(28)\ttimeout",
+		},
+		{
+			name:  "ESC CSI (color/cursor) stripped",
+			input: "\x1b[2J\x1b[31mBAD\x1b[0m",
+			want:  "[2J[31mBAD[0m",
+		},
+		{
+			name:  "OSC title-rewrite stripped",
+			input: "\x1b]0;pwned\x07curl failed",
+			want:  "]0;pwnedcurl failed",
+		},
+		{
+			name:  "CR/LF/NUL stripped",
+			input: "curl\r\nrefused\x00tail",
+			want:  "curlrefusedtail",
+		},
+		{
+			name:  "C1 CSI single-byte stripped",
+			input: "curl\x9b31mBAD",
+			want:  "curl31mBAD",
+		},
+		{
+			name:  "DEL (0x7F) stripped",
+			input: "curl\x7ferased",
+			want:  "curlerased",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("bash", "-c", harness)
+			cmd.Stdin = strings.NewReader(tc.input)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("bash harness failed: %v", err)
+			}
+			if string(out) != tc.want {
+				t.Fatalf("scrub mismatch\n  input:   %q\n  got:     %q\n  want:    %q", tc.input, out, tc.want)
+			}
+		})
+	}
+}
+
 // TestHookScriptStrictModePrefixIsExportedConstant cross-pins the strict-
 // mode error wording with the exported HookHealthFailurePrefix constant
 // that runRemoteNotificationHealthProbe (cmd/cc-clip/main.go) keys off.

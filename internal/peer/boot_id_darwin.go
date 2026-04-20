@@ -4,30 +4,41 @@ package peer
 
 import (
 	"fmt"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-// readBootID returns a cross-boot discriminator on Darwin derived from
-// `kern.boottime`. The sysctl returns a `Timeval` recording wall-clock
-// time at kernel boot; formatting it as `<sec>.<usec>` matches Linux's
-// /proc/sys/kernel/random/boot_id semantics closely enough for the
-// recycled-PID check — any two boots produce distinct values so the
-// boot-id mismatch arm in staleRegistryLock reaps a lock whose recorded
-// PID was inherited across a reboot.
+// readBootID returns a cross-boot discriminator on Darwin.
 //
-// A read failure returns ("", err); callers fall back to PID-only
-// liveness checking when the boot-id is unavailable, so a
-// sysctl-unavailable or sandboxed environment still degrades to the
-// hard-ceiling path rather than the boot-id shortcut.
+// Primary source: `kern.bootsessionuuid` — a UUID assigned at kernel boot,
+// stable for the lifetime of the session, immune to wall-clock changes.
+// This is the correct discriminator to use for "has the machine rebooted?"
+// because `kern.boottime` (the previous source) returns a Timeval derived
+// from wall-clock time at boot and can change mid-session when the system
+// clock is stepped (settimeofday, manual adjustment, virt-host resume). A
+// clock step while a cc-clip process was holding the registry lock would
+// otherwise cause `staleRegistryLock` to observe a boot-id mismatch and
+// reap a still-live lock on the next acquisition attempt.
+//
+// Fallback: `kern.boottime` for older macOS kernels (pre-10.12 or
+// sandboxed sysctl allowlists that only permit boottime). The fallback
+// value is still a useful cross-boot signal between two reboots even if
+// it's clock-step-fragile within a single session.
+//
+// A read failure from both sources returns ("", err); callers fall back
+// to PID-only liveness checking when the boot-id is unavailable.
 func readBootID() (string, error) {
+	if uuid, err := unix.Sysctl("kern.bootsessionuuid"); err == nil {
+		uuid = strings.TrimSpace(uuid)
+		if uuid != "" {
+			return uuid, nil
+		}
+	}
 	tv, err := unix.SysctlTimeval("kern.boottime")
 	if err != nil {
 		return "", err
 	}
-	// Zero values would compare as "always matching boot-id" and defeat
-	// the discriminator. In practice the sysctl never returns zero on a
-	// running system; guard defensively anyway.
 	if tv.Sec == 0 && tv.Usec == 0 {
 		return "", nil
 	}

@@ -712,10 +712,19 @@ func rejectExtraTunnelPositionals(args []string, start int, usage string, valueF
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
-			if _, ok := flagsWithValues[arg]; ok && i+1 < len(args) {
-				i++
+			if eq := strings.IndexByte(arg, '='); eq >= 0 {
+				name := arg[:eq]
+				if _, ok := flagsWithValues[name]; ok {
+					continue
+				}
+				return fmt.Errorf("unexpected flag %q\nusage: %s", arg, usage)
 			}
-			continue
+			if _, ok := flagsWithValues[arg]; ok && i+1 < len(args) {
+				// The next token is consumed as this flag's value.
+				i++
+				continue
+			}
+			return fmt.Errorf("unexpected flag %q\nusage: %s", arg, usage)
 		}
 		return fmt.Errorf("unexpected extra argument %q\nusage: %s", arg, usage)
 	}

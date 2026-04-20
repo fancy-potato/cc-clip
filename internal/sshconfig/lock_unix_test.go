@@ -82,3 +82,46 @@ func TestAcquireConfigLockFailsClosedOnChownError(t *testing.T) {
 		t.Fatalf("expected chown-wrapped error, got %v", err)
 	}
 }
+
+// TestAcquireConfigLockSidecarPersistsAcrossRuns pins the contract
+// documented at the top of lock_unix.go: "The lock file persists between
+// runs (empty 0600 file)." An overzealous future cleanup (e.g. a release
+// func that removed the sidecar instead of just unlocking) would break the
+// two-process serialization contract — the second process would race the
+// cleanup and create a fresh sidecar it locks independently of the first.
+// Without this test, that regression would only surface as intermittent
+// double-writes to ~/.ssh/config under `cc-clip setup` concurrency, which
+// is exactly what the lock exists to prevent.
+func TestAcquireConfigLockSidecarPersistsAcrossRuns(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	if err := os.WriteFile(configPath, []byte("Host example\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	euid := os.Geteuid()
+	egid := os.Getegid()
+
+	lockPath := configPath + ".cc-clip.lock"
+
+	for i := 0; i < 3; i++ {
+		release, err := acquireConfigLock(configPath, euid, egid, true)
+		if err != nil {
+			t.Fatalf("iteration %d: acquireConfigLock: %v", i, err)
+		}
+		// Sidecar must exist WHILE the lock is held.
+		if _, err := os.Stat(lockPath); err != nil {
+			t.Fatalf("iteration %d: sidecar missing while lock held: %v", i, err)
+		}
+		release()
+		// And sidecar must STILL exist after release — releasing must not
+		// delete the file, or the next caller would race on a re-create.
+		info, err := os.Stat(lockPath)
+		if err != nil {
+			t.Fatalf("iteration %d: sidecar deleted by release; two concurrent callers would race on re-create: %v", i, err)
+		}
+		// 0600 mode is the contract; confirm it wasn't loosened between runs.
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("iteration %d: sidecar mode = %o, want 0600", i, mode)
+		}
+	}
+}

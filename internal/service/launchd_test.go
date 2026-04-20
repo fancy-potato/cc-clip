@@ -72,6 +72,67 @@ func TestGeneratePlist(t *testing.T) {
 	}
 }
 
+// TestGeneratePlistEscapesSpecialCharacters pins that every XML-significant
+// character in user-controllable plist inputs (binary path, log path) is
+// properly entity-encoded. A launchd plist emitted with a raw `&`, `<`, `>`,
+// `"`, or `'` is invalid XML and `launchctl load` rejects it at install
+// time — without this test a future edit to escapeXMLText that drops any
+// of the five mappings (most likely &apos;, the least common one) would
+// only be caught in the field.
+func TestGeneratePlistEscapesSpecialCharacters(t *testing.T) {
+	// Each row exercises one raw character that MUST be entity-encoded in
+	// the ProgramArguments <string>. Checking the output contains the
+	// expected entity AND does NOT contain the raw character in the
+	// relevant <string> slot is stronger than a substring check alone —
+	// the substring check would still pass if a future edit accidentally
+	// double-escaped one char (&amp;amp;) or mangled another.
+	cases := []struct {
+		name   string
+		path   string
+		entity string
+	}{
+		{"ampersand", "/Users/a & b/cc-clip", "/Users/a &amp; b/cc-clip"},
+		{"less-than", "/Users/a<b/cc-clip", "/Users/a&lt;b/cc-clip"},
+		{"greater-than", "/Users/a>b/cc-clip", "/Users/a&gt;b/cc-clip"},
+		{"double-quote", `/Users/a"b/cc-clip`, "/Users/a&quot;b/cc-clip"},
+		{"apostrophe", "/Users/o'brien/cc-clip", "/Users/o&apos;brien/cc-clip"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			content := generatePlist(tc.path, 18339)
+			if !strings.Contains(content, "<string>"+tc.entity+"</string>") {
+				t.Fatalf("plist does not contain expected entity-encoded path\n  want contains: <string>%s</string>\n  got:\n%s", tc.entity, content)
+			}
+			// Also ensure the raw path doesn't appear unescaped in the
+			// ProgramArguments <string> slot. Entity-encoded forms like
+			// &amp; still contain the `&` byte, so we search specifically
+			// for the `<string>RAW</string>` shape which would signal
+			// escaping was skipped entirely.
+			if strings.Contains(content, "<string>"+tc.path+"</string>") {
+				t.Fatalf("plist contains UN-escaped raw path <string>%s</string>; escaping was skipped", tc.path)
+			}
+		})
+	}
+}
+
+// TestEscapeXMLTextIdempotentOnSafeInput pins that strings containing no
+// XML-significant characters pass through escapeXMLText unchanged. A
+// regression that accidentally encoded every character (e.g. via
+// encoding/xml.EscapeText) would wildly inflate plist sizes without
+// changing correctness, but would be caught here.
+func TestEscapeXMLTextIdempotentOnSafeInput(t *testing.T) {
+	for _, in := range []string{
+		"/usr/local/bin/cc-clip",
+		"com.cc-clip.daemon",
+		"cc-clip.log",
+		"",
+	} {
+		if got := escapeXMLText(in); got != in {
+			t.Errorf("escapeXMLText(%q) = %q, want unchanged", in, got)
+		}
+	}
+}
+
 func TestGeneratePlist_CustomPort(t *testing.T) {
 	content := generatePlist("/opt/bin/cc-clip", 9999)
 
@@ -165,6 +226,25 @@ func TestInstall_MockLaunchctl(t *testing.T) {
 	}
 	if !loadCalled {
 		t.Error("launchctl load was not called")
+	}
+}
+
+func TestInstallCreatesFallbackLogDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+	t.Setenv("SUDO_USER", "")
+	userhome.SetResolverForTest(t, failingHomeResolver{})
+
+	originalLoad := launchctlLoad
+	launchctlLoad = func(string) error { return nil }
+	defer func() { launchctlLoad = originalLoad }()
+
+	if err := Install(filepath.Join(tmpDir, "cc-clip"), 18339); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(tmpDir, "cc-clip", "Logs")); err != nil {
+		t.Fatalf("fallback log directory not created: %v", err)
 	}
 }
 

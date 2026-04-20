@@ -12,8 +12,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// bootIDReadErrorOnce gates logBootIDReadErrorOnce so a sandboxed cc-clip
+// whose sysctl/proc reads consistently fail only surfaces the condition
+// once per process — the condition doesn't change mid-run, so subsequent
+// registry acquires logging the same error would just spam the daemon log.
+var bootIDReadErrorOnce sync.Once
+
+func logBootIDReadErrorOnce(err error) {
+	bootIDReadErrorOnce.Do(func() {
+		log.Printf("peer: readBootID failed (%v); registry staleness falls back to 10-minute hard ceiling instead of the boot-id shortcut.", err)
+	})
+}
 
 const registryVersion = 1
 
@@ -308,11 +321,30 @@ func emptyPeersFile() PeersFile {
 func loadRegistryFiles(registryDir string) (PortsFile, PeersFile, error) {
 	ports := emptyPortsFile()
 	peers := emptyPeersFile()
+	portsPath := filepath.Join(registryDir, "ports.json")
+	peersPath := filepath.Join(registryDir, "peers.json")
 
-	if err := loadJSON(filepath.Join(registryDir, "ports.json"), &ports); err != nil {
+	portsExists, err := fileExists(portsPath)
+	if err != nil {
+		return PortsFile{}, PeersFile{}, fmt.Errorf("stat ports registry: %w", err)
+	}
+	peersExists, err := fileExists(peersPath)
+	if err != nil {
+		return PortsFile{}, PeersFile{}, fmt.Errorf("stat peers registry: %w", err)
+	}
+	switch {
+	case !portsExists && !peersExists:
+		return ports, peers, nil
+	case !portsExists:
+		return PortsFile{}, PeersFile{}, fmt.Errorf("failed to load ports registry: registry is incomplete (missing %s while %s exists)", portsPath, peersPath)
+	case !peersExists:
+		return PortsFile{}, PeersFile{}, fmt.Errorf("failed to load peers registry: registry is incomplete (missing %s while %s exists)", peersPath, portsPath)
+	}
+
+	if err := loadJSON(portsPath, &ports); err != nil {
 		return PortsFile{}, PeersFile{}, fmt.Errorf("failed to load ports registry: %w", err)
 	}
-	if err := loadJSON(filepath.Join(registryDir, "peers.json"), &peers); err != nil {
+	if err := loadJSON(peersPath, &peers); err != nil {
 		return PortsFile{}, PeersFile{}, fmt.Errorf("failed to load peers registry: %w", err)
 	}
 	if ports.Ports == nil {
@@ -359,6 +391,16 @@ func loadRegistryFiles(registryDir string) (PortsFile, PeersFile, error) {
 		}
 	}
 	return ports, peers, nil
+}
+
+func fileExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func loadJSON(path string, dst any) error {
@@ -522,7 +564,16 @@ func lockRegistry(baseDir string) (func(), error) {
 	for {
 		if err := os.Mkdir(lockPath, 0700); err == nil {
 			ownerPID := os.Getpid()
-			ownerBootID, _ := readBootIDFn()
+			ownerBootID, bootIDErr := readBootIDFn()
+			if bootIDErr != nil {
+				// Best-effort visibility: readBootIDFn errors silently
+				// degrade the staleness check from the boot-id shortcut
+				// (immediate reap of cross-boot PID reuse) to the 10-minute
+				// hard ceiling. A sandboxed cc-clip that can't read sysctl
+				// /proc wouldn't otherwise surface why port reservation
+				// feels slow after a reboot.
+				logBootIDReadErrorOnce(bootIDErr)
+			}
 			// Stamp the pid file before returning. If the stamp fails we
 			// MUST tear down the lock and retry: a held-but-unstamped lock
 			// races with stealStaleLock, which would observe an empty pid

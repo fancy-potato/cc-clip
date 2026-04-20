@@ -2083,3 +2083,140 @@ func TestCollectManagedMarkerPairs(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyPreLockOwnerDriftIsBenign pins the documented invariant in
+// Apply (see sshconfig.go: "a concurrent rewrite between the two reads is
+// fine: the post-lock read wins"). The review flagged this as an untested
+// assumption; a regression that accidentally fed the pre-lock `data` into
+// the write path would surface as "Apply silently loses concurrent edits,"
+// which on a shared-account host looks like "cc-clip nuked my manual
+// HostName change."
+//
+// We simulate a concurrent rewrite by hooking the synchronous injection
+// point between acquireConfigLock and the post-lock readConfig. The hook
+// replaces the file's contents with a new, valid Host block — exactly what
+// a competing writer on another terminal (or another laptop sharing the
+// account) could land in that window. Apply must:
+//   1. complete without error,
+//   2. preserve the MUTATED post-lock contents in the non-managed lines,
+//   3. still land the SetEnv block inside the (mutated) Host block.
+func TestApplyPreLockOwnerDriftIsBenign(t *testing.T) {
+	path := writeTempConfig(t, `Host myalias
+  HostName old.example.com
+  User old
+`)
+
+	// Hook fires AFTER the lock is held but BEFORE the authoritative read.
+	// Rewrite the file so the pre-lock meta/data is stale — the post-lock
+	// read must observe these new contents and Apply must operate on them.
+	applyPostLockHookForTest = func(p string) {
+		if p != path {
+			t.Errorf("hook fired with unexpected path %q (want %q)", p, path)
+			return
+		}
+		newContent := `Host myalias
+  HostName new.example.com
+  User newuser
+`
+		if err := os.WriteFile(p, []byte(newContent), 0o600); err != nil {
+			t.Errorf("hook rewrite failed: %v", err)
+		}
+	}
+	t.Cleanup(func() { applyPostLockHookForTest = nil })
+
+	if err := ApplyToFile(path, "myalias", map[string]string{
+		"CC_CLIP_PORT":      "18339",
+		"CC_CLIP_STATE_DIR": "/home/newuser/.cache/cc-clip/peers/drift",
+	}); err != nil {
+		t.Fatalf("Apply under drift: %v", err)
+	}
+
+	got := readFile(t, path)
+	// Non-managed lines must reflect the POST-lock rewrite, not the
+	// pre-lock snapshot. If this assertion fails, the post-lock read was
+	// discarded and the pre-lock data was used for the write — regression.
+	if !strings.Contains(got, "HostName new.example.com") {
+		t.Fatalf("post-lock rewrite was not preserved; got:\n%s", got)
+	}
+	if strings.Contains(got, "HostName old.example.com") {
+		t.Fatalf("pre-lock stale data leaked into write; got:\n%s", got)
+	}
+	// Managed SetEnv must land inside the (mutated) Host block.
+	if !strings.Contains(got, "SetEnv CC_CLIP_PORT=18339 CC_CLIP_STATE_DIR=/home/newuser/.cache/cc-clip/peers/drift") {
+		t.Fatalf("SetEnv directive missing or mangled; got:\n%s", got)
+	}
+}
+
+// TestRenderMarkerBlockEmitsSingleSetEnvLine pins the OpenSSH invariant
+// called out in ManagedSetEnvLine: CC_CLIP_PORT and CC_CLIP_STATE_DIR MUST
+// land on a single `SetEnv` directive because OpenSSH remembers only the
+// first SetEnv it sees per host. A refactor that emitted two lines (say
+// `SetEnv CC_CLIP_PORT=…` + `SetEnv CC_CLIP_STATE_DIR=…`) would silently
+// drop one variable, breaking the shared-account multi-laptop path in a
+// way that only surfaces as "clipboard/notify went to the wrong peer."
+func TestRenderMarkerBlockEmitsSingleSetEnvLine(t *testing.T) {
+	env := map[string]string{
+		"CC_CLIP_PORT":      "18339",
+		"CC_CLIP_STATE_DIR": "/home/user/.cache/cc-clip/peers/abc",
+	}
+	lines, err := renderMarkerBlock(env, "    ")
+	if err != nil {
+		t.Fatalf("renderMarkerBlock: %v", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("expected exactly 3 lines (begin, SetEnv, end); got %d: %v", len(lines), lines)
+	}
+	if lines[0] != "    "+MarkerBegin {
+		t.Fatalf("line 0: want begin marker, got %q", lines[0])
+	}
+	if lines[2] != "    "+MarkerEnd {
+		t.Fatalf("line 2: want end marker, got %q", lines[2])
+	}
+	body := strings.TrimSpace(lines[1])
+	if !strings.HasPrefix(body, "SetEnv ") {
+		t.Fatalf("line 1 must begin with `SetEnv `; got %q", body)
+	}
+	// Exactly one SetEnv *directive* on line 1 and none elsewhere. The
+	// marker comments intentionally mention "SetEnv" in their human-readable
+	// text, so we count lines whose trimmed prefix is literally `SetEnv `
+	// rather than a raw substring match.
+	setEnvDirectives := 0
+	for _, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "SetEnv ") {
+			setEnvDirectives++
+		}
+	}
+	if setEnvDirectives != 1 {
+		t.Fatalf("expected exactly 1 SetEnv directive in block; got %d\n%v", setEnvDirectives, lines)
+	}
+	// Both assignments must appear on the SAME line.
+	if !strings.Contains(body, "CC_CLIP_PORT=18339") {
+		t.Fatalf("SetEnv line missing CC_CLIP_PORT assignment: %q", body)
+	}
+	if !strings.Contains(body, "CC_CLIP_STATE_DIR=") {
+		t.Fatalf("SetEnv line missing CC_CLIP_STATE_DIR assignment: %q", body)
+	}
+}
+
+// TestManagedSetEnvLineIsSingleDirective is the tighter unit-level mirror of
+// the block-level test above: the string returned by ManagedSetEnvLine must
+// be a single line (no embedded newline) carrying every key.
+func TestManagedSetEnvLineIsSingleDirective(t *testing.T) {
+	env := map[string]string{
+		"CC_CLIP_PORT":      "18339",
+		"CC_CLIP_STATE_DIR": "/home/u/.cache/cc-clip/peers/x",
+	}
+	line, err := ManagedSetEnvLine(env)
+	if err != nil {
+		t.Fatalf("ManagedSetEnvLine: %v", err)
+	}
+	if strings.Contains(line, "\n") || strings.Contains(line, "\r") {
+		t.Fatalf("ManagedSetEnvLine must return a single line; got %q", line)
+	}
+	if strings.Count(line, "SetEnv") != 1 {
+		t.Fatalf("expected exactly one `SetEnv` in line; got %q", line)
+	}
+	if !strings.HasPrefix(line, "SetEnv ") {
+		t.Fatalf("line must start with `SetEnv `; got %q", line)
+	}
+}

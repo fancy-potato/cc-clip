@@ -10,6 +10,7 @@ LOCAL_SHARE_DIR="${CC_CLIP_SHARE_DIR:-$HOME/.local/share/cc-clip}"
 SWIFTBAR_APP="/Applications/SwiftBar.app"
 SWIFTBAR_PLUGIN_DIR="${SWIFTBAR_PLUGIN_DIR:-$HOME/Documents/SwiftBar}"
 LOCAL_PLUGIN_DIR="${CC_CLIP_SWIFTBAR_PLUGIN_DIR:-$LOCAL_SHARE_DIR/swiftbar}"
+LOCAL_SCRIPT_DIR="${CC_CLIP_SCRIPT_DIR:-$LOCAL_SHARE_DIR/scripts}"
 PLUGIN_NAME="cc-clip-tunnels.30s.sh"
 INSTALL_SWIFTBAR="${INSTALL_SWIFTBAR:-1}"
 INSTALL_JQ="${INSTALL_JQ:-1}"
@@ -24,6 +25,7 @@ if [ "${CC_CLIP_ALLOW_TEST:-0}" != "1" ]; then
     unset CC_CLIP_TEST_DOWNLOAD 2>/dev/null || true
     unset CC_CLIP_TEST_VERSION 2>/dev/null || true
     unset CC_CLIP_TEST_CHECKSUMS 2>/dev/null || true
+    unset CC_CLIP_TEST_RAW_DIR 2>/dev/null || true
 fi
 
 die() {
@@ -105,6 +107,26 @@ download_checksums() {
         curl -fsSL "$1" -o "$2"
     else
         wget -qO "$2" "$1"
+    fi
+}
+
+download_repo_file() {
+    repo_ref=$1
+    repo_path=$2
+    dest=$3
+    if [ -n "${CC_CLIP_TEST_RAW_DIR:-}" ]; then
+        src="${CC_CLIP_TEST_RAW_DIR%/}/${repo_path}"
+        if [ ! -f "$src" ]; then
+            return 1
+        fi
+        cp "$src" "$dest"
+        return 0
+    fi
+    url="https://raw.githubusercontent.com/${REPO}/${repo_ref}/${repo_path}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$dest"
+    else
+        wget -qO "$dest" "$url"
     fi
 }
 
@@ -238,6 +260,30 @@ install_swiftbar_plugin() {
     echo "  SwiftBar link: $plugin_link"
 }
 
+install_maintenance_script() {
+    script_name="$1"
+    script_src="$2"
+    mkdir -p "$LOCAL_SCRIPT_DIR"
+    cp "$script_src" "$LOCAL_SCRIPT_DIR/$script_name"
+    chmod +x "$LOCAL_SCRIPT_DIR/$script_name"
+}
+
+ensure_support_script() {
+    script_name="$1"
+    script_path="${TMP_DIR}/scripts/${script_name}"
+    if [ -f "$script_path" ]; then
+        return 0
+    fi
+    mkdir -p "${TMP_DIR}/scripts"
+    echo "Support script ${script_name} missing from release archive; fetching from ${VERSION}..."
+    if ! download_repo_file "$VERSION" "scripts/${script_name}" "$script_path"; then
+        echo "Warning: could not fetch scripts/${script_name} from ${VERSION}" >&2
+        return 1
+    fi
+    chmod +x "$script_path"
+    return 0
+}
+
 main() {
     PLATFORM=$(detect_platform)
     VERSION=$(get_latest_version)
@@ -301,12 +347,24 @@ main() {
     install_swiftbar_if_missing
     install_jq_if_missing
     install_terminal_notifier_if_missing
+    ensure_support_script "${PLUGIN_NAME}" || true
+    ensure_support_script "uninstall-local.sh" || true
+    ensure_support_script "uninstall-all.sh" || true
     if [ -f "${TMP_DIR}/scripts/${PLUGIN_NAME}" ]; then
         install_swiftbar_plugin "${TMP_DIR}/scripts/${PLUGIN_NAME}"
+    fi
+    if [ -f "${TMP_DIR}/scripts/uninstall-local.sh" ]; then
+        install_maintenance_script "uninstall-local.sh" "${TMP_DIR}/scripts/uninstall-local.sh"
+    fi
+    if [ -f "${TMP_DIR}/scripts/uninstall-all.sh" ]; then
+        install_maintenance_script "uninstall-all.sh" "${TMP_DIR}/scripts/uninstall-all.sh"
     fi
 
     echo ""
     echo "cc-clip ${VERSION} installed to ${INSTALL_DIR}/cc-clip"
+    if [ -d "$LOCAL_SCRIPT_DIR" ]; then
+        echo "Maintenance scripts installed to ${LOCAL_SCRIPT_DIR}"
+    fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -q "^${INSTALL_DIR}$"; then
         echo ""

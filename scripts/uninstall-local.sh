@@ -42,6 +42,47 @@ warn() {
 	printf 'warning: %s\n' "$*" >&2
 }
 
+run_chown() {
+	if command -v chown >/dev/null 2>&1; then
+		chown "$@"
+		return $?
+	fi
+	if [ -x /usr/sbin/chown ]; then
+		/usr/sbin/chown "$@"
+		return $?
+	fi
+	if [ -x /bin/chown ]; then
+		/bin/chown "$@"
+		return $?
+	fi
+	return 1
+}
+
+stat_mode() {
+	if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+		stat -f '%Lp' "$1"
+		return 0
+	fi
+	stat -c '%a' "$1"
+}
+
+stat_owner() {
+	if stat -f '%u:%g' "$1" >/dev/null 2>&1; then
+		stat -f '%u:%g' "$1"
+		return 0
+	fi
+	stat -c '%u:%g' "$1"
+}
+
+preserve_file_metadata() {
+	SRC=$1
+	DST=$2
+	MODE=$(stat_mode "$SRC") || return 1
+	OWNER=$(stat_owner "$SRC") || return 1
+	chmod "$MODE" "$DST" || return 1
+	run_chown "$OWNER" "$DST" || return 1
+}
+
 require_arg() {
 	if [ $# -lt 2 ] || [ -z "$2" ]; then
 		printf 'error: %s requires a value\n' "$1" >&2
@@ -99,24 +140,6 @@ remove_managed_ssh_config_blocks() {
 
 	TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/cc-clip-ssh-config.XXXXXX")
 	trap 'rm -f "$TMP_FILE"' EXIT HUP INT TERM
-	# Preserve the existing file's owner/mode on the temp copy before we
-	# rewrite it. If an operator runs this script under sudo, writing the
-	# awk output straight to a mktemp-owned file and then mv'ing it over
-	# ~/.ssh/config would replace the user's config with temp-file metadata.
-	# Copying with -p first gives the temp path the same metadata, and the
-	# shell redirection below truncates that file in place without changing
-	# owner/mode.
-	#
-	# SECURITY: cp -p overwrites the existing regular file that mktemp
-	# created, which closes a symlink-in-TMPDIR race that would otherwise
-	# exist between `rm -f "$TMP_FILE"` and the later `cp`. A previous
-	# revision rm'd the temp file between mktemp and cp, opening a window
-	# where a malicious actor with write access to TMPDIR could plant a
-	# symlink at the same path pointing anywhere writable by the user
-	# running this script; `cp -p --follow-symlinks` would then clobber
-	# the symlink target. Keep the rm-via-EXIT-trap (to clean up after a
-	# successful run or a panic), but do not pre-delete the mktemp file.
-	cp -p "$SSH_CONFIG" "$TMP_FILE"
 
 	awk '
 	function flush_buffer(    i) {
@@ -175,6 +198,7 @@ remove_managed_ssh_config_blocks() {
 	}
 	' "$SSH_CONFIG" >"$TMP_FILE"
 
+	preserve_file_metadata "$SSH_CONFIG" "$TMP_FILE"
 	mv "$TMP_FILE" "$SSH_CONFIG"
 	trap - EXIT HUP INT TERM
 }

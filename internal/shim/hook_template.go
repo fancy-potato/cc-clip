@@ -237,7 +237,13 @@ if [ "$_http_code" != "204" ] && [ "$_http_code" != "200" ]; then
 		# diagnostic value: curl's real error strings are already printable
 		# ASCII.
 		if [ "$_http_code" = "000" ] && [ -n "$_curl_err" ]; then
-			_curl_err_safe=$(printf '%%s' "$_curl_err" | tr -cd '[:print:]\t')
+			_curl_err_safe=""
+			for ((_i=0; _i<${#_curl_err}; _i++)); do
+				_ch=${_curl_err:_i:1}
+				case "$_ch" in
+					[[:print:]]|$'\t') _curl_err_safe="${_curl_err_safe}${_ch}" ;;
+				esac
+			done
 			echo "cc-clip-hook health probe failed: http=$_http_code ($_curl_err_safe)"
 		else
 			echo "cc-clip-hook health probe failed: http=$_http_code"

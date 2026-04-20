@@ -149,6 +149,9 @@ func Install(binaryPath string, port int) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("cannot create LaunchAgents directory: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Dir(logPath()), 0755); err != nil {
+		return fmt.Errorf("cannot create launchd log directory: %w", err)
+	}
 
 	content := generatePlist(binaryPath, port)
 	if err := os.WriteFile(plist, []byte(content), 0644); err != nil {

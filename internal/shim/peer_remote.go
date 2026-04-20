@@ -178,19 +178,30 @@ func ListPeersViaSession(session *SSHSession, remoteBin string) ([]peer.Registra
 	if err != nil {
 		return nil, fmt.Errorf("failed to list remote peer registry: %w", err)
 	}
+	return parsePeerListOutput(out)
+}
+
+// parsePeerListOutput decodes the stdout of `cc-clip peer list` into a
+// registration slice, failing closed on any ambiguity so the uninstall
+// fail-safe contract (AGENTS.md: "Uninstall is multi-peer safe") holds:
+// an unparseable reply MUST become an error so callers preserve shared
+// assets instead of misreading it as "zero peers, safe to clean up".
+//
+// `cc-clip peer list` always prints `[...JSON array...]` (see cmdPeer in
+// cmd/cc-clip/main.go). We require the trimmed output to START with `[`
+// before handing it to json.Unmarshal so a rc-file echo, MOTD banner, or
+// wrapper log-line preceding the payload can't coax the parser into
+// treating `"some banner\n[]"` as a successful empty-registry read (it
+// wouldn't — json.Unmarshal is strict — but a stricter structural gate
+// up front keeps the error message actionable and defends against future
+// parser leniency).
+func parsePeerListOutput(out string) ([]peer.Registration, error) {
 	trimmed := bytes.TrimSpace([]byte(out))
-	// `cc-clip peer list` always prints `[]` for an empty registry (see
-	// cmdPeer in cmd/cc-clip/main.go). Empty stdout therefore signals a
-	// broken remote: a transport that swallowed the output, a wrapper that
-	// truncated it, or a remote binary that exited 0 without writing. The
-	// uninstall fail-safe contract (AGENTS.md: "Uninstall is multi-peer safe")
-	// requires we treat ambiguous registry reads as errors so callers
-	// preserve shared assets rather than racing to delete them. Returning a
-	// nil slice here would conflate "no peers, safe to clean up" with "I
-	// don't know" — the exact regression the registry overhaul exists to
-	// prevent.
 	if len(trimmed) == 0 {
 		return nil, fmt.Errorf("remote peer list returned empty output (expected JSON array, got 0 bytes)")
+	}
+	if trimmed[0] != '[' {
+		return nil, fmt.Errorf("remote peer list did not start with '[' (got: %s) — likely a shell-rc banner or wrapper log leaked before the payload", truncateForError(string(trimmed)))
 	}
 	var regs []peer.Registration
 	if err := json.Unmarshal(trimmed, &regs); err != nil {

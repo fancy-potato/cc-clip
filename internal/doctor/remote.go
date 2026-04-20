@@ -221,7 +221,16 @@ echo tunnel fail
 	}
 
 	// Check token on remote
-	stateDir := resolveDoctorStateDir(reg, managedEnv)
+	stateDir, stateDirErr := resolveDoctorStateDir(reg, managedEnv, managedEnvErr)
+	if stateDirErr != nil {
+		msg := stateDirErr.Error()
+		results = append(results, CheckResult{"remote-token", false, msg})
+		results = append(results, CheckResult{"remote-nonce", false, msg})
+		results = append(results, CheckResult{"token-match", false, msg})
+		results = append(results, checkDeployStateResult(deployState, deployErr)...)
+		results = append(results, checkPathFix(host)...)
+		return results
+	}
 	stateDirExpr := remotePathExpr(stateDir)
 	// P2-25: distinguish "file missing" from "SSH failed". The old code
 	// treated any non-"present" output as missing, which silently hid SSH
@@ -276,21 +285,24 @@ echo tunnel fail
 func readManagedSetEnv(host string) (map[string]string, error) {
 	data, err := readLocalSSHConfig()
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return sshconfig.ReadManagedEnvFromBytes(data, host)
 }
 
-func resolveDoctorStateDir(reg *peer.Registration, managedEnv map[string]string) string {
+func resolveDoctorStateDir(reg *peer.Registration, managedEnv map[string]string, managedEnvErr error) (string, error) {
 	if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
-		return strings.TrimSpace(reg.StateDir)
+		return strings.TrimSpace(reg.StateDir), nil
 	}
 	if managedEnv != nil {
 		if stateDir := strings.TrimSpace(managedEnv["CC_CLIP_STATE_DIR"]); stateDir != "" {
-			return stateDir
+			return stateDir, nil
 		}
 	}
-	return "~/.cache/cc-clip"
+	if managedEnvErr != nil {
+		return "", fmt.Errorf("cannot determine remote state dir: peer lookup unavailable and ~/.ssh/config SetEnv read failed: %w", managedEnvErr)
+	}
+	return "~/.cache/cc-clip", nil
 }
 
 // remoteExecNoForward runs an SSH command without applying RemoteForward from ssh config.
@@ -889,6 +901,25 @@ func checkSetEnvAlignment(host string, reg *peer.Registration, managedEnv map[st
 		managedEnv, managedEnvErr = readManagedSetEnv(host)
 	}
 	if managedEnvErr != nil {
+		if _, err := readLocalSSHConfig(); err != nil {
+			wantPort := fmt.Sprintf("%d", reg.ReservedPort)
+			wantStateDir := strings.TrimSpace(reg.StateDir)
+			expectedEnv := map[string]string{
+				"CC_CLIP_PORT": wantPort,
+			}
+			if wantStateDir != "" {
+				expectedEnv["CC_CLIP_STATE_DIR"] = wantStateDir
+			}
+			expectedLine := ""
+			if line, lineErr := sshconfig.ManagedSetEnvLine(expectedEnv); lineErr == nil {
+				expectedLine = line
+			}
+			return &CheckResult{
+				Name:    "ssh-config-setenv",
+				OK:      true,
+				Message: fmt.Sprintf("skipped: cannot read ~/.ssh/config (%v); add SetEnv manually if needed: %s", err, expectedLine),
+			}
+		}
 		return &CheckResult{
 			Name:    "ssh-config-setenv",
 			OK:      false,

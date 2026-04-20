@@ -835,11 +835,21 @@ func TestCheckSetEnvAlignmentSkipsOnUnreadableConfig(t *testing.T) {
 }
 
 func TestResolveDoctorStateDirPrefersManagedSetEnvWhenPeerLookupMisses(t *testing.T) {
-	got := resolveDoctorStateDir(nil, map[string]string{
+	got, err := resolveDoctorStateDir(nil, map[string]string{
 		"CC_CLIP_STATE_DIR": "/home/shared/.cache/cc-clip/peers/peer-a",
-	})
+	}, nil)
+	if err != nil {
+		t.Fatalf("resolveDoctorStateDir: %v", err)
+	}
 	if got != "/home/shared/.cache/cc-clip/peers/peer-a" {
 		t.Fatalf("state dir = %q, want managed SetEnv state dir", got)
+	}
+}
+
+func TestResolveDoctorStateDirFailsClosedWhenSetEnvUnreadableAndPeerMissing(t *testing.T) {
+	_, err := resolveDoctorStateDir(nil, nil, errors.New("permission denied"))
+	if err == nil || !strings.Contains(err.Error(), "cannot determine remote state dir") {
+		t.Fatalf("resolveDoctorStateDir err = %v, want fail-closed error", err)
 	}
 }
 

@@ -134,7 +134,7 @@ Doctor check ID: `ssh-config-legacy` (advisory only — this check is cosmetic; 
 
 Save and reconnect. The warning will not return.
 
-The one exception is the destructive local purge script: `scripts/uninstall-local.sh` removes legacy managed blocks too, but only when `~/.ssh/config` is a regular file. Symlinked SSH configs are preserved with a warning.
+The one exception is the destructive local purge script: `scripts/uninstall-local.sh` (or the installer copy at `~/.local/share/cc-clip/scripts/uninstall-local.sh`) removes legacy managed blocks too, but only when `~/.ssh/config` is a regular file. Symlinked SSH configs are preserved with a warning.
 
 ---
 

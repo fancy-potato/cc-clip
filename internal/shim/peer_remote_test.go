@@ -159,6 +159,70 @@ func TestValidateRemoteBinAllowsCanonicalPath(t *testing.T) {
 	}
 }
 
+// TestParsePeerListOutputAcceptsEmptyArray pins that a clean `[]` reply —
+// the canonical empty-registry payload — decodes to a non-nil empty slice.
+// A nil return here would regress callers that rely on (len==0, err==nil)
+// to mean "registry is empty, safe to proceed"; see countRemoteActivePeers.
+func TestParsePeerListOutputAcceptsEmptyArray(t *testing.T) {
+	regs, err := parsePeerListOutput("[]\n")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if regs == nil {
+		t.Fatalf("expected non-nil empty slice; got nil")
+	}
+	if len(regs) != 0 {
+		t.Fatalf("expected 0 regs; got %d", len(regs))
+	}
+}
+
+// TestParsePeerListOutputRejectsAmbiguousInputs pins the fail-closed
+// contract for every ambiguity mode the uninstall path must treat as "I
+// don't know" rather than "zero peers." Each row documents a real
+// distortion a shared-account remote can introduce: rc-file echo, MOTD,
+// null payload, wrapper truncation, or a transport that ate the array.
+func TestParsePeerListOutputRejectsAmbiguousInputs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"empty", ""},
+		{"whitespace only", "  \n\t  "},
+		{"rc-file banner before array", "Last login: Tue Apr  1 10:00\n[]"},
+		{"MOTD prefix", "Welcome to Ubuntu\n[{\"peer_id\":\"p\",\"reserved_port\":1}]"},
+		{"null payload", "null"},
+		{"object instead of array", "{\"peer_id\":\"p\"}"},
+		{"truncated array open", "["},
+		{"truncated entry", "[{\"peer_id\""},
+		{"trailing garbage after array", "[]\nbye"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			regs, err := parsePeerListOutput(tc.in)
+			if err == nil {
+				t.Fatalf("expected error for input %q, got regs=%v", tc.in, regs)
+			}
+		})
+	}
+}
+
+// TestParsePeerListOutputDecodesPopulatedArray pins the happy-path shape
+// so a future Registration field rename doesn't silently parse into zero
+// values and let the uninstall flow misread populated peers as "no peers".
+func TestParsePeerListOutputDecodesPopulatedArray(t *testing.T) {
+	in := `[{"peer_id":"abc123","reserved_port":18341,"state_dir":"/home/u/.cache/cc-clip/peers/abc123","created_at":"2026-04-20T12:00:00Z"}]`
+	regs, err := parsePeerListOutput(in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(regs) != 1 {
+		t.Fatalf("expected 1 registration; got %d", len(regs))
+	}
+	if regs[0].PeerID != "abc123" {
+		t.Fatalf("expected peer_id=abc123; got %q", regs[0].PeerID)
+	}
+}
+
 // TestValidateRemoteBinRejectsInjection pins the P1-3 review fix. The peer
 // helpers Sprintf `remoteBin` raw (because `~` must expand), so any shell
 // metacharacter in the path would be interpreted by the remote shell. The
