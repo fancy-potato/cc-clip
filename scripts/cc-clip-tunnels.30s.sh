@@ -277,10 +277,10 @@ while IFS= read -r t; do
     # $CC_CLIP may contain spaces (e.g. `/Applications/My Dir/cc-clip`).
     # SwiftBar splits the line on unquoted whitespace, so wrap the executable
     # in quotes — SwiftBar strips the outer quotes and passes the full path as
-    # a single argv token. Quote $host too so the allowlist isn't the sole
-    # barrier against argv injection. The daemon port is passed as an explicit
-    # `--port` flag, matching the CLI surface exposed to interactive users.
-    echo "--${action_label} | bash=\"${CC_CLIP}\" param1=tunnel param2=${action_cmd} \"param3=${host}\" param4=--port param5=${action_daemon_port} terminal=false refresh=true"
+    # a single argv token. Host must stay as a plain paramN=value token here:
+    # wrapping the whole `paramN=...` fragment in quotes causes SwiftBar to
+    # drop the host argument and invoke `cc-clip tunnel down --port ...`.
+    echo "--${action_label} | bash=\"${CC_CLIP}\" param1=tunnel param2=${action_cmd} param3=${host} param4=--port param5=${action_daemon_port} terminal=false refresh=true"
 done <<< "$rows"
 
 if [ -n "$cc_clip_extra_path_warning" ]; then
