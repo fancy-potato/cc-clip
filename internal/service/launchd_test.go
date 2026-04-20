@@ -3,10 +3,28 @@
 package service
 
 import (
+	"errors"
 	"os"
+	"os/user"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
+
+type failingHomeResolver struct{}
+
+func (failingHomeResolver) LookupUser(string) (*user.User, error) {
+	return nil, errors.New("unexpected lookup")
+}
+
+func (failingHomeResolver) UserHomeDir() (string, error) {
+	return "", errors.New("boom")
+}
+
+func (failingHomeResolver) IsSudoRoot() bool { return false }
 
 func TestGeneratePlist(t *testing.T) {
 	content := generatePlist("/usr/local/bin/cc-clip", 18339)
@@ -21,7 +39,6 @@ func TestGeneratePlist(t *testing.T) {
 		{"port flag", "<string>--port</string>"},
 		{"port value", "<string>18339</string>"},
 		{"run at load", "<key>RunAtLoad</key>"},
-		{"run at load true", "<true/>"},
 		{"keep alive", "<key>KeepAlive</key>"},
 		{"log path", "cc-clip.log"},
 		{"xml header", "<?xml version"},
@@ -31,6 +48,26 @@ func TestGeneratePlist(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(content, check.contains) {
 			t.Errorf("plist missing %s: expected to contain %q", check.name, check.contains)
+		}
+	}
+
+	// Pin the VALUE of each boolean key, not just the key's presence.
+	// The previous substring check ("<true/>" appears somewhere)
+	// would pass even if KeepAlive or RunAtLoad flipped to <false/>
+	// because the other key contributed a <true/> to the file. A
+	// silent KeepAlive regression would defeat the persistent tunnel's
+	// "daemon restart via launchd" contract and never be caught.
+	valueChecks := []struct {
+		name    string
+		key     string
+		pattern string
+	}{
+		{"RunAtLoad=true", "RunAtLoad", `<key>RunAtLoad</key>\s*<true/>`},
+		{"KeepAlive=true", "KeepAlive", `<key>KeepAlive</key>\s*<true/>`},
+	}
+	for _, vc := range valueChecks {
+		if !regexp.MustCompile(vc.pattern).MatchString(content) {
+			t.Errorf("plist %s missing or not true: pattern %q did not match\n--- plist ---\n%s", vc.name, vc.pattern, content)
 		}
 	}
 }
@@ -50,6 +87,40 @@ func TestPlistPath(t *testing.T) {
 	path := PlistPath()
 	if !strings.HasSuffix(path, "Library/LaunchAgents/com.cc-clip.daemon.plist") {
 		t.Errorf("unexpected plist path: %s", path)
+	}
+}
+
+func TestPlistPathFallsBackToAbsoluteTempPathWhenHomeLookupFails(t *testing.T) {
+	userhome.SetResolverForTest(t, failingHomeResolver{})
+	t.Setenv("SUDO_USER", "")
+
+	got := PlistPath()
+	want := filepath.Join(os.TempDir(), "cc-clip", "LaunchAgents", plistFileName)
+	if got != want {
+		t.Fatalf("PlistPath() = %q, want %q", got, want)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("PlistPath() = %q, want absolute path", got)
+	}
+	if strings.HasPrefix(got, "~") {
+		t.Fatalf("PlistPath() = %q, must not use ~ fallback", got)
+	}
+}
+
+func TestLogPathFallsBackToAbsoluteTempPathWhenHomeLookupFails(t *testing.T) {
+	userhome.SetResolverForTest(t, failingHomeResolver{})
+	t.Setenv("SUDO_USER", "")
+
+	got := logPath()
+	want := filepath.Join(os.TempDir(), "cc-clip", "Logs", "cc-clip.log")
+	if got != want {
+		t.Fatalf("logPath() = %q, want %q", got, want)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("logPath() = %q, want absolute path", got)
+	}
+	if strings.HasPrefix(got, "~") {
+		t.Fatalf("logPath() = %q, must not use ~ fallback", got)
 	}
 }
 

@@ -33,6 +33,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/sshconfig"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
+	"github.com/shunmei/cc-clip/internal/userhome"
 	"github.com/shunmei/cc-clip/internal/x11bridge"
 	"github.com/shunmei/cc-clip/internal/xvfb"
 )
@@ -90,6 +91,8 @@ func main() {
 		cmdService()
 	case "notify":
 		cmdNotify()
+	case "notify-sound":
+		cmdNotifySound()
 	case "x11-bridge":
 		cmdX11Bridge()
 	case "tunnel":
@@ -127,7 +130,7 @@ Remote:
   install            Install xclip/wl-paste shim
     --target         auto|xclip|wl-paste (default: auto)
     --path           Install directory (default: ~/.local/bin)
-  uninstall          Remove shim (see flags; combine --host/--peer/--codex for remote/codex cleanup)
+  uninstall          Remove shim (see flags; use --codex separately from --peer/--peer-id)
     --target         auto|xclip|wl-paste (default: auto; auto removes the installed shim when exactly one exists)
     --path           Install directory (default: ~/.local/bin)
     --host           Clean up PATH marker on remote host instead of local shim
@@ -210,6 +213,12 @@ Notifications:
     --urgency        Urgency level (default: 1)
     --from-codex     Parse Codex JSON payload (extracts last-assistant-message)
     --port           Daemon port (default: 18339, env: CC_CLIP_PORT)
+  notify-sound <sound|off>
+                     Persist terminal-notifier sound for cc-clip notifications
+                     Requires terminal-notifier on the local Mac
+                     Common names: Glass, Ping, Pop, Submarine, Funk, Hero, Sosumi
+                     List sounds: ls /System/Library/Sounds
+                     Examples: cc-clip notify-sound Glass | default | off
 
 Internal (used by deploy):
   peer               Internal registry management
@@ -468,6 +477,7 @@ func cmdServe() {
 				// running after cancel+5s, proceed rather than hanging
 				// the daemon indefinitely. Any entries not yet in the
 				// map will be handled on the next daemon restart.
+				log.Printf("warning: tunnel startup did not finish in 5s; orphaned ssh children may exist")
 			}
 			cancel()
 			tunnelMgr.Shutdown()
@@ -645,6 +655,15 @@ func cmdUninstall() {
 		failUsage("uninstall: pass either --peer (release this workstation's peer) or --peer-id <id> (release a specific peer), not both")
 	}
 
+	// --peer / --peer-id and --codex touch disjoint surfaces (peer release
+	// vs Codex x11-bridge/Xvfb). Silently dropping --codex when the peer
+	// flags are set would leave operators thinking a "full teardown"
+	// command cleaned both, when in reality Codex state was untouched.
+	// Fail loud so the operator picks one scope per invocation.
+	if (peerFlag || peerID != "") && codex {
+		failUsage("uninstall: --codex cannot be combined with --peer / --peer-id; run the two subcommands separately")
+	}
+
 	if peerFlag || peerID != "" {
 		cmdUninstallPeer(host, peerID)
 		return
@@ -653,7 +672,9 @@ func cmdUninstall() {
 	// --codex mode: only clean up Codex assets, don't touch Claude shim.
 	if codex {
 		if host != "" {
-			cmdUninstallCodexRemote(host)
+			if err := cmdUninstallCodexRemote(host); err != nil {
+				log.Fatalf("%v", err)
+			}
 		} else {
 			cmdUninstallCodexLocal()
 		}
@@ -777,6 +798,21 @@ func localPeerIDForHost() string {
 	return ""
 }
 
+// noteHostScopedUninstallLeavesSetEnvAlone prints the advisory informing the
+// operator that `cc-clip uninstall --host H` (without --peer) does NOT touch
+// the per-peer SetEnv marker block in ~/.ssh/config, and that `--peer` is
+// the tool to use when tearing down this workstation's peer altogether.
+//
+// The previous message ("Note: preserving local ~/.ssh/config SetEnv block
+// for Host X…") implied runShimUninstall had considered deleting the block
+// and chosen not to — misleading because this code path never touches
+// ~/.ssh/config under any condition. The new phrasing is factual: the
+// block was not in scope for this command, and --peer is what the operator
+// wants if full cleanup is intended.
+func noteHostScopedUninstallLeavesSetEnvAlone(host string) {
+	fmt.Printf("Note: ~/.ssh/config SetEnv block for Host %s is out of scope for this command; run `cc-clip uninstall --host %s --peer` when you are also tearing down this workstation's peer\n", host, host)
+}
+
 func runShimUninstall(target shim.Target, installPath, host string, ops uninstallOps) error {
 	if host != "" {
 		// Gate the PATH-marker deletion on the remote peer registry. The
@@ -787,6 +823,7 @@ func runShimUninstall(target shim.Target, installPath, host string, ops uninstal
 			switch {
 			case err != nil:
 				fmt.Printf("Preserving shared PATH marker on %s: unable to confirm whether other peers remain (%v); rerun `cc-clip uninstall --host %s --peer` once the registry is healthy\n", host, err, host)
+				noteHostScopedUninstallLeavesSetEnvAlone(host)
 				printLegacyManagedBlockAdvisoryIfAny(host)
 				return nil
 			case !selfResolved && count > 0:
@@ -796,10 +833,12 @@ func runShimUninstall(target shim.Target, installPath, host string, ops uninstal
 				// we cannot confidently claim "N other peers remain" —
 				// preserve the marker and spell out the ambiguity instead.
 				fmt.Printf("Preserving shared PATH marker on %s: %d peer(s) registered but this workstation's own peer id could not be resolved; rerun with `--peer-id <id>` or reinstall to re-establish a local identity\n", host, count)
+				noteHostScopedUninstallLeavesSetEnvAlone(host)
 				printLegacyManagedBlockAdvisoryIfAny(host)
 				return nil
 			case count > 0:
 				fmt.Printf("Preserving shared PATH marker on %s: %d other peer(s) still registered on this remote host\n", host, count)
+				noteHostScopedUninstallLeavesSetEnvAlone(host)
 				printLegacyManagedBlockAdvisoryIfAny(host)
 				return nil
 			}
@@ -809,7 +848,7 @@ func runShimUninstall(target shim.Target, installPath, host string, ops uninstal
 			fmt.Fprintf(os.Stderr, "warning: failed to remove PATH marker: %v\n", err)
 		} else {
 			fmt.Println("PATH marker removed from remote shell rc file.")
-			fmt.Printf("Note: preserving local ~/.ssh/config SetEnv block for Host %s; remove it with `cc-clip uninstall --host %s --peer` when you are tearing down this workstation's peer as well\n", host, host)
+			noteHostScopedUninstallLeavesSetEnvAlone(host)
 		}
 		printLegacyManagedBlockAdvisoryIfAny(host)
 		return nil
@@ -1001,7 +1040,14 @@ func resolveSelfUninstallPeerTarget(host string, ident peer.Identity) (string, s
 	// recover from ~/.ssh/config's managed SetEnv block for the same reason
 	// explained above — that block can be stale / copied and is not a reliable
 	// ownership signal for destructive self-cleanup.
-	return "", "", fmt.Errorf("cannot resolve `--peer-id self` for Host %s; restore the local peer identity first", host)
+	//
+	// Surface the on-disk identity path in the error so the operator can
+	// recover by inspecting or recreating the file, instead of having to
+	// grep the cc-clip source for where self-identity is persisted.
+	if basePath, pathErr := peer.BaseDir(); pathErr == nil {
+		return "", "", fmt.Errorf("cannot resolve `--peer-id self` for Host %s; restore the local peer identity first (expected at %s/local-peer-id) — run `cc-clip connect <host>` to re-establish it, or pass `--peer-id <id>` explicitly", host, basePath)
+	}
+	return "", "", fmt.Errorf("cannot resolve `--peer-id self` for Host %s; restore the local peer identity first (expected under ~/.cache/cc-clip/local-peer-id)", host)
 }
 
 func uninstallPeerRemoteAndConfig(
@@ -1039,9 +1085,10 @@ type uninstallPeerCleanupOps struct {
 	// zero → safe to delete; >0 → preserve. A non-nil error triggers the
 	// safe default (preserve) and is logged, not propagated, because we'd
 	// rather leak a hook script on the remote than break another laptop's
-	// active session. Optional — nil short-circuits the shared cleanup to
-	// "treat as last peer", which preserves the pre-multi-peer behavior
-	// for any test that pre-dates this op.
+	// active session. A nil counter is likewise treated as "unknown" and
+	// PRESERVES shared assets (fail safe) — AGENTS.md pins the invariant
+	// that shared cleanup only fires when peer count is affirmatively zero.
+	// Tests that exercise the shared-cleanup path MUST wire this op.
 	countRemainingPeers func() (int, error)
 	// removePersistentTunnel tears down every saved tunnel state for the host
 	// across all daemon local ports (passing 0 as localPort).
@@ -1129,9 +1176,11 @@ func uninstallPeerRemoteAndConfigWithOps(managedHost string, remoteCleanup func(
 //   - remoteErr != "" or managedHost == "": the caller already won't run
 //     shared cleanup, so the returned values don't matter — we return
 //     safe=true with no reason so no "preserving" banner prints.
-//   - countRemainingPeers == nil: treated as "this is the last peer",
-//     preserving the pre-multi-peer test baseline so older test suites
-//     that don't set this op continue to see the shared cleanup fire.
+//   - countRemainingPeers == nil: PRESERVE (fail safe). AGENTS.md pins the
+//     invariant that any inability to confirm "this is the last peer" must
+//     leave shared assets in place — a nil counter is an unwired/unknown
+//     signal, not an affirmative "no other peers". Tests that care about
+//     the shared-cleanup path MUST wire a countRemainingPeers op.
 //   - count query fails: preserve (fail safe).
 //   - count > 0: preserve with a user-facing reason listing remaining peers.
 //   - count == 0: proceed with deletion.
@@ -1140,7 +1189,7 @@ func resolveSafeToRemoveSharedAssets(remoteErr error, managedHost string, countR
 		return true, ""
 	}
 	if countRemainingPeers == nil {
-		return true, ""
+		return false, "unable to confirm this is the last peer (peer-count query not wired); other laptops sharing this remote account may still depend on them"
 	}
 	count, err := countRemainingPeers()
 	if err != nil {
@@ -1222,12 +1271,21 @@ func removePersistentTunnelWith(
 }
 
 // cmdUninstallCodexRemote cleans up Codex support on a remote host via SSH.
-func cmdUninstallCodexRemote(host string) {
+//
+// Multi-peer safety: a previous revision unconditionally globbed
+// ~/.cache/cc-clip/peers/*/codex and rm -rf'd every match, wiping other
+// laptops' bridge/Xvfb state on a shared Unix account. The peer-count gate
+// below mirrors the contract in `runShimUninstall`: when other peers still
+// depend on the shared Codex assets (DISPLAY marker, deploy.json codex
+// block) we only scrub this workstation's own peer state plus the legacy
+// pre-peer dir. When the peer registry cannot be read we FAIL SAFE and
+// restrict the wipe to our own state rather than assume solo ownership.
+func cmdUninstallCodexRemote(host string) error {
 	fmt.Printf("Uninstalling Codex support from %s...\n", host)
 
 	session, err := shim.NewSSHSession(host)
 	if err != nil {
-		log.Fatalf("SSH connection failed: %v", err)
+		return fmt.Errorf("SSH connection failed: %w", err)
 	}
 	defer session.Close()
 
@@ -1235,7 +1293,24 @@ func cmdUninstallCodexRemote(host string) {
 		hasError          bool
 		remainingCodexEnv bool
 	)
-	codexStateDirs := remoteCodexStateDirs(session)
+
+	selfReg, selfRegErr := localPeerRegistration(session, "~/.local/bin/cc-clip")
+	if selfRegErr != nil {
+		log.Printf("warning: remote peer lookup failed: %v — falling back to local identity", selfRegErr)
+	}
+	peersRemain, peerCountErr := remoteCodexOtherPeersRemain(session, selfReg)
+	var codexStateDirs []string
+	switch {
+	case peerCountErr != nil:
+		fmt.Printf("      warning: could not confirm remaining peers (%v); restricting cleanup to this workstation's codex state\n", peerCountErr)
+		peersRemain = true
+		codexStateDirs = codexCleanupStateDirsWithLocalIdentityFallback(selfReg, selfRegErr)
+	case peersRemain:
+		fmt.Println("      other peers still registered on this host; restricting cleanup to this workstation's codex state")
+		codexStateDirs = codexCleanupStateDirsWithLocalIdentityFallback(selfReg, selfRegErr)
+	default:
+		codexStateDirs = remoteCodexStateDirs(session)
+	}
 
 	// Step 1: Stop x11-bridge
 	fmt.Println("[1/5] Stopping x11-bridge...")
@@ -1267,7 +1342,12 @@ func cmdUninstallCodexRemote(host string) {
 			hasError = true
 		}
 	}
-	remainingCodexEnv = remoteHasRemainingCodexState(session)
+	// Decide whether shared assets (DISPLAY marker, deploy.json codex block)
+	// should be preserved. Trust the pre-wipe peer-count result first; the
+	// post-wipe filesystem probe is a belt-and-suspenders backup so a race
+	// (a concurrent cc-clip connect from another laptop between peer-count
+	// and wipe) still errs on the side of preservation.
+	remainingCodexEnv = peersRemain || remoteHasRemainingCodexState(session)
 	fmt.Println("      done")
 
 	// Step 4: Remove DISPLAY marker
@@ -1308,16 +1388,25 @@ func cmdUninstallCodexRemote(host string) {
 	fmt.Println()
 	if hasError {
 		fmt.Println("Codex uninstall completed with warnings. Check issues above.")
-		os.Exit(1)
+		return fmt.Errorf("codex uninstall completed with warnings")
 	}
 	fmt.Println("Codex support removed successfully.")
+	return nil
 }
 
 // cmdUninstallCodexLocal cleans up Codex support on the local machine.
 func cmdUninstallCodexLocal() {
 	fmt.Println("Uninstalling Codex support (local)...")
 
-	home, _ := os.UserHomeDir()
+	home, err := userhome.Dir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		if err != nil {
+			fmt.Printf("warning: cannot determine local home directory for Codex cleanup: %v\n", err)
+		} else {
+			fmt.Println("warning: cannot determine local home directory for Codex cleanup")
+		}
+		return
+	}
 	stateDir := filepath.Join(home, ".cache", "cc-clip", "codex")
 
 	// Stop bridge
@@ -1345,6 +1434,76 @@ type connectOpts struct {
 	noTunnel  bool
 }
 
+type setupLocalDaemonOps struct {
+	goos          string
+	probe         func(addr string, timeout time.Duration) error
+	serviceStatus func() (bool, error)
+	executable    func() (string, error)
+	evalSymlinks  func(string) (string, error)
+	install       func(string, int) error
+	sleep         func(time.Duration)
+}
+
+func defaultSetupLocalDaemonOps() setupLocalDaemonOps {
+	return setupLocalDaemonOps{
+		goos:          runtime.GOOS,
+		probe:         tunnel.Probe,
+		serviceStatus: service.Status,
+		executable:    os.Executable,
+		evalSymlinks:  filepath.EvalSymlinks,
+		install:       service.Install,
+		sleep:         time.Sleep,
+	}
+}
+
+func ensureSetupLocalDaemon(localPort int, ops setupLocalDaemonOps) ([]string, error) {
+	probeTimeout := envDuration("CC_CLIP_PROBE_TIMEOUT_MS", 500*time.Millisecond)
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	serviceSupported := ops.goos == "darwin" || ops.goos == "windows"
+	serviceInstalledMsg := "      scheduled task installed and started"
+	if ops.goos == "darwin" {
+		serviceInstalledMsg = "      launchd service installed and started"
+	}
+
+	installService := func(lines []string) ([]string, error) {
+		exePath, err := ops.executable()
+		if err != nil {
+			return lines, fmt.Errorf("      cannot determine executable path: %v", err)
+		}
+		exePath, _ = ops.evalSymlinks(exePath)
+		if err := ops.install(exePath, localPort); err != nil {
+			return lines, fmt.Errorf("      service install failed: %v", err)
+		}
+		lines = append(lines, serviceInstalledMsg)
+		if ops.sleep != nil {
+			ops.sleep(500 * time.Millisecond)
+		}
+		return lines, nil
+	}
+
+	if err := ops.probe(addr, probeTimeout); err == nil {
+		lines := []string{fmt.Sprintf("      daemon already running on :%d", localPort)}
+		if !serviceSupported {
+			return lines, nil
+		}
+		running, err := ops.serviceStatus()
+		if err != nil {
+			lines = append(lines, "      auto-start not configured; installing service")
+			return installService(lines)
+		}
+		if running {
+			return lines, nil
+		}
+		lines = append(lines, "      auto-start not configured; installing service")
+		return installService(lines)
+	}
+
+	if !serviceSupported {
+		return nil, fmt.Errorf("      daemon not running. Start it first: cc-clip serve")
+	}
+	return installService(nil)
+}
+
 func cmdConnect() {
 	if len(os.Args) < 3 {
 		log.Fatal("usage: cc-clip connect <host> [--port PORT] [--codex] [--local-bin PATH] [--force] [--token-only] [--no-notify] [--no-tunnel]")
@@ -1353,18 +1512,57 @@ func cmdConnect() {
 	if err := tunnel.ValidateSSHHost(host); err != nil {
 		log.Fatalf("invalid host: %v", err)
 	}
-	runConnect(connectOpts{
+	force := hasFlag("force")
+	tokenOnly := hasFlag("token-only")
+	codex := hasFlag("codex")
+	noNotify := hasFlag("no-notify")
+	if msg := validateOrchestrationFlags("connect", force, tokenOnly, codex, noNotify); msg != "" {
+		failUsage("%s", msg)
+	}
+	if err := runConnect(connectOpts{
 		host:      host,
 		port:      getPort(),
-		force:     hasFlag("force"),
-		tokenOnly: hasFlag("token-only"),
-		codex:     hasFlag("codex"),
-		noNotify:  hasFlag("no-notify"),
+		force:     force,
+		tokenOnly: tokenOnly,
+		codex:     codex,
+		noNotify:  noNotify,
 		noTunnel:  hasFlag("no-tunnel"),
-	})
+	}); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func runConnect(opts connectOpts) {
+// validateOrchestrationFlags returns a non-empty user-facing message when the
+// combination of --force / --token-only / --codex / --no-notify is invalid.
+// Pure so cmdConnect/cmdSetup share one rule set and the tests can pin every
+// bad combination without spawning a subprocess.
+//
+// The rules:
+//   - --force redeploys; --token-only skips redeploy. Picking both silently
+//     resolved to --token-only and operators thought --force had taken effect.
+//   - --token-only's code path returns before Codex and notification deploy.
+//     Combining it with --codex or --no-notify silently dropped the feature.
+func validateOrchestrationFlags(cmdName string, force, tokenOnly, codex, noNotify bool) string {
+	if force && tokenOnly {
+		return cmdName + ": --force and --token-only are mutually exclusive (force redeploys; token-only skips deploy)"
+	}
+	if tokenOnly && codex {
+		return cmdName + ": --token-only cannot be combined with --codex (token-only skips Codex deploy; rerun without --token-only to install Codex support)"
+	}
+	if tokenOnly && noNotify {
+		return cmdName + ": --token-only cannot be combined with --no-notify (token-only skips notification setup; --no-notify only takes effect on a full " + cmdName + ")"
+	}
+	return ""
+}
+
+// runConnect returns an error on every failure path so that the function's
+// `defer session.Close()` fires before the process exits. All former
+// log.Fatalf sites inside this function have been converted to
+// `return fmt.Errorf(...)` — the single caller (cmdConnect) converts the
+// returned error into log.Fatal, which preserves the existing "one-line
+// error, exit 1" CLI contract while guaranteeing the SSH ControlMaster
+// socket is cleaned up on error instead of leaking.
+func runConnect(opts connectOpts) error {
 	host := opts.host
 	localPort := opts.port
 	force := opts.force
@@ -1375,7 +1573,7 @@ func runConnect(opts connectOpts) {
 	fmt.Printf("[1/8] Checking local daemon on :%d...\n", localPort)
 	probeTimeout := envDuration("CC_CLIP_PROBE_TIMEOUT_MS", 500*time.Millisecond)
 	if err := tunnel.Probe(fmt.Sprintf("127.0.0.1:%d", localPort), probeTimeout); err != nil {
-		log.Fatalf("Local daemon not running. Start it first: cc-clip serve")
+		return fmt.Errorf("Local daemon not running. Start it first: cc-clip serve")
 	}
 	fmt.Println("      daemon running")
 
@@ -1383,12 +1581,12 @@ func runConnect(opts connectOpts) {
 	// This is the token the daemon validates against — we must send this exact token to the remote.
 	daemonToken, err := token.ReadTokenFile()
 	if err != nil {
-		log.Fatalf("      cannot read daemon token (is 'cc-clip serve' running?): %v", err)
+		return fmt.Errorf("      cannot read daemon token (is 'cc-clip serve' running?): %v", err)
 	}
 
 	ident, err := peer.LoadOrCreateLocalIdentity()
 	if err != nil {
-		log.Fatalf("      cannot load local peer identity: %v", err)
+		return fmt.Errorf("      cannot load local peer identity: %v", err)
 	}
 	fmt.Printf("      peer: %s (%s)\n", ident.Label, ident.ID[:12])
 
@@ -1396,7 +1594,7 @@ func runConnect(opts connectOpts) {
 	fmt.Printf("[2/8] Establishing SSH session to %s...\n", host)
 	session, err := shim.NewSSHSession(host)
 	if err != nil {
-		log.Fatalf("      failed: %v", err)
+		return fmt.Errorf("      failed: %v", err)
 	}
 	defer session.Close()
 	fmt.Println("      SSH master connected")
@@ -1421,22 +1619,22 @@ func runConnect(opts connectOpts) {
 	if tokenOnly {
 		fmt.Println("[4/8] Skipping binary prepare/upload (--token-only)")
 		if _, err := session.Exec(fmt.Sprintf("test -x %s", remoteBin)); err != nil {
-			log.Fatalf("      remote binary missing; re-run without --token-only to deploy it")
+			return fmt.Errorf("      remote binary missing; re-run without --token-only to deploy it")
 		}
 		if err := ensureRemotePeerRegistrySupport(session, remoteBin); err != nil {
-			log.Fatalf("      %v", err)
+			return fmt.Errorf("      %v", err)
 		}
 	} else {
 		remoteOS, remoteArch, err := shim.DetectRemoteArchViaSession(session)
 		if err != nil {
-			log.Fatalf("      failed to detect remote arch: %v", err)
+			return fmt.Errorf("      failed to detect remote arch: %v", err)
 		}
 		fmt.Printf("      %s/%s\n", remoteOS, remoteArch)
 
 		// Step 4: Prepare and upload binary (skip if hash matches)
 		localBin, err = prepareBinaryLocal(host, remoteOS, remoteArch)
 		if err != nil {
-			log.Fatalf("[4/8] Prepare binary failed: %v", err)
+			return fmt.Errorf("[4/8] Prepare binary failed: %v", err)
 		}
 
 		needsUpload = force || shim.NeedsUpload(localBin, remoteState)
@@ -1452,7 +1650,7 @@ func runConnect(opts connectOpts) {
 			// Ensure remote directory exists
 			session.Exec("mkdir -p ~/.local/bin")
 			if err := shim.UploadBinaryViaSession(session, localBin, remoteBin); err != nil {
-				log.Fatalf("      failed: %v", err)
+				return fmt.Errorf("      failed: %v", err)
 			}
 			fmt.Printf("      uploaded to %s\n", remoteBin)
 		} else {
@@ -1468,6 +1666,20 @@ func runConnect(opts connectOpts) {
 			if !createdReservation {
 				return nil
 			}
+			// P2: before destructively cleaning up the peer reservation this
+			// run created, re-lookup the current registration and only
+			// proceed if the current reservation's PeerID still matches
+			// ours. If a racing `cc-clip connect` on another laptop sharing
+			// the same remote account overwrote our entry between our
+			// Reserve and this rollback, releasing it here would strip the
+			// OTHER laptop's reservation. Fail closed: log and skip.
+			if currentReg, lookupErr := lookupPeerReservation(session, remoteBin, ident.ID); lookupErr != nil {
+				log.Printf("      warning: skipping token-only rollback destructive cleanup: could not re-lookup peer registration: %v", lookupErr)
+				return nil
+			} else if currentReg == nil || currentReg.PeerID != ident.ID {
+				log.Printf("      warning: skipping token-only rollback destructive cleanup: current reservation PeerID does not match this laptop's (ident.ID=%s)", ident.ID)
+				return nil
+			}
 			return cleanupCreatedTokenOnlyFallback(host, localPort, tokenOnlyFallbackCleanupOps{
 				removePersistentTunnel: removePersistentTunnel,
 				releasePeer: func() error {
@@ -1476,7 +1688,7 @@ func runConnect(opts connectOpts) {
 				},
 			})
 		}
-		failTokenOnly := func(format string, args ...any) {
+		failTokenOnly := func(format string, args ...any) error {
 			msg := fmt.Sprintf(format, args...)
 			// createdReservation=true is rolled back via removePersistentTunnel
 			// (which also removes state). Handle the "reused an existing
@@ -1488,9 +1700,9 @@ func runConnect(opts connectOpts) {
 				}
 			}
 			if rollbackErr := rollbackCreatedReservation(); rollbackErr != nil {
-				log.Fatalf("      %s; rollback failed: %v", msg, rollbackErr)
+				return fmt.Errorf("      %s; rollback failed: %v", msg, rollbackErr)
 			}
-			log.Fatalf("      %s", msg)
+			return fmt.Errorf("      %s", msg)
 		}
 		if existingRegErr == nil && existingReg == nil {
 			// Preserve the pre-refactor semantic that `--token-only` was a
@@ -1500,7 +1712,7 @@ func runConnect(opts connectOpts) {
 			fmt.Printf("[5/8] No existing peer reservation — creating one (--token-only fallback)...\n")
 			newReg, err := shim.ReservePeerViaSession(session, remoteBin, ident.ID, ident.Label, peer.DefaultRangeStart, peer.DefaultRangeEnd)
 			if err != nil {
-				log.Fatalf("      failed to reserve peer port: %v", err)
+				return fmt.Errorf("      failed to reserve peer port: %v", err)
 			}
 			existingReg = &newReg
 			createdReservation = true
@@ -1508,13 +1720,13 @@ func runConnect(opts connectOpts) {
 		fmt.Printf("[5/8] Reusing peer reservation and recording tunnel state (--token-only)...\n")
 		reg, err := resolveTokenOnlyPeerReservation(existingReg, existingRegErr)
 		if err != nil {
-			failTokenOnly("%v", err)
+			return failTokenOnly("%v", err)
 		}
 		if reg.StateDir, err = resolveRemoteStateDirForSSHConfig(session, reg.StateDir); err != nil {
-			failTokenOnly("failed to resolve remote state dir: %v", err)
+			return failTokenOnly("failed to resolve remote state dir: %v", err)
 		}
 		if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
-			failTokenOnly("failed to record tunnel state for Host %s: %v", host, err)
+			return failTokenOnly("failed to record tunnel state for Host %s: %v", host, err)
 		}
 		savedTunnelState = true
 		fmt.Printf("      host: %s\n", host)
@@ -1524,17 +1736,17 @@ func runConnect(opts connectOpts) {
 		fmt.Printf("[7/8] Syncing peer token and session...\n")
 		sid, _ := shim.GenerateSessionID()
 		if err := syncRemoteTokenAndSession(session, daemonToken, reg.StateDir, sid); err != nil {
-			failTokenOnly("failed to write token: %v", err)
+			return failTokenOnly("failed to write token: %v", err)
 		}
 		fmt.Println("      token synced from local daemon")
 		if sid != "" {
 			fmt.Printf("      session ID: %s\n", sid[:16])
 		}
 		if err := connectActivateTunnel(session, opts, host, localPort, reg.ReservedPort); err != nil {
-			failTokenOnly("%v", err)
+			return failTokenOnly("%v", err)
 		}
 		applyLaptopSSHConfigSetEnv(host, reg.ReservedPort, reg.StateDir)
-		return
+		return nil
 	}
 
 	fmt.Printf("[5/8] Reserving peer port and recording tunnel state...\n")
@@ -1544,15 +1756,15 @@ func runConnect(opts connectOpts) {
 	releaseReservedPeerOnRollback := shouldReleaseReservedPeerOnRollback(existingReg, existingRegErr)
 	reg, err := shim.ReservePeerViaSession(session, remoteBin, ident.ID, ident.Label, peer.DefaultRangeStart, peer.DefaultRangeEnd)
 	if err != nil {
-		log.Fatalf("      failed to reserve peer port: %v", err)
+		return fmt.Errorf("      failed to reserve peer port: %v", err)
 	}
 	if reg.StateDir, err = resolveRemoteStateDirForSSHConfig(session, reg.StateDir); err != nil {
 		bestEffortReleasePeer(session, remoteBin, ident.ID, releaseReservedPeerOnRollback)
-		log.Fatalf("      failed to resolve remote state dir: %v", err)
+		return fmt.Errorf("      failed to resolve remote state dir: %v", err)
 	}
 	if err := saveConnectTunnelState(host, localPort, reg.ReservedPort, !opts.noTunnel); err != nil {
 		bestEffortReleasePeer(session, remoteBin, ident.ID, releaseReservedPeerOnRollback)
-		log.Fatalf("      failed to record tunnel state for Host %s: %v", host, err)
+		return fmt.Errorf("      failed to record tunnel state for Host %s: %v", host, err)
 	}
 	// failAfterSave covers fatal exits between saveConnectTunnelState and
 	// connectActivateTunnel reporting success — i.e. while the local state
@@ -1563,12 +1775,12 @@ func runConnect(opts connectOpts) {
 	// (e.g. Codex setup at the bottom of this function) deliberately leave
 	// the state in place — the tunnel is already live and the state file
 	// accurately reflects reality.
-	failAfterSave := func(format string, args ...any) {
+	failAfterSave := func(format string, args ...any) error {
 		rollbackConnectReservation(
 			func() error { return tunnel.RemoveState(tunnel.DefaultStateDir(), host, localPort) },
 			func() { bestEffortReleasePeer(session, remoteBin, ident.ID, releaseReservedPeerOnRollback) },
 		)
-		log.Fatalf(format, args...)
+		return fmt.Errorf(format, args...)
 	}
 	fmt.Printf("      host: %s\n", host)
 	fmt.Printf("      remote port: %d\n", reg.ReservedPort)
@@ -1598,7 +1810,7 @@ func runConnect(opts connectOpts) {
 			session.Exec(fmt.Sprintf("%s uninstall", remoteBin))
 			out, err = session.Exec(installCmd)
 			if err != nil {
-				failAfterSave("      remote install failed: %s: %v", out, err)
+				return failAfterSave("      remote install failed: %s: %v", out, err)
 			}
 		}
 		installOut = out
@@ -1627,7 +1839,7 @@ func runConnect(opts connectOpts) {
 	fmt.Printf("[7/8] Syncing peer token and session...\n")
 	sessionID, _ := shim.GenerateSessionID()
 	if err := syncRemoteTokenAndSession(session, daemonToken, reg.StateDir, sessionID); err != nil {
-		failAfterSave("      failed to write token: %v", err)
+		return failAfterSave("      failed to write token: %v", err)
 	}
 	fmt.Println("      token synced from local daemon")
 	if sessionID != "" {
@@ -1663,7 +1875,7 @@ func runConnect(opts connectOpts) {
 
 	// Step 8: Activate daemon-managed tunnel and verify remote binary
 	if err := connectActivateTunnel(session, opts, host, localPort, reg.ReservedPort); err != nil {
-		failAfterSave("%v", err)
+		return failAfterSave("%v", err)
 	}
 
 	// Multi-laptop on shared account: push per-peer env via ~/.ssh/config.
@@ -1702,12 +1914,17 @@ func runConnect(opts connectOpts) {
 			fmt.Println()
 			fmt.Println("Claude shim is ready, but Codex support failed.")
 			fmt.Println("Fix the issues above and re-run: cc-clip connect", host, "--codex")
-			os.Exit(1)
+			// Return the failure instead of os.Exit(1) so the deferred
+			// session.Close() higher up in this function runs before the
+			// process terminates. runConnect (the void wrapper) converts
+			// this into log.Fatal at the top level.
+			return fmt.Errorf("Codex support failed for host %s", host)
 		}
 		if err := shim.WriteRemoteState(session, newState); err != nil {
 			log.Printf("      warning: could not update remote deploy state: %v", err)
 		}
 	}
+	return nil
 }
 
 // connectNotifySetup performs notification bridge setup:
@@ -2005,6 +2222,13 @@ func cmdSetup() {
 	if err := tunnel.ValidateSSHHost(host); err != nil {
 		log.Fatalf("invalid host: %v", err)
 	}
+	// Reject the same flag combinations cmdConnect rejects, before the
+	// step-by-step output starts. Mirrors the rule set in
+	// validateOrchestrationFlags so a `cc-clip setup` mismatch isn't
+	// surfaced after the operator has already seen step progress.
+	if msg := validateOrchestrationFlags("setup", hasFlag("force"), hasFlag("token-only"), hasFlag("codex"), hasFlag("no-notify")); msg != "" {
+		failUsage("%s", msg)
+	}
 	localPort := getPort()
 
 	// Step 1: Dependencies
@@ -2027,27 +2251,12 @@ func cmdSetup() {
 
 	// Step 2: Daemon
 	fmt.Println("[2/4] Starting local daemon...")
-	probeTimeout := envDuration("CC_CLIP_PROBE_TIMEOUT_MS", 500*time.Millisecond)
-	if err := tunnel.Probe(fmt.Sprintf("127.0.0.1:%d", localPort), probeTimeout); err == nil {
-		fmt.Printf("      daemon already running on :%d\n", localPort)
-	} else if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		exePath, err := os.Executable()
-		if err != nil {
-			log.Fatalf("      cannot determine executable path: %v", err)
-		}
-		exePath, _ = filepath.EvalSymlinks(exePath)
-		if err := service.Install(exePath, localPort); err != nil {
-			log.Fatalf("      service install failed: %v", err)
-		}
-		if runtime.GOOS == "darwin" {
-			fmt.Println("      launchd service installed and started")
-		} else {
-			fmt.Println("      scheduled task installed and started")
-		}
-		// Wait for daemon to be ready
-		time.Sleep(500 * time.Millisecond)
-	} else {
-		log.Fatal("      daemon not running. Start it first: cc-clip serve")
+	lines, err := ensureSetupLocalDaemon(localPort, defaultSetupLocalDaemonOps())
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	// Step 3: Deploy to the remote and record local tunnel state. The daemon
@@ -2060,7 +2269,7 @@ func cmdSetup() {
 	// Previously these flags were silently dropped, leaving scripts that
 	// added --force puzzled when nothing redeployed.
 	fmt.Printf("\n[3/4] Deploying to %s and recording local tunnel state...\n", host)
-	runConnect(connectOpts{
+	if err := runConnect(connectOpts{
 		host:      host,
 		port:      localPort,
 		codex:     hasFlag("codex"),
@@ -2068,7 +2277,9 @@ func cmdSetup() {
 		tokenOnly: hasFlag("token-only"),
 		noNotify:  hasFlag("no-notify"),
 		noTunnel:  hasFlag("no-tunnel"),
-	})
+	}); err != nil {
+		log.Fatal(err)
+	}
 }
 
 // connectActivateTunnel starts the daemon-managed persistent reverse tunnel
@@ -2570,8 +2781,46 @@ func remoteHasRemainingCodexState(session *shim.SSHSession) bool {
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
+// remoteCodexOtherPeersRemain reports whether any OTHER peer (i.e. excluding
+// `selfReg`) still has a reservation on the remote host. It reuses the
+// already-open session so cmdUninstallCodexRemote doesn't spawn a second ssh
+// connection. Returns (peersRemain, err). A non-nil err means the caller
+// cannot confidently claim solo ownership — the caller MUST fail safe and
+// preserve shared assets.
+func remoteCodexOtherPeersRemain(session *shim.SSHSession, selfReg *peer.Registration) (bool, error) {
+	regs, err := shim.ListPeersViaSession(session, "~/.local/bin/cc-clip")
+	if err != nil {
+		return true, err
+	}
+	if len(regs) == 0 {
+		return false, nil
+	}
+	var selfID string
+	if selfReg != nil {
+		selfID = strings.TrimSpace(selfReg.PeerID)
+	}
+	if selfID == "" {
+		ident, identErr := peer.LoadLocalIdentity()
+		if identErr == nil {
+			selfID = strings.TrimSpace(ident.ID)
+		}
+	}
+	if selfID == "" {
+		// We can't subtract ourselves from the count, so any registered peer
+		// is ambiguous — treat as "others remain" and let the caller preserve
+		// shared assets.
+		return true, nil
+	}
+	for _, reg := range regs {
+		if reg.PeerID != selfID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func localPeerRegistration(session *shim.SSHSession, remoteBin string) (*peer.Registration, error) {
-	ident, err := peer.LoadOrCreateLocalIdentity()
+	ident, err := loadLocalPeerIdentity()
 	if err != nil {
 		return nil, err
 	}
@@ -2654,6 +2903,25 @@ func saveConnectTunnelState(host string, localPort, remotePort int, enabled bool
 		},
 		Status: status,
 	}
+	// Serialize concurrent `cc-clip connect <same-host>` runs via an
+	// advisory lock on a per-(host, port) sidecar. Without this, two
+	// connects could both observe the same `existing` state and race on
+	// SaveState; the later writer would win non-deterministically and
+	// could overwrite a partial state file whose PID/StartedAt belonged
+	// to the other race. The lock is per-(host, port) so independent
+	// hosts still run in parallel.
+	//
+	// TOCTOU note: the LoadState read below MUST run INSIDE the lock so
+	// the read-modify-write on the tunnel-state file is atomic per
+	// (host, port). A prior revision read existing state before
+	// acquiring the lock, which allowed a concurrent writer to replace
+	// the state between our read and our SaveState.
+	release, lockErr := acquireConnectStateLock(host, localPort)
+	if lockErr == nil {
+		defer release()
+	} else {
+		log.Printf("warning: connect state lock unavailable (%v); proceeding with unlocked save — concurrent connect may race", lockErr)
+	}
 	// The preserve-live-fields branch only applies when the caller is about
 	// to (re)start the tunnel AND the existing state points at the SAME
 	// remote port. A --no-tunnel re-run of `connect` must not carry Status=
@@ -2671,11 +2939,6 @@ func saveConnectTunnelState(host string, localPort, remotePort int, enabled bool
 			state.ReconnectCount = existing.ReconnectCount
 		}
 	}
-	// NOTE: Load-then-Save is not atomic. Concurrent `cc-clip connect
-	// <same-host>` runs could both observe the same `existing` state and
-	// then race on the final SaveState, with the later writer winning
-	// non-deterministically. Connects are not expected to run in parallel;
-	// automation that orchestrates multiple connects should serialize them.
 	return tunnel.SaveState(tunnel.DefaultStateDir(), state)
 }
 
@@ -2825,6 +3088,28 @@ func codexCleanupStateDirs(reg *peer.Registration) []string {
 	return appendUniqueStrings([]string{legacyCodexStateDir}, targetRemoteCodexStateDir(reg))
 }
 
+func codexCleanupStateDirsWithLocalIdentityFallback(reg *peer.Registration, regErr error) []string {
+	dirs := codexCleanupStateDirs(reg)
+	if reg != nil && strings.TrimSpace(reg.StateDir) != "" {
+		return dirs
+	}
+	ident, err := loadLocalPeerIdentity()
+	if err != nil {
+		if regErr != nil {
+			log.Printf("warning: could not load local peer identity for codex cleanup fallback: %v", err)
+		}
+		return dirs
+	}
+	if legacy := legacyPeerStateDir(ident.ID); legacy != "" {
+		fallback := legacy + "/codex"
+		if fallback != legacyCodexStateDir {
+			log.Printf("warning: using local identity fallback to augment codex cleanup list with %s", fallback)
+		}
+		return appendUniqueStrings(dirs, fallback)
+	}
+	return dirs
+}
+
 func compatStateDirs(stateDir string) []string {
 	return appendUniqueStrings(nil, stateDir, legacyStateDir)
 }
@@ -2852,13 +3137,26 @@ func syncRemoteNotificationNonce(session *shim.SSHSession, nonce, stateDir strin
 	return nil
 }
 
+// resolveRemoteStateDirForSSHConfig expands a remote-supplied state directory
+// path into an absolute POSIX path and then validates it via
+// validateRemoteStateDirForSSHConfig so all downstream consumers (rm -rf,
+// token-sync, bridge-start, ssh_config SetEnv) inherit a single
+// already-checked value. Callers therefore do NOT need to re-run the
+// validator at each use site — running it once, here, immediately after the
+// peer registry answers, is the documented privilege boundary between
+// "remote says" and "local acts on".
+//
+// Empty input is returned as empty (no validation applied): the peer
+// registry historically returns "" on legacy installs that predate the
+// StateDir field, and callers already handle the empty case separately.
 func resolveRemoteStateDirForSSHConfig(session remoteExecutor, stateDir string) (string, error) {
 	stateDir = strings.TrimSpace(stateDir)
+	var expanded string
 	switch {
 	case stateDir == "":
 		return "", nil
 	case strings.HasPrefix(stateDir, "/"):
-		return stateDir, nil
+		expanded = stateDir
 	case strings.HasPrefix(stateDir, "~/"):
 		out, err := session.Exec(fmt.Sprintf(`printf %%s "$HOME/%s"`, shellutil.EscapeDoubleQuoted(strings.TrimPrefix(stateDir, "~/"))))
 		if err != nil {
@@ -2868,10 +3166,14 @@ func resolveRemoteStateDirForSSHConfig(session remoteExecutor, stateDir string) 
 		if out == "" {
 			return "", fmt.Errorf("expand remote home-relative state dir %q: empty result", stateDir)
 		}
-		return out, nil
+		expanded = out
 	default:
-		return stateDir, nil
+		expanded = stateDir
 	}
+	if err := validateRemoteStateDirForSSHConfig(expanded); err != nil {
+		return "", fmt.Errorf("reject remote state dir %q: %w", stateDir, err)
+	}
+	return expanded, nil
 }
 
 // localSSHConfigDisplayPath returns the resolved ~/.ssh/config path
@@ -2963,14 +3265,17 @@ func validateRemoteStateDirForSSHConfig(p string) error {
 // warning; teeing both streams (`2>&1`) captures warnings alongside the
 // step log.
 func applyLaptopSSHConfigSetEnv(host string, remotePort int, remoteStateDir string) {
-	// sshconfig.validateEnvValue only guards against newline/NUL, but
-	// CC_CLIP_STATE_DIR originates from the remote peer registry — a
-	// compromised or misbehaving remote could push path-traversal strings
-	// or `$(…)`-bearing values that survive into the user's ~/.ssh/config
-	// and later into bash interpolation on the next ssh session. Reject
-	// anything that isn't a conventional absolute POSIX path before we
-	// hand it to Apply so the privilege boundary between "remote says" and
-	// "local writes" is explicit.
+	// Defense-in-depth: the primary validation lives in
+	// resolveRemoteStateDirForSSHConfig (called once, immediately after the
+	// peer registry returns StateDir), so every downstream consumer — rm
+	// -rf, token-sync, bridge-start, and this ssh_config write — sees a
+	// value that has already been rejected for path-traversal, control
+	// chars, shell metacharacters, and non-ASCII. We re-check here anyway
+	// because applyLaptopSSHConfigSetEnv is the one call that crosses the
+	// privilege boundary into the user's persisted dotfile: if a future
+	// refactor hands this helper an unvalidated path from somewhere new,
+	// the re-check fails closed instead of silently writing an unsafe
+	// SetEnv value. Keep both call sites in sync.
 	if err := validateRemoteStateDirForSSHConfig(remoteStateDir); err != nil {
 		fmt.Fprintf(os.Stderr, "      warning: refusing to write CC_CLIP_STATE_DIR to ~/.ssh/config: %v\n", err)
 		fmt.Fprintf(os.Stderr, "               (peer registry returned %q; run `cc-clip doctor --host %s` to inspect)\n", remoteStateDir, host)
@@ -3540,6 +3845,14 @@ func cmdNotify() {
 	fromCodexStdin := fs.Bool("from-codex-stdin", false, "read Codex notify JSON payload from stdin")
 	_ = fs.Parse(os.Args[2:])
 
+	// Urgency is a 3-value enum (0=low, 1=normal, 2=critical); accepting
+	// anything outside [0, 2] would produce ambiguous downstream behavior
+	// — the DeliveryChain maps urgency to platform-specific severity levels
+	// and an out-of-range int falls through silently.
+	if *urgency < 0 || *urgency > 2 {
+		log.Fatalf("notify failed: --urgency must be 0 (low), 1 (normal), or 2 (critical); got %d", *urgency)
+	}
+
 	msg := daemon.GenericMessagePayload{
 		Title:   *title,
 		Body:    *body,
@@ -3656,7 +3969,7 @@ func cmdPeer() {
 	// same entry point (rather than a sibling dispatch) preserves the
 	// existing SSH-invocation pattern `cc-clip peer …`.
 	if subcmd == "list" {
-		baseDir, err := peer.BaseDir()
+		baseDir, err := peer.BaseDirPath()
 		if err != nil {
 			log.Fatalf("peer list failed: %v", err)
 		}

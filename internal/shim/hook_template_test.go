@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,20 @@ func TestHookScriptDoesNotUseSessionToken(t *testing.T) {
 	}
 }
 
+// TestHookScriptUsesBashLongestMatchForNonceCRStrip pins the rendered
+// bash form `${_nonce%%$'\r'}` (longest-match). The template source uses
+// four percent signs which fmt.Sprintf collapses to two. A regression
+// that drops a pair (down to two in source → one in output) would
+// degrade to shortest-match, which is equivalent for a single-char
+// target today but invites silent semantic drift for any future
+// longest-match pattern added next to this one.
+func TestHookScriptUsesBashLongestMatchForNonceCRStrip(t *testing.T) {
+	got := HookScript(18339)
+	if !strings.Contains(got, "${_nonce%%$'\\r'}") {
+		t.Fatalf("expected rendered bash to use longest-match %%%%$'\\r' suffix strip; got script:\n%s", got)
+	}
+}
+
 func TestHookScriptAlwaysExitsZero(t *testing.T) {
 	got := HookScript(18339)
 	if !strings.Contains(got, "exit 0") {
@@ -81,11 +96,15 @@ func TestHookScriptStrictModePrefixIsExportedConstant(t *testing.T) {
 	}
 	// Defense in depth: assert no near-miss variant has crept in. If a
 	// future refactor introduces a second prefix (e.g. plural "probes"),
-	// this catches the divergence.
-	if strings.Count(got, "cc-clip-hook health probe") != 2 {
-		// One occurrence in the with-curl-err branch, one in the without-
-		// curl-err branch. Both must use the canonical wording.
-		t.Fatalf("expected exactly 2 occurrences of canonical 'cc-clip-hook health probe' wording; got %d", strings.Count(got, "cc-clip-hook health probe"))
+	// this catches the divergence. Current branches:
+	//   1. nonce-empty-or-corrupt strict-mode exit (post-sanitization)
+	//   2. cat-rc strict-mode exit (stdin reader failed)
+	//   3. HTTP-failure with curl-err branch
+	//   4. HTTP-failure without curl-err branch
+	// All four MUST use the canonical wording so the Go-side probe can
+	// recognise any of them from stdout.
+	if strings.Count(got, "cc-clip-hook health probe") != 4 {
+		t.Fatalf("expected exactly 4 occurrences of canonical 'cc-clip-hook health probe' wording; got %d", strings.Count(got, "cc-clip-hook health probe"))
 	}
 }
 
@@ -322,6 +341,333 @@ func TestHookScriptHostAliasMissingPython3FallbackPreservesPayload(t *testing.T)
 	}
 	if got, _ := payload["hook_event_name"].(string); got != "notification" {
 		t.Fatalf("fallback dropped original fields: hook_event_name=%q (want %q)", got, "notification")
+	}
+}
+
+func TestHookScriptPayloadPreservesLiteralCatRcMarker(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
+
+	dir := t.TempDir()
+	var (
+		mu      sync.Mutex
+		gotBody []byte
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		gotBody = body
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse httptest url: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("test-nonce\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+
+	scriptPath := filepath.Join(dir, "cc-clip-hook")
+	if err := os.WriteFile(scriptPath, []byte(HookScript(1)), 0700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	payloadIn := `{"hook_event_name":"notification","message":"literal __cc_clip_cat_rc=7 survives"}`
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"CC_CLIP_STATE_DIR="+dir,
+		"CC_CLIP_PORT="+u.Port(),
+	)
+	cmd.Stdin = strings.NewReader(payloadIn)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hook script exited nonzero with marker-like payload: %v\noutput: %s", err, out)
+	}
+
+	mu.Lock()
+	body := gotBody
+	mu.Unlock()
+	if len(body) == 0 {
+		t.Fatal("receiver got no body")
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("payload is not valid JSON: %v\nbody=%s", err, body)
+	}
+	if got, _ := payload["message"].(string); got != "literal __cc_clip_cat_rc=7 survives" {
+		t.Fatalf("message = %q, want literal marker payload", got)
+	}
+}
+
+// TestHookScriptRejectsNonNumericPort pins the P1-6 guard: a hostile or
+// typo'd CC_CLIP_PORT that contains non-digits (URL path splicing,
+// command substitution, empty, whitespace) must fall back to the default
+// port baked into the template, not be spliced into the notify URL.
+// Without this, an attacker able to seed CC_CLIP_PORT via the managed
+// SSH SetEnv block could redirect the /notify POST to an arbitrary path,
+// or trigger command substitution through the later URL interpolation.
+func TestHookScriptRejectsNonNumericPort(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
+	const defaultPort = 18339
+	cases := []struct {
+		name        string
+		port        string
+		description string
+	}{
+		{"url_splice", "18339/attacker.example/x", "URL-path injection"},
+		{"command_substitution_literal", "$(id)", "literal $(...) should not execute"},
+		{"backtick_substitution_literal", "`id`", "literal backticks should not execute"},
+		{"whitespace", "  ", "whitespace-only rejected"},
+		{"empty", "", "empty string rejected (uses default via parameter expansion, then guard)"},
+		{"alpha", "abc", "alpha-only rejected"},
+		{"mixed", "18339x", "mixed numeric+letter rejected"},
+		{"zero", "0", "zero rejected as invalid TCP port"},
+		{"too_large", "70000", "out-of-range TCP port rejected"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+
+			var (
+				mu      sync.Mutex
+				gotURL  string
+				gotHits int
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				gotURL = r.URL.Path
+				gotHits++
+				mu.Unlock()
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+			u, _ := url.Parse(srv.URL)
+
+			// Point the template's DEFAULT port (which the rejection fallback
+			// reuses via the second %d substitution) at the httptest server —
+			// if the port guard works, the hook will hit srv.URL+"/notify"
+			// regardless of the poisoned CC_CLIP_PORT.
+			listenPortInt, err := strconv.Atoi(u.Port())
+			if err != nil {
+				t.Fatalf("parse test server port: %v", err)
+			}
+
+			if err := os.WriteFile(filepath.Join(dir, "notify.nonce"), []byte("n\n"), 0600); err != nil {
+				t.Fatalf("write nonce: %v", err)
+			}
+			scriptPath := filepath.Join(dir, "cc-clip-hook")
+			if err := os.WriteFile(scriptPath, []byte(HookScript(listenPortInt)), 0700); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			cmd := exec.Command("bash", scriptPath)
+			cmd.Env = append(os.Environ(),
+				"CC_CLIP_STATE_DIR="+dir,
+				"CC_CLIP_PORT="+tc.port,
+			)
+			cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("hook script exited nonzero with poisoned port: %v\noutput: %s", err, out)
+			}
+
+			mu.Lock()
+			hits, path := gotHits, gotURL
+			mu.Unlock()
+
+			// The poisoned port was rejected and the default (test server
+			// port) was used, so we should see exactly 1 hit on /notify,
+			// NOT on a poisoned path. If the guard fails, either no hit
+			// lands (port routed to some other address) or the path was
+			// spliced — either way, this assertion catches it.
+			if hits != 1 {
+				t.Fatalf("[%s] expected exactly 1 POST, got %d (guard may have passed poisoned port through)", tc.description, hits)
+			}
+			if path != "/notify" {
+				t.Fatalf("[%s] expected path=/notify, got %q (URL splice not rejected)", tc.description, path)
+			}
+
+			// Silence unused defaultPort warning while keeping the
+			// constant documented near the test for future readers who
+			// want to confirm the template-embedded default.
+			_ = defaultPort
+		})
+	}
+}
+
+// TestHookScriptAcceptsLegitimateDoubleDotInStateDir pins the P2-24 fix:
+// the earlier `*..*` glob also rejected legitimate paths containing ".."
+// as a substring (e.g. /home/a..b/.cache/cc-clip). Only a true ".." path
+// component should be rejected.
+func TestHookScriptAcceptsLegitimateDoubleDotInStateDir(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
+	dir := t.TempDir()
+	// Create a directory with a literal ".." inside the path-segment name
+	// (not a path component) to exercise the accept branch.
+	stateDir := filepath.Join(dir, "a..b", "cache")
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "notify.nonce"), []byte("n\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+
+	var (
+		mu      sync.Mutex
+		gotAuth string
+		gotHits int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotAuth = r.Header.Get("Authorization")
+		gotHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	scriptPath := filepath.Join(dir, "cc-clip-hook")
+	listenPort, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse test server port: %v", err)
+	}
+	if err := os.WriteFile(scriptPath, []byte(HookScript(listenPort)), 0700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"CC_CLIP_STATE_DIR="+stateDir,
+	)
+	cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hook script exited nonzero with a..b state dir: %v\noutput: %s", err, out)
+	}
+
+	mu.Lock()
+	hits, auth := gotHits, gotAuth
+	mu.Unlock()
+
+	if hits != 1 {
+		t.Fatalf("expected 1 POST (legitimate a..b path should have been accepted), got %d", hits)
+	}
+	// Auth header from the per-peer state dir's nonce proves we did NOT
+	// silently fall back to $HOME/.cache/cc-clip.
+	if auth != "Bearer n" {
+		t.Fatalf("Authorization = %q, want %q (legitimate state dir not preserved — fell back to $HOME/.cache/cc-clip)", auth, "Bearer n")
+	}
+}
+
+// TestHookScriptRejectsPathTraversalStateDir pins the path-traversal
+// rejection half of P2-24: a state dir with a true ".." path component
+// must still be rejected (the original security invariant, now with the
+// tighter pattern that doesn't also catch "a..b").
+func TestHookScriptRejectsPathTraversalStateDir(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skipf("curl not available: %v", err)
+	}
+	dir := t.TempDir()
+	// The fallback state dir is ${HOME}/.cache/cc-clip, so the nonce must
+	// live there — not at the bare HOME — for the fallback branch to read it.
+	fallbackDir := filepath.Join(dir, ".cache", "cc-clip")
+	if err := os.MkdirAll(fallbackDir, 0700); err != nil {
+		t.Fatalf("mkdir fallback: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fallbackDir, "notify.nonce"), []byte("real-default-nonce\n"), 0600); err != nil {
+		t.Fatalf("write nonce: %v", err)
+	}
+
+	var (
+		mu      sync.Mutex
+		gotAuth string
+		gotHits int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotAuth = r.Header.Get("Authorization")
+		gotHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	scriptPath := filepath.Join(dir, "cc-clip-hook")
+	listenPort, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse test server port: %v", err)
+	}
+	if err := os.WriteFile(scriptPath, []byte(HookScript(listenPort)), 0700); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// Test several path-traversal forms. Each should fall back to
+	// $HOME/.cache/cc-clip (via HOME=dir). We put the "real" nonce at
+	// dir/notify.nonce to assert the fallback path is used.
+	cases := []string{
+		"/home/user/../../etc",
+		"/var/lib/foo/..",
+		"../relative-is-also-rejected", // relative, too, separate branch
+	}
+	for _, poisoned := range cases {
+		mu.Lock()
+		gotAuth = ""
+		gotHits = 0
+		mu.Unlock()
+		cmd := exec.Command("bash", scriptPath)
+		cmd.Env = []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOME=" + dir,
+			"CC_CLIP_STATE_DIR=" + poisoned,
+		}
+		cmd.Stdin = strings.NewReader(`{"hook_event_name":"notification"}`)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("hook script exited nonzero on poisoned state dir %q: %v\noutput: %s", poisoned, err, out)
+		}
+		mu.Lock()
+		auth := gotAuth
+		hits := gotHits
+		mu.Unlock()
+		if hits != 1 {
+			t.Fatalf("[%s] expected exactly 1 POST, got %d", poisoned, hits)
+		}
+		if auth != "Bearer real-default-nonce" {
+			t.Fatalf("[%s] Authorization = %q, want %q (fallback to $HOME/.cache/cc-clip not used)", poisoned, auth, "Bearer real-default-nonce")
+		}
+	}
+}
+
+// TestHookScriptPayloadNotInArgv pins the P3 fix: the payload must be
+// passed on stdin (--data-binary @-), not as an argv element
+// (--data-raw "$_payload"). argv is visible via /proc/<pid>/cmdline on
+// Linux and `ps -ww` on macOS; stdin is not. A template refactor that
+// reintroduces --data-raw would expose notification bodies to any local
+// user on a shared remote.
+func TestHookScriptPayloadNotInArgv(t *testing.T) {
+	got := HookScript(18339)
+	if strings.Contains(got, "--data-raw") {
+		t.Fatal("hook template must not use --data-raw; switch to --data-binary @- to keep payload off argv")
+	}
+	if !strings.Contains(got, "--data-binary @-") {
+		t.Fatal("hook template must use --data-binary @- so payload is read from stdin, not argv")
 	}
 }
 

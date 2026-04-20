@@ -131,6 +131,9 @@ One command does everything:
 3. Deploys the binary and shim to the remote server.
 4. Reserves a remote port and starts the daemon-managed reverse tunnel.
 
+If a foreground daemon is already listening, `setup` still verifies that
+auto-start is configured and installs the local service when needed.
+
 Optional flags:
 
 - `--codex` — also deploy Codex CLI support (Xvfb + x11-bridge).
@@ -184,6 +187,8 @@ codex           # Codex CLI  — Ctrl+V pastes your Mac clipboard
 
 The daemon runs under launchd (`KeepAlive=true`) and restarts saved tunnels automatically on login and after network flaps. On Linux, run `cc-clip serve` in a terminal multiplexer or wire it into systemd.
 
+> **Editing `~/.ssh/config`?** The reconnect loop caches the resolved `ssh -G <host>` options (HostName, User, IdentityFile, ProxyCommand, …) from the first `cc-clip tunnel up <host>` and reuses that snapshot on every flap and daemon restart. This is a deliberate security pin — a later edit to `~/.ssh/config` cannot silently change the `ssh` argv the daemon spawns. To pick up your change, re-run `cc-clip tunnel up <host>`; that is the only path that refreshes the cache.
+
 ### Notifications out of the box
 
 If you ran `cc-clip setup` (or `cc-clip connect`), the notification path is already wired: Codex `notify` is auto-configured (when `~/.codex/` exists on the remote), and the notification nonce is registered and synced.
@@ -213,6 +218,30 @@ When Claude Code or Codex CLI runs on a remote server, **notifications don't wor
 - **Sequence number** (#1, #2, #3…) lets you detect gaps (e.g. #1 → #3 means #2 was lost).
 - **Duplicate detection** alerts when the same image is pasted twice within 5 images.
 - **Click the notification** to open the full image in Preview.app (macOS, requires `terminal-notifier`).
+
+### terminal-notifier on macOS
+
+`terminal-notifier` is the macOS command-line bridge that lets `cc-clip` send Notification Center alerts with image previews. If it is not installed, `cc-clip` falls back to `osascript` text notifications. If `cmux` is installed and successfully handles the notification first, `terminal-notifier` is not used for that event.
+
+Install it with:
+
+```bash
+brew install terminal-notifier
+```
+
+Set the notification sound with:
+
+```bash
+cc-clip notify-sound Glass
+cc-clip notify-sound default
+cc-clip notify-sound off
+```
+
+Common sound names usually include `Glass`, `Ping`, `Pop`, `Submarine`, `Funk`, `Hero`, and `Sosumi`, but the source of truth is your local macOS sound set. To inspect what your machine currently offers:
+
+```bash
+ls /System/Library/Sounds
+```
 
 ### Hook configuration
 
@@ -562,7 +591,7 @@ The cc-clip daemon owns the reverse tunnel end-to-end: it spawns its own `ssh -N
 
 ```bash
 cc-clip tunnel list                 # show status per host
-cc-clip tunnel up   myserver        # start (also re-reads ~/.ssh/config)
+cc-clip tunnel up   myserver        # start (re-runs `ssh -G <host>`; the reconnect loop does NOT — re-run `cc-clip tunnel up` after editing ~/.ssh/config)
 cc-clip tunnel down myserver        # pause without forgetting
 cc-clip tunnel remove myserver      # stop + delete saved state
 ```
@@ -607,14 +636,33 @@ The first `cc-clip tunnel up <host>` runs `ssh -G <host>`, caches the expansion 
 **Install:**
 
 ```bash
-brew install --cask swiftbar
-brew install jq
-
-ln -s "$(pwd)/scripts/cc-clip-tunnels.30s.sh" \
-    ~/Library/Application\ Support/SwiftBar/Plugins/
+curl -fsSL https://raw.githubusercontent.com/fancy-potato/cc-clip/main/scripts/install.sh | sh
 ```
 
-Use an absolute path for the symlink so it keeps working when you move your shell elsewhere. The `30s` in the filename tells SwiftBar to refresh every 30 seconds.
+On macOS, the installer now best-effort installs `swiftbar`, `jq`, and `terminal-notifier` via Homebrew, copies the plugin script into `~/.local/share/cc-clip/swiftbar/`, symlinks it into `~/Documents/SwiftBar/`, and points SwiftBar at that directory with `defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/Documents/SwiftBar"`.
+
+> ⚠️ **If you are already a SwiftBar user**, that `defaults write` will *replace* your existing `PluginDirectory` setting — SwiftBar will then look at `~/Documents/SwiftBar/` instead of wherever you had it pointed (e.g. `~/Library/Application Support/SwiftBar/Plugins/`), and your other plugins will appear to vanish until you revert the setting or symlink them into the new directory. If you already have a plugin directory configured, set `INSTALL_SWIFTBAR=0` in the `install.sh` environment and wire the plugin up manually (see below) into your existing location instead.
+
+If you want to wire it up manually instead:
+
+```bash
+brew install --cask swiftbar
+brew install jq
+brew install terminal-notifier
+
+mkdir -p "$HOME/.local/share/cc-clip/swiftbar"
+cp "$(pwd)/scripts/cc-clip-tunnels.30s.sh" \
+   "$HOME/.local/share/cc-clip/swiftbar/cc-clip-tunnels.30s.sh"
+chmod +x "$HOME/.local/share/cc-clip/swiftbar/cc-clip-tunnels.30s.sh"
+
+mkdir -p "$HOME/Documents/SwiftBar"
+ln -sfn "$HOME/.local/share/cc-clip/swiftbar/cc-clip-tunnels.30s.sh" \
+    "$HOME/Documents/SwiftBar/cc-clip-tunnels.30s.sh"
+
+defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/Documents/SwiftBar"
+```
+
+The `30s` in the filename tells SwiftBar to refresh every 30 seconds.
 
 **What you'll see:**
 
@@ -715,7 +763,7 @@ If both are empty: the server's `AcceptEnv` is missing or sshd has not been relo
 | `cc-clip connect <host> --force` | Full redeploy ignoring cache |
 | `cc-clip connect <host> --no-tunnel` | Deploy + persist tunnel state without auto-starting |
 | `cc-clip tunnel list [--json]` | List persistent tunnels |
-| `cc-clip tunnel up <host> [--remote-port N]` | Start a persistent tunnel (re-reads `~/.ssh/config`; explicit `--remote-port` overrides only the remote-port lookup) |
+| `cc-clip tunnel up <host> [--remote-port N]` | Start a persistent tunnel (also re-runs `ssh -G <host>` — the reconnect loop does NOT; explicit `--remote-port` overrides only the remote-port lookup) |
 | `cc-clip tunnel down <host>` | Stop the tunnel owned by the current daemon (select with `--port` / `CC_CLIP_PORT`) |
 | `cc-clip tunnel remove <host>` | Stop and delete the tunnel's saved state |
 | `cc-clip serve` | Start daemon in foreground |
@@ -825,7 +873,7 @@ scripts/uninstall-local.sh
 # Remove all cc-clip state from the target remote Unix account that lives in
 # regular files, then run the same full local purge on this machine.
 # Symlinked remote rc/config files are preserved with a warning.
-scripts/uninstall-all.sh --host myserver
+scripts/uninstall-all.sh --host <alias>
 ```
 
 Use these scripts carefully. They are intentionally aggressive and bypass the normal multi-peer preservation behavior so they can wipe all cc-clip installation data.

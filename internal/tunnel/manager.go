@@ -80,6 +80,13 @@ type entry struct {
 // NewManager creates a new tunnel manager.
 func NewManager(stateDir string) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
+	// Best-effort GC of scratch directories left behind by prior daemon
+	// crashes. Runs once per manager construction (effectively once per
+	// daemon start) rather than on every tunnel Up to avoid the repeated
+	// ReadDir cost on a hot path. 1h age threshold is comfortably longer
+	// than any tunnel's spawn window, so this never races with a live
+	// sibling daemon's freshly-created scratch dir.
+	sweepStaleSSHTunnelScratchDirs(1 * time.Hour)
 	return &Manager{
 		entries:              make(map[string]*entry),
 		stateDir:             stateDir,
@@ -985,10 +992,19 @@ func (m *Manager) reconnectLoop(ctx context.Context, e *entry, cfg TunnelConfig)
 
 		args, cleanupArgs, err := sshTunnelArgs(ctx, cfg)
 		if err != nil {
-			m.updateState(e, StatusDisconnected, 0, err.Error(), false)
+			// ErrTunnelSSHOptionsUnresolved is a permanent stop: the
+			// tunnel was never `tunnel up`-resolved (e.g. daemon
+			// restarted with an old state file that predates the
+			// ssh-options cache). Surface this as StatusStopped so
+			// the CLI's tunnel list shows a clearly terminal state,
+			// distinct from a transient disconnect that's still
+			// retrying. StatusDisconnected with reconnectCount=0
+			// looked identical to "just starting" on inspection.
 			if errors.Is(err, ErrTunnelSSHOptionsUnresolved) {
+				m.updateState(e, StatusStopped, 0, err.Error(), false)
 				return
 			}
+			m.updateState(e, StatusDisconnected, 0, err.Error(), false)
 			if !m.sleepCtx(ctx, backoff) {
 				return
 			}

@@ -10,11 +10,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/fileutil"
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 var (
@@ -29,6 +31,8 @@ var (
 	// robust against caller-side error wrapping and future message changes.
 	errTokenFileRegeneratable = errors.New("token file regeneratable")
 )
+
+var runtimeGOOS = runtime.GOOS
 
 type Session struct {
 	Token     string
@@ -70,6 +74,15 @@ func (m *Manager) Generate() (Session, error) {
 // or the token has expired, a new token is generated. Real I/O failures
 // (permission denied, EIO) are surfaced so a broken filesystem does not
 // silently rotate the token out from under every synced peer.
+//
+// Expiry asymmetry (intentional): this function uses `Before(expiresAt)`
+// — strict. Validate (in serve-time) uses `After(expiresAt)` — lax. At
+// the exact boundary LoadOrGenerate regenerates while a request
+// in-flight is still accepted. The mismatch is deliberate: we'd rather
+// regenerate on startup than reuse a token that's about to expire
+// mid-request, but we shouldn't invalidate a request that races the
+// expiry edge. Do not "normalize" the two to use the same operator —
+// either choice would regress one path.
 func (m *Manager) LoadOrGenerate(ttl time.Duration) (Session, bool, error) {
 	tok, expiresAt, err := ReadTokenFileWithExpiry()
 	switch {
@@ -142,6 +155,10 @@ func ConstantTimeEqual(got, want string) bool {
 	return subtle.ConstantTimeCompare(gotDigest[:], wantDigest[:]) == 1
 }
 
+// Validate accepts a token at the exact expiry boundary (time.After is
+// strict "later than"). LoadOrGenerate is the complementary direction —
+// it regenerates at the same boundary. See the expiry-asymmetry note on
+// LoadOrGenerate for why the two are deliberately different.
 func (m *Manager) Validate(tok string) error {
 	m.mu.Lock()
 	if m.session == nil {
@@ -200,7 +217,7 @@ func TokenDir() (string, error) {
 	if env := os.Getenv("CC_CLIP_TOKEN_DIR"); env != "" {
 		return env, ensureTokenDirMode(env)
 	}
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return "", err
 	}
@@ -342,18 +359,33 @@ func readOpaqueTokenFile(dirFn tokenDirFn, fileName string) (string, error) {
 		return "", err
 	}
 	path := filepath.Join(dir, fileName)
-	permissive := false
 	if info, statErr := os.Stat(path); statErr == nil {
+		if runtimeGOOS == "windows" {
+			goto readTokenFile
+		}
 		if leakedMode := info.Mode().Perm() &^ 0600; leakedMode != 0 {
-			// On first upgrade from an older cc-clip build — or after a
-			// hand-placed token file landed at 0644 — the permissions may be
-			// wider than 0600. Warn loudly so the leak is visible in daemon
-			// logs, and flag for tightening after a successful read so the
-			// next reader no longer trips this branch.
-			log.Printf("cc-clip: warning: token file %s has permissive mode %o — tightening to 0600", path, info.Mode().Perm())
-			permissive = true
+			// The file sat on disk at a mode wider than 0600 at the moment
+			// we read it, meaning every local user on this machine had a
+			// window to read the secret. The earlier behavior was to warn
+			// + tighten in place and return the token anyway. That is the
+			// wrong response: the secret is already compromised, and
+			// continuing to trust it would accept attacker replay for the
+			// token's remaining lifetime.
+			//
+			// Instead, refuse the read and remove the file so
+			// loadOrGenerateOpaqueTokenFile regenerates a fresh token
+			// (writeTokenFileAtomic writes at 0600 from byte one). The
+			// attacker's snapshotted copy is then useless against the
+			// daemon's next request. Classify as errOpaqueTokenInvalid so
+			// loadOrGenerateOpaqueTokenFile takes the regenerate branch.
+			log.Printf("cc-clip: token file %s had permissive mode %o — removing and forcing regeneration (previous value may be compromised)", path, info.Mode().Perm())
+			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("cc-clip: warning: failed to remove compromised token file %s: %v", path, rmErr)
+			}
+			return "", fmt.Errorf("%w: %s had permissive mode %o", errOpaqueTokenInvalid, fileName, info.Mode().Perm())
 		}
 	}
+readTokenFile:
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -370,16 +402,6 @@ func readOpaqueTokenFile(dirFn tokenDirFn, fileName string) (string, error) {
 	}
 	if _, err := hex.DecodeString(tok); err != nil {
 		return "", fmt.Errorf("%w: %s is not valid hex", errOpaqueTokenInvalid, fileName)
-	}
-	if permissive {
-		// Warning alone is not enough — a token that stays at 0644 across
-		// restarts stays leaked to every local reader. Re-chmod in place so
-		// the next call sees a tightened mode. Errors are logged but not
-		// fatal: the secret was already on disk at the wider mode before
-		// this function ran, so refusing the read changes nothing.
-		if chmodErr := os.Chmod(path, 0600); chmodErr != nil {
-			log.Printf("cc-clip: warning: failed to tighten %s to 0600: %v", path, chmodErr)
-		}
 	}
 	return tok, nil
 }
@@ -412,7 +434,7 @@ func localOnlyTokenDir() (string, error) {
 	if TokenDirOverride != "" {
 		return TokenDirOverride, ensureTokenDirMode(TokenDirOverride)
 	}
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return "", err
 	}

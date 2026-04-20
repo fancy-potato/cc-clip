@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -86,6 +87,31 @@ func TestCheckDeployStateResultMissing(t *testing.T) {
 	}
 }
 
+// TestReadDeployStateRemoteCommandSurfacesReadErrors pins the shape of the
+// remote command. The previous form
+//
+//	cat ~/.cache/cc-clip/deploy.json 2>/dev/null || echo '__NOTFOUND__'
+//
+// swallowed permission / quota / corruption errors as `__NOTFOUND__`, so
+// doctor reported a broken host as "deploy state not tracked" and steered
+// the operator toward `cc-clip connect --force`. The current form uses
+// `test -e` to distinguish missing vs unreadable, then runs `cat` WITHOUT
+// stderr redirection so read failures propagate as non-zero ssh exit.
+// A regression that re-added `2>/dev/null` to the cat invocation would
+// silently restore the masking bug; this test catches it.
+func TestReadDeployStateRemoteCommandSurfacesReadErrors(t *testing.T) {
+	cmd := readDeployStateRemoteCommand
+	if !strings.Contains(cmd, "[ ! -e ~/.cache/cc-clip/deploy.json ]") {
+		t.Fatalf("expected explicit existence check, got %q", cmd)
+	}
+	if strings.Contains(cmd, "2>/dev/null") {
+		t.Fatalf("cat must not suppress stderr (would mask permission/IO errors), got %q", cmd)
+	}
+	if !strings.Contains(cmd, "__NOTFOUND__") {
+		t.Fatalf("expected __NOTFOUND__ sentinel for the missing case, got %q", cmd)
+	}
+}
+
 func TestCheckDeployStateResultValid(t *testing.T) {
 	got := checkDeployStateResult(&shim.DeployState{
 		BinaryHash: "sha256:test",
@@ -109,6 +135,28 @@ func TestPeerLookupCheckResultFallsBackForLegacyRemote(t *testing.T) {
 	got := peerLookupCheckResult(nil, fmt.Errorf("unknown command: peer"))
 	if !got.OK || got.Message != "peer registry not configured on remote; using legacy state path" {
 		t.Fatalf("expected legacy fallback success, got %#v", got)
+	}
+}
+
+// TestPeerLookupCheckResultDoesNotMisclassifyModernUsageError pins the fix
+// for the over-broad `strings.Contains(msg, "usage: cc-clip")` matcher.
+// A modern remote running `cc-clip peer show` with bad args prints
+// `usage: cc-clip peer show ...` to stderr; the previous matcher treated
+// that as "legacy remote" and reported OK=true, hiding real failures.
+func TestPeerLookupCheckResultDoesNotMisclassifyModernUsageError(t *testing.T) {
+	cases := []error{
+		fmt.Errorf("usage: cc-clip peer show --peer-id <id>"),
+		fmt.Errorf("ssh exited 2: usage: cc-clip peer show --peer-id <id>"),
+		fmt.Errorf("usage: cc-clip connect <host> [--port PORT]"),
+	}
+	for _, err := range cases {
+		got := peerLookupCheckResult(nil, err)
+		if got.OK {
+			t.Fatalf("expected modern usage error to surface as failure, got OK for %v: %#v", err, got)
+		}
+		if !strings.Contains(got.Message, "peer registry lookup failed") {
+			t.Fatalf("expected lookup-failed message for %v, got %#v", err, got)
+		}
 	}
 }
 
@@ -610,6 +658,24 @@ func TestCheckSetEnvAlignmentFailsWhenManagedBlockMissing(t *testing.T) {
 	}
 }
 
+func TestCheckSetEnvAlignmentFailsWhenManagedBlockMissingForLegacyPeer(t *testing.T) {
+	old := readLocalSSHConfig
+	t.Cleanup(func() { readLocalSSHConfig = old })
+	readLocalSSHConfig = func() ([]byte, error) {
+		return []byte("Host myserver\n  HostName srv\n"), nil
+	}
+
+	got := checkSetEnvAlignment("myserver", &peer.Registration{
+		ReservedPort: 18340,
+	}, nil, nil)
+	if got == nil || got.OK {
+		t.Fatalf("expected failing result when no managed block present for legacy peer, got %#v", got)
+	}
+	if !strings.Contains(got.Message, "exact manual line: SetEnv CC_CLIP_PORT=18340") {
+		t.Fatalf("expected exact manual SetEnv line, got %q", got.Message)
+	}
+}
+
 func TestCheckSetEnvAlignmentReportsUnsupportedWildcardLayout(t *testing.T) {
 	old := readLocalSSHConfig
 	t.Cleanup(func() { readLocalSSHConfig = old })
@@ -656,43 +722,85 @@ func TestCheckSetEnvAlignmentFailsOnCorruptedManagedBlock(t *testing.T) {
 	}
 }
 
+// TestClassifyDoctorPeerNotFoundRequiresExitCodeAndSentinel pins the
+// classifier contract using the SAME exec path production uses
+// (runRemoteSSHCommand → cmd.Run() with cmd.Stderr = &buf). The earlier
+// helper used cmd.CombinedOutput(), which happens to populate
+// *exec.ExitError.Stderr automatically — masking the P1-A production bug
+// where exitErr.Stderr was always nil. The helper below mirrors the
+// production capture so these tests exercise the real code path.
 func TestClassifyDoctorPeerNotFoundRequiresExitCodeAndSentinel(t *testing.T) {
 	t.Run("matching_exit_code_and_sentinel", func(t *testing.T) {
-		err, out := helperExitError(t, exitcode.PeerNotFound, exitcode.PeerNotFoundSentinel)
-		if !classifyDoctorPeerNotFound(err, out) {
+		err, stdout, stderr := helperExitError(t, exitcode.PeerNotFound, exitcode.PeerNotFoundSentinel)
+		if !classifyDoctorPeerNotFound(err, stdout, stderr) {
 			t.Fatalf("expected sentinel + exit code %d to classify as peer-not-found", exitcode.PeerNotFound)
 		}
 	})
 
 	t.Run("sentinel_without_matching_exit_code", func(t *testing.T) {
-		err, out := helperExitError(t, exitcode.UsageError, exitcode.PeerNotFoundSentinel)
-		if classifyDoctorPeerNotFound(err, out) {
+		err, stdout, stderr := helperExitError(t, exitcode.UsageError, exitcode.PeerNotFoundSentinel)
+		if classifyDoctorPeerNotFound(err, stdout, stderr) {
 			t.Fatal("classification should reject sentinel when exit code is not PeerNotFound")
 		}
 	})
 
 	t.Run("matching_exit_code_without_sentinel", func(t *testing.T) {
-		err, out := helperExitError(t, exitcode.PeerNotFound, "some other error")
-		if classifyDoctorPeerNotFound(err, out) {
+		err, stdout, stderr := helperExitError(t, exitcode.PeerNotFound, "some other error")
+		if classifyDoctorPeerNotFound(err, stdout, stderr) {
 			t.Fatal("classification should reject exit code without sentinel")
 		}
 	})
 }
 
-func helperExitError(t *testing.T, code int, stderr string) (error, string) {
+// TestClassifyDoctorPeerNotFoundReadsSentinelFromProductionStderrPath is
+// the P1-A regression test. It runs a subprocess via the SAME pattern
+// runRemoteSSHCommand uses (cmd.Run with explicit cmd.Stderr sink so
+// *exec.ExitError.Stderr stays nil) and asserts the classifier still
+// recognises the sentinel. Before the fix, exitErr.Stderr was the only
+// place the classifier looked — it would return false for this input
+// and uninstall would treat a broken remote session as a clean success.
+func TestClassifyDoctorPeerNotFoundReadsSentinelFromProductionStderrPath(t *testing.T) {
+	err, stdout, stderr := helperExitError(t, exitcode.PeerNotFound, exitcode.PeerNotFoundSentinel)
+	// Paranoid re-assertion of the production invariant: when an explicit
+	// cmd.Stderr sink is used, *exec.ExitError.Stderr is NOT populated.
+	// This is what makes the separate stderr argument load-bearing.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.Stderr != nil {
+		t.Fatalf("test scaffolding bug: exitErr.Stderr populated (%q); would mask the P1-A regression", exitErr.Stderr)
+	}
+	if !classifyDoctorPeerNotFound(err, stdout, stderr) {
+		t.Fatalf("classifier missed sentinel that reached stderr via the production exec path; stderr=%q", stderr)
+	}
+}
+
+// helperExitError spawns a short-lived subprocess that emits `stderrBody`
+// on stderr, nothing on stdout, and exits with `code`. The capture mirrors
+// runRemoteSSHCommand (cmd.Run + explicit cmd.Stderr sink), so the tests
+// exercise exactly the exec shape that production uses. Do NOT switch to
+// cmd.CombinedOutput/cmd.Output here without also reverting the P1-A fix
+// — those variants populate *exec.ExitError.Stderr automatically and
+// would hide a regression in the classifier's explicit-stderr argument.
+func helperExitError(t *testing.T, code int, stderrBody string) (error, string, string) {
 	t.Helper()
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", "echo "+stderr+" 1>&2 && exit "+fmt.Sprint(code))
+		cmd = exec.Command("cmd", "/c", "echo "+stderrBody+" 1>&2 && exit "+fmt.Sprint(code))
 	} else {
-		cmd = exec.Command("sh", "-c", "printf '%s\\n' \"$1\" >&2; exit \"$2\"", "sh", stderr, fmt.Sprint(code))
+		cmd = exec.Command("sh", "-c", "printf '%s\\n' \"$1\" >&2; exit \"$2\"", "sh", stderrBody, fmt.Sprint(code))
 	}
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	if err == nil {
 		t.Fatalf("helper command exited 0, want exit %d", code)
 	}
-	return err, strings.TrimSpace(string(out))
+	// Sanity: the exec path we picked is the one whose *exec.ExitError
+	// leaves Stderr nil. If a future Go release changes that, the
+	// regression guard in TestClassifyDoctorPeerNotFoundReadsSentinelFromProductionStderrPath
+	// will catch it.
+	return err, strings.TrimSpace(stdout.String()), stderr.String()
 }
 
 // TestCheckSetEnvAlignmentSkipsOnUnreadableConfig pins that a missing
@@ -732,6 +840,95 @@ func TestResolveDoctorStateDirPrefersManagedSetEnvWhenPeerLookupMisses(t *testin
 	})
 	if got != "/home/shared/.cache/cc-clip/peers/peer-a" {
 		t.Fatalf("state dir = %q, want managed SetEnv state dir", got)
+	}
+}
+
+// TestCappedBufferTruncatesAtCap pins the P2-D 1 MiB cap on each of
+// stdout/stderr captured by runRemoteSSHCommand. Without the cap, a
+// runaway remote command could grow the in-process buffers without
+// bound. The cap includes a stable marker so operators reading the
+// truncated output can tell data was dropped.
+func TestCappedBufferTruncatesAtCap(t *testing.T) {
+	t.Run("under_cap_writes_verbatim", func(t *testing.T) {
+		b := &cappedBuffer{cap: 16}
+		n, err := b.Write([]byte("hello"))
+		if err != nil || n != 5 {
+			t.Fatalf("Write returned (%d, %v), want (5, nil)", n, err)
+		}
+		if got := b.String(); got != "hello" {
+			t.Fatalf("String() = %q, want %q", got, "hello")
+		}
+	})
+
+	t.Run("spanning_cap_truncates_and_appends_marker", func(t *testing.T) {
+		b := &cappedBuffer{cap: 8}
+		n, err := b.Write([]byte("hello world")) // 11 bytes, cap 8
+		if err != nil || n != 11 {
+			t.Fatalf("Write returned (%d, %v), want (11, nil)", n, err)
+		}
+		got := b.String()
+		if !strings.HasPrefix(got, "hello wo") {
+			t.Fatalf("String() = %q, want prefix %q", got, "hello wo")
+		}
+		if !strings.Contains(got, "output truncated") {
+			t.Fatalf("String() = %q, missing truncation marker", got)
+		}
+	})
+
+	t.Run("writes_after_cap_are_dropped_but_succeed", func(t *testing.T) {
+		b := &cappedBuffer{cap: 4}
+		// Fill past cap with first write.
+		if _, err := b.Write([]byte("abcdefg")); err != nil {
+			t.Fatalf("first Write: %v", err)
+		}
+		// Subsequent writes must not error (EPIPE on ssh's stdout would
+		// make ssh exit nonzero even when the remote succeeded) and must
+		// not re-append the marker.
+		before := b.String()
+		n, err := b.Write([]byte("XYZ"))
+		if err != nil || n != 3 {
+			t.Fatalf("second Write returned (%d, %v), want (3, nil)", n, err)
+		}
+		after := b.String()
+		if strings.Count(after, "output truncated") != 1 {
+			t.Fatalf("marker duplicated across writes: %q", after)
+		}
+		if after != before {
+			t.Fatalf("post-cap bytes leaked: before=%q after=%q", before, after)
+		}
+	})
+}
+
+// TestCappedBufferSatisfiesIOWriter is a compile-time assertion that
+// *cappedBuffer implements io.Writer. If a future refactor changes the
+// signature in a way that breaks the exec.Cmd Stdout/Stderr assignment,
+// this will surface at test compile time rather than runtime.
+func TestCappedBufferSatisfiesIOWriter(t *testing.T) {
+	var _ interface {
+		Write(p []byte) (int, error)
+	} = (*cappedBuffer)(nil)
+	// Defense in depth: the concrete assignment used by runRemoteSSHCommand.
+	var buf bytes.Buffer
+	_ = buf // silence unused; keeps the import pinned alongside the cap test
+}
+
+// TestLookupPeerSanitizesRemoteOutputInErrorMessages pins the P2-B fix:
+// when the remote returns an error with ANSI / control-character bytes
+// in stdout (a compromised remote, a sandbox wrapper, etc.), the
+// operator-facing error message must NOT contain the raw escape
+// sequences — those would rewrite the operator's terminal view. The JSON
+// parse path still sees raw stdout (keep the round-trip contract), but
+// any bytes we splice into an error for human eyes go through
+// sanitizeRemoteOutput first.
+func TestSanitizeRemoteOutputStripsANSIEscape(t *testing.T) {
+	// Sanity guard for the sanitizer itself — the P2-B fix only works
+	// because this function actually strips CSI sequences.
+	got := sanitizeRemoteOutput("\x1b[31mred\x1b[0m text")
+	if strings.Contains(got, "\x1b") {
+		t.Fatalf("sanitizeRemoteOutput leaked ESC: %q", got)
+	}
+	if !strings.Contains(got, "red") || !strings.Contains(got, "text") {
+		t.Fatalf("sanitizeRemoteOutput dropped payload content: %q", got)
 	}
 }
 

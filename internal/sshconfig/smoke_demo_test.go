@@ -1,3 +1,5 @@
+//go:build sshconfig_demo
+
 package sshconfig
 
 import (

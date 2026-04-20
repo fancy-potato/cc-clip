@@ -17,10 +17,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
 	"unicode"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 // MarkerBegin and MarkerEnd wrap the cc-clip-managed SetEnv block inside
@@ -43,12 +46,13 @@ const (
 var ErrHostBlockMissing = errors.New("no `Host <alias>` block found in ~/.ssh/config")
 
 // ErrOnlyGlobMatch means the only `Host` blocks that would apply to
-// the alias use wildcard (`*`, `?`) or negation (`!`) patterns. cc-clip
-// refuses to inject SetEnv into such a block because it would leak
-// per-laptop env vars to every host the pattern matches, and because
-// negation-bearing blocks have semantics that don't map cleanly to a
-// per-alias injection.
-var ErrOnlyGlobMatch = errors.New("alias is matched only by a wildcard or negation `Host` pattern; add a literal `Host <alias>` block")
+// the alias use wildcard (`*`, `?`) or negation (`!`) patterns, OR a
+// Host block contains BOTH a literal matching the alias AND a wildcard
+// pattern (e.g. `Host myalias *`). cc-clip refuses to inject SetEnv
+// into such a block because it would leak per-laptop env vars to every
+// host the pattern matches, and because negation-bearing blocks have
+// semantics that don't map cleanly to a per-alias injection.
+var ErrOnlyGlobMatch = errors.New("alias is matched only by a wildcard or negation `Host` pattern, or the matching `Host` block mixes a literal alias with a wildcard token (e.g. `Host myalias *`); add a dedicated literal `Host <alias>` block")
 
 // ErrInvalidHost means the alias contains characters that cannot
 // appear in a Host token (whitespace, control chars, `#`, marker
@@ -70,6 +74,13 @@ var ErrSetEnvConflict = errors.New("host already contains a user-authored SetEnv
 // the link with a regular file and silently detach the user's dotfiles.
 var ErrSymlinkConfig = errors.New("refusing to edit symlinked ~/.ssh/config")
 
+// ErrSSHConfigTooLarge is returned when ~/.ssh/config exceeds
+// maxSSHConfigSize bytes. The cap is a defense-in-depth measure: a
+// runaway or hostile write to the user's config would otherwise force
+// readConfig to allocate unbounded memory. Realistic ssh_config files
+// are a few KiB; 1 MiB is ~1000x the typical upper bound.
+var ErrSSHConfigTooLarge = errors.New("~/.ssh/config exceeds size cap")
+
 // ErrHostBlockInInclude is returned when the top-level ~/.ssh/config has
 // no literal `Host <alias>` block matching the alias, but does contain
 // one or more `Include` directives. Because cc-clip does NOT walk
@@ -84,7 +95,7 @@ var ErrHostBlockInInclude = errors.New("no literal `Host <alias>` block in top-l
 // does not check whether the file exists; Apply/Remove will surface
 // that as an os error.
 func LocalConfigPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return "", err
 	}
@@ -247,23 +258,46 @@ func ApplyToFile(path, host string, env map[string]string) error {
 	if err := validateHost(host); err != nil {
 		return err
 	}
-	for k, v := range env {
+	// Iterate in sorted key order so the user-facing error (and any
+	// logs) is deterministic. Go map iteration is randomized, which
+	// produced non-reproducible failures in `env with multiple bad
+	// keys` cases — different runs picked different keys to complain
+	// about first.
+	sortedKeys := make([]string, 0, len(env))
+	for k := range env {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Strings(sortedKeys)
+	for _, k := range sortedKeys {
 		if err := validateEnvKey(k); err != nil {
 			return err
 		}
-		if err := validateEnvValue(v); err != nil {
+		if err := validateEnvValue(env[k]); err != nil {
 			return err
 		}
 	}
 
+	// Pre-lock readConfig: this is a fast gate that proves the target is a
+	// real, readable, non-symlinked ssh_config BEFORE we materialize the
+	// sidecar `.cc-clip.lock` file via acquireConfigLock. Without this, a
+	// missing path or a symlinked path would still create the sidecar lock
+	// on disk as a side effect of the (then-inevitable) fail-closed return.
+	// The second readConfig after the lock acquisition is the
+	// authoritative one whose bytes we operate on — this first read is
+	// discarded intentionally and a concurrent rewrite between the two
+	// reads is fine: the post-lock read wins.
 	data, meta, err := readConfig(path)
 	if err != nil {
 		return err
 	}
-	// Prove the target is a real readable config before creating the sidecar
-	// lock. Missing or symlinked configs should remain no-op / fail-closed
-	// cases without materializing a new `.cc-clip.lock` file next to them.
-	release, err := acquireConfigLock(path)
+	// Pass the config's owner uid/gid into the lock acquire so the
+	// sidecar `.cc-clip.lock` inherits the same ownership. Without
+	// this, `sudo cc-clip setup` materializes the sidecar root-owned
+	// (process euid=0) and the user's next non-sudo run can no longer
+	// flock it. The pre-lock readConfig is enough for this purpose —
+	// the post-lock re-read may pick up a concurrent rewrite, but the
+	// owner of the sidecar should match the on-disk owner we just saw.
+	release, err := acquireConfigLock(path, meta.uid, meta.gid, meta.hasOwnerID)
 	if err != nil {
 		return fmt.Errorf("acquire ssh_config advisory lock: %w", err)
 	}
@@ -287,15 +321,23 @@ func ApplyToFile(path, host string, env map[string]string) error {
 		return ErrHostBlockMissing
 	}
 
+	// Conflict detection MUST run against the original lines, BEFORE the
+	// marker-sweep has a chance to remove a user-authored
+	// `SetEnv CC_CLIP_PORT=…` line that happens to sit adjacent to a stale
+	// orphan marker. The adjacent-SetEnv sweep in removeManagedMarkersFromBlocks
+	// is intentional for cc-clip-authored content — but running it ahead of
+	// the user-conflict check would silently delete that content before we
+	// could raise ErrSetEnvConflict. blockHasUserSetEnv skips lines inside
+	// managed marker pairs so it does not false-trigger on a prior Apply.
+	for _, block := range blocks {
+		if blockHasUserSetEnv(lines, block) {
+			return ErrSetEnvConflict
+		}
+	}
 	cleanedLines, _ := removeManagedMarkersFromBlocks(lines, blocks)
 	blocks, status = findHostBlocks(cleanedLines, host)
 	if status != hostMatchLiteral || len(blocks) == 0 {
 		return ErrHostBlockMissing
-	}
-	for _, block := range blocks {
-		if blockHasUserSetEnv(cleanedLines, block) {
-			return ErrSetEnvConflict
-		}
 	}
 	// When a user has multiple literal `Host <alias>` stanzas in their own
 	// ~/.ssh/config, we CONSOLIDATE: managed markers in every matching
@@ -340,7 +382,9 @@ func RemoveFromFile(path, host string) error {
 	// Mirror ApplyToFile's locking, but only after we know the path is an
 	// actual readable file. That keeps missing configs as no-ops and
 	// symlinked configs as fail-closed without creating sidecar lock files.
-	release, err := acquireConfigLock(path)
+	// Inherit the config's owner so a `sudo cc-clip uninstall …` doesn't
+	// leave a root-owned sidecar lock behind.
+	release, err := acquireConfigLock(path, meta.uid, meta.gid, meta.hasOwnerID)
 	if err != nil {
 		return fmt.Errorf("acquire ssh_config advisory lock: %w", err)
 	}
@@ -386,6 +430,18 @@ type hostBlock struct {
 	end   int
 }
 
+// maxContinuation caps the per-directive backslash-newline continuation
+// walk. ssh_config Host aliases are almost always one line; 64 is well
+// past any realistic wrap count. The cap exists so a pathological config
+// with thousands of trailing-backslash lines cannot O(n²) us via repeated
+// string concat. When the cap fires, collectContinuation / continuationEnd
+// stop silently and the rest of the continuation is ignored — a 65-line
+// `Host` continuation may return ErrHostBlockMissing because the later
+// aliases are not seen. This is an intentional defense-in-depth trade-off:
+// realistic configs are one line, pathological configs are unreachable in
+// practice, and the silent truncation is safer than unbounded work.
+const maxContinuation = 64
+
 // collectContinuation returns the logical remainder of a directive that
 // uses ssh_config backslash-newline continuation. Given `rest` parsed
 // from the keyword line at index i, walk forward through any lines that
@@ -396,11 +452,6 @@ type hostBlock struct {
 // (== i when no continuation was present).
 func collectContinuation(lines []string, i int, rest string) (string, int) {
 	end := i
-	// Cap the continuation walk so a pathological ssh_config with
-	// thousands of trailing-backslash lines under one directive cannot
-	// O(n²) us via repeated string concat. 64 is well past any realistic
-	// Host alias wrap count (ssh_config aliases are usually one line).
-	const maxContinuation = 64
 	for steps := 0; steps < maxContinuation && strings.HasSuffix(rest, `\`) && end+1 < len(lines); steps++ {
 		// Drop the trailing backslash and splice the next line's content.
 		// ssh_config joins continuations with an implicit separator, so a
@@ -414,7 +465,6 @@ func collectContinuation(lines []string, i int, rest string) (string, int) {
 
 func continuationEnd(lines []string, i int) int {
 	end := i
-	const maxContinuation = 64
 	for steps := 0; steps < maxContinuation && end+1 < len(lines); steps++ {
 		if !strings.HasSuffix(strings.TrimRight(lines[end], " \t"), `\`) {
 			break
@@ -504,35 +554,46 @@ func findHostBlocks(lines []string, alias string) ([]hostBlock, hostMatchStatus)
 // which only matters when the Include itself is reachable for our query.
 //
 // Discriminator (per ssh_config grammar):
-//   - Indented `Include` belongs to its enclosing Host/Match block; we
-//     skip it because we only care about top-level reachability here.
-//   - Column-0 `Include` BEFORE any Host/Match: unconditionally reached.
-//   - Column-0 `Include` after a `Host <pat>` directive: ssh treats it
-//     as INSIDE that Host block, conditional on matching <pat>. Since
-//     findHostBlocks already proved no literal Host block matches our
-//     alias, an Include inside some other Host block cannot reach us.
-//     Skip it.
-//   - Column-0 `Include` after a `Match` directive: Match patterns can
-//     match unconditionally (e.g. `Match all`) and we deliberately
-//     don't evaluate them — treat the Include as potentially reachable.
+//   - `Include` BEFORE any Host/Match: unconditionally reached.
+//   - `Include` after a `Host <pat>` directive: ssh treats it as INSIDE
+//     that Host block, conditional on matching <pat>. Since findHostBlocks
+//     already proved no literal Host block matches our alias, an Include
+//     inside some other Host block cannot reach us — UNLESS we already
+//     saw a Match block earlier in the file. Match patterns can match
+//     unconditionally (e.g. `Match all`) and we deliberately don't
+//     evaluate them, so once a Match has been observed, every subsequent
+//     Include is considered reachable regardless of any intervening Host
+//     directive that would "close" the Match's apparent scope. This
+//     monotonic `reachableViaMatch` bit handles the `Match → Host → Include`
+//     ordering: an include after a Match+Host sequence could still be
+//     reachable because the Match block's own body can include arbitrary
+//     directives that find their way into the user's config surface.
+//   - `Include` after a `Match` directive: always reachable for the same
+//     unconditional-match reason.
 //
-// An earlier version tracked an `inBlock` flag that flipped true on the
-// first Host/Match and never reset, silently masking any later Include
-// and turning `Match all\n …\nInclude ~/.ssh/conf.d/*` into a false
-// `ErrHostBlockMissing`. The most-recent-opener tracking below restores
-// the documented fail-loud behavior without falsely flagging Include
-// directives that live inside a non-matching Host block.
+// Leading whitespace is intentionally ignored on Host/Match/Include
+// directives: OpenSSH accepts indented top-level directives, so
+// indentation alone does NOT imply nesting.
+//
+// Backslash-newline continuations are honored: a physical line ending
+// with a trailing `\` (ignoring trailing whitespace) extends the logical
+// directive to the next physical line. The continuation lines are
+// skipped when scanning for the NEXT directive, so a `Host foo \` that
+// continues with aliases on the next physical line cannot be misread as
+// a new top-level directive.
 func hasIncludeDirective(lines []string) bool {
 	insideHostBlock := false
-	for _, line := range lines {
-		if line == "" {
+	insideMatchBlock := false
+	reachableViaMatch := false
+	skipUntil := -1
+	for i := 0; i < len(lines); i++ {
+		if i <= skipUntil {
 			continue
 		}
-		// Indented directive: belongs to the enclosing block per ssh_config
-		// grammar. Skip — we only care about column-0 reachability.
-		if line[0] == ' ' || line[0] == '\t' {
-			continue
+		if end := continuationEnd(lines, i); end > i {
+			skipUntil = end
 		}
+		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -541,12 +602,23 @@ func hasIncludeDirective(lines []string) bool {
 		switch strings.ToLower(keyword) {
 		case "host":
 			insideHostBlock = true
+			insideMatchBlock = false
 		case "match":
 			// Match opens a new block whose body is reachable whenever
-			// the Match pattern fires. Treat any subsequent column-0
-			// Include as potentially reachable.
+			// the Match pattern fires. Any Include within — indented or
+			// not — is potentially reachable for our alias. We also set
+			// reachableViaMatch so a later `Host` → `Include` sequence
+			// stays flagged as reachable: a subsequent Host block does
+			// not erase the fact that the file already crossed a Match
+			// boundary where an unconditional pattern (e.g. `Match all`)
+			// could have fired.
 			insideHostBlock = false
+			insideMatchBlock = true
+			reachableViaMatch = true
 		case "include":
+			if insideMatchBlock || reachableViaMatch {
+				return true
+			}
 			if !insideHostBlock {
 				return true
 			}
@@ -641,21 +713,41 @@ func tokenizeHostPatterns(rest string) []string {
 }
 
 func classifyHostMatch(tokens []string, alias string) hostMatchStatus {
+	// OpenSSH matches Host patterns case-insensitively for the hostname
+	// component (see OpenSSH misc.c:match_pattern). A byte-exact compare
+	// here would let `Host ProdBox` match `ssh prodbox` at runtime while
+	// cc-clip returned ErrHostBlockMissing, forcing the user to either
+	// duplicate their Host block or rename their alias. Normalize to lower
+	// case so literal matching agrees with what OpenSSH actually does.
+	aliasLower := strings.ToLower(alias)
 	status := hostMatchNone
+	// hasNonNegatedWildcard tracks whether this block's token list contains
+	// ANY non-negated wildcard pattern, independent of whether it matches
+	// the alias. A block like `Host myalias *` would otherwise be
+	// classified as a literal match (the `myalias` token matches
+	// literally), and Apply would inject CC_CLIP_* into a block OpenSSH
+	// applies to every host — leaking per-laptop env vars to every
+	// connection. Treat any mix of literal-match + non-negated wildcard as
+	// hostMatchGlob so Apply returns ErrOnlyGlobMatch.
+	hasNonNegatedWildcard := false
 	for _, t := range tokens {
 		negated := strings.HasPrefix(t, "!")
 		pattern := strings.TrimPrefix(t, "!")
 		if pattern == "" {
 			continue
 		}
-		isGlob := containsGlobMeta(pattern)
+		patternLower := strings.ToLower(pattern)
+		isGlob := containsGlobMeta(patternLower)
+		if isGlob && !negated {
+			hasNonNegatedWildcard = true
+		}
 		matched := false
 		if isGlob {
-			if m, err := matchSSHPattern(pattern, alias); err == nil {
+			if m, err := matchSSHPattern(patternLower, aliasLower); err == nil {
 				matched = m
 			}
 		} else {
-			matched = pattern == alias
+			matched = patternLower == aliasLower
 		}
 		if !matched {
 			continue
@@ -671,9 +763,23 @@ func classifyHostMatch(tokens []string, alias string) hostMatchStatus {
 			status = hostMatchGlob
 		}
 	}
+	// Promote a literal-alias match to glob if the same block also carries
+	// a non-negated wildcard. This is the `Host myalias *` case: the block
+	// legitimately applies to the alias, but OpenSSH also applies its
+	// directives to every other host matching `*`, so injecting SetEnv
+	// here leaks per-laptop env vars to the entire SSH config surface.
+	if status == hostMatchLiteral && hasNonNegatedWildcard {
+		return hostMatchGlob
+	}
 	return status
 }
 
+// containsGlobMeta reports whether s contains an OpenSSH wildcard
+// metacharacter. Only `*` and `?` are recognised because OpenSSH's
+// match_pattern (see misc.c in openssh-portable) intentionally has NO
+// character-class (`[...]`) support — adding one here would diverge
+// from real ssh behavior and could classify a literal bracketed alias
+// as a glob match. Do not add `[`/`]` here.
 func containsGlobMeta(s string) bool {
 	return strings.ContainsAny(s, "*?")
 }
@@ -746,18 +852,121 @@ func detectIndent(lines []string, block hostBlock) string {
 	return "  "
 }
 
+// blockHasUserSetEnv reports whether a block contains a SetEnv directive
+// authored by the user (i.e. carrying a key that is NOT one of the
+// cc-clip-managed keys). SetEnv lines nested between MarkerBegin/MarkerEnd
+// are always treated as managed. A bare `SetEnv CC_CLIP_PORT=…` line
+// outside a marker pair (legacy single-key layout, or the orphan-end-
+// marker repair case) is also treated as managed so Apply can replace it.
+// Any other key — `SetEnv FOO=bar`, or a mixed `SetEnv CC_CLIP_PORT=… FOO=…`
+// — is user-authored and must trigger ErrSetEnvConflict.
+//
+// Call this BEFORE the marker-sweep runs so a user-authored
+// `SetEnv FOO=bar` next to a stale orphan marker is detected and rejected
+// rather than silently deleted by the adjacent-SetEnv sweep.
 func blockHasUserSetEnv(lines []string, block hostBlock) bool {
+	// Collect all properly-paired managed marker ranges. An orphan begin
+	// marker (with no matching end) is NOT treated as opening a managed
+	// region: if we did, any user-authored SetEnv after the orphan would
+	// be misclassified as managed and ErrSetEnvConflict would silently
+	// not fire. Orphans are swept separately by findOrphanMarker.
+	managedRanges := collectManagedMarkerPairs(lines, block.start, block.end)
+	inManaged := func(i int) bool {
+		for _, r := range managedRanges {
+			if i >= r[0] && i <= r[1] {
+				return true
+			}
+		}
+		return false
+	}
 	for i := block.start + 1; i < block.end; i++ {
+		if inManaged(i) {
+			continue
+		}
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		keyword, _ := splitDirective(trimmed)
-		if strings.EqualFold(keyword, "setenv") {
+		keyword, rest := splitDirective(trimmed)
+		if !strings.EqualFold(keyword, "setenv") {
+			continue
+		}
+		// A SetEnv directive is "user-authored" only if it carries at
+		// least one key that is NOT cc-clip-managed. Legacy single-key
+		// `SetEnv CC_CLIP_PORT=…` lines left from older cc-clip releases
+		// (and the orphan-repair scenarios exercised by
+		// TestApplyRepairsOrphanedEndMarker) need to be sweepable.
+		if setEnvHasNonManagedKey(rest) {
 			return true
 		}
 	}
 	return false
+}
+
+// collectManagedMarkerPairs returns all properly-paired marker ranges
+// inside [start+1, end). Orphan begins / ends / mismatched counts are
+// intentionally omitted so callers can treat them as non-managed and
+// sweep them via findOrphanMarker.
+func collectManagedMarkerPairs(lines []string, start, end int) [][2]int {
+	var pairs [][2]int
+	cursor := start
+	for cursor < end {
+		begin, endIdx, found := findMarkerPair(lines, cursor, end)
+		if !found {
+			break
+		}
+		pairs = append(pairs, [2]int{begin, endIdx})
+		cursor = endIdx
+	}
+	return pairs
+}
+
+// setEnvHasNonManagedKey reports whether the tokens after the `SetEnv`
+// keyword include any key beyond the cc-clip-managed set (CC_CLIP_PORT,
+// CC_CLIP_STATE_DIR). Malformed tokens (no `=`) are treated as non-managed
+// so we err on the side of preservation.
+func setEnvHasNonManagedKey(rest string) bool {
+	tokens, err := splitSetEnvTokens(rest)
+	if err != nil {
+		return true
+	}
+	for _, tok := range tokens {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			return true
+		}
+		key := tok[:eq]
+		if key != "CC_CLIP_PORT" && key != "CC_CLIP_STATE_DIR" {
+			return true
+		}
+	}
+	return false
+}
+
+// setEnvIsManagedOnly reports whether every token after the `SetEnv`
+// keyword is a KEY=VALUE assignment whose KEY is one of the cc-clip
+// managed keys (CC_CLIP_PORT, CC_CLIP_STATE_DIR). Returns false for
+// empty token lists or malformed input — an empty SetEnv is not "ours",
+// and malformed input must be preserved rather than swept. This is
+// used by the orphan-adjacent sweep to identify SetEnv lines cc-clip
+// itself wrote; a user SetEnv that embeds `CC_CLIP_PORT=…` as part of
+// a quoted value does NOT satisfy key-equality and is left alone.
+func setEnvIsManagedOnly(rest string) bool {
+	tokens, err := splitSetEnvTokens(rest)
+	if err != nil || len(tokens) == 0 {
+		return false
+	}
+	for _, tok := range tokens {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			return false
+		}
+		key := tok[:eq]
+		if key != "CC_CLIP_PORT" && key != "CC_CLIP_STATE_DIR" {
+			return false
+		}
+	}
+	return true
 }
 
 func renderMarkerBlock(env map[string]string, indent string) ([]string, error) {
@@ -859,17 +1068,7 @@ func findMarkerPair(lines []string, start, end int) (int, int, bool) {
 // hand-edit that deleted one half of the pair — without the sweep, a
 // subsequent Apply would stack a new marker block alongside the orphan.
 func findOrphanMarker(lines []string, start, end int) (int, bool) {
-	// All matched pairs in this block.
-	var pairs [][2]int
-	cursor := start
-	for cursor < end {
-		begin, endIdx, found := findMarkerPair(lines, cursor, end)
-		if !found {
-			break
-		}
-		pairs = append(pairs, [2]int{begin, endIdx})
-		cursor = endIdx
-	}
+	pairs := collectManagedMarkerPairs(lines, start, end)
 	inPair := func(i int) bool {
 		for _, p := range pairs {
 			if i >= p[0] && i <= p[1] {
@@ -905,12 +1104,20 @@ func findAdjacentManagedSetEnv(lines []string, start, end, orphanIdx int) (int, 
 			// match would have silently removed it, breaking the "never
 			// touch unrelated SetEnv lines" invariant in CLAUDE.md.
 			//
-			// Either key alone is enough: older cc-clip releases wrote a
-			// single-key SetEnv (just CC_CLIP_PORT) and the orphan-repair
-			// path must still clean those up after an upgrade.
-			if strings.EqualFold(keyword, "setenv") &&
-				(strings.Contains(rest, "CC_CLIP_PORT=") ||
-					strings.Contains(rest, "CC_CLIP_STATE_DIR=")) {
+			// Parse tokens via splitSetEnvTokens so a user SetEnv value
+			// that happens to contain the literal substring
+			// `CC_CLIP_PORT=` (e.g. `SetEnv MY="prefix-CC_CLIP_PORT=foo"`)
+			// is NOT misidentified as managed. Only a bona fide
+			// `KEY=VALUE` token whose KEY equals CC_CLIP_PORT or
+			// CC_CLIP_STATE_DIR qualifies. Either key alone is enough:
+			// older cc-clip releases wrote a single-key SetEnv (just
+			// CC_CLIP_PORT) and the orphan-repair path must still clean
+			// those up after an upgrade. A SetEnv line carrying a managed
+			// key MIXED with a user key (e.g. `CC_CLIP_PORT=… FOO=bar`)
+			// would have been rejected by blockHasUserSetEnv before
+			// reaching this sweep, so restricting the match to
+			// cc-clip-only-keyed lines here is safe.
+			if strings.EqualFold(keyword, "setenv") && setEnvIsManagedOnly(rest) {
 				return i, true
 			}
 			break
@@ -931,6 +1138,11 @@ func findAdjacentManagedSetEnv(lines []string, start, end, orphanIdx int) (int, 
 func removeManagedMarkersFromBlocks(lines []string, blocks []hostBlock) ([]string, bool) {
 	out := append([]string{}, lines...)
 	removed := false
+	// Iterate blocks from last to first. Shrinking `out` only affects indices
+	// >= the current block's start, so earlier blocks' (smaller) start/end
+	// indices remain valid for the next iteration. `block.end -= …` below is
+	// a local decrement applied within the current iteration only — the
+	// reverse traversal is what keeps blocks[i-1]'s indices correct.
 	for i := len(blocks) - 1; i >= 0; i-- {
 		block := blocks[i]
 		for {
@@ -953,17 +1165,26 @@ func removeManagedMarkersFromBlocks(lines []string, blocks []hostBlock) ([]strin
 				break
 			}
 			removed = true
-			removeStart, removeEnd := orphanIdx, orphanIdx
+			// Only the orphan marker line itself, plus the adjacent
+			// managed SetEnv if findAdjacentManagedSetEnv claims one.
+			// We DO NOT remove the inclusive range [min..max] between
+			// them: a previous version did, which silently deleted any
+			// user-authored blank lines or comments that happened to sit
+			// between the orphan and the legacy SetEnv. Building a
+			// new slice that omits exactly the matched indices preserves
+			// everything in between byte-for-byte.
+			drop := map[int]bool{orphanIdx: true}
 			if setEnvIdx, ok := findAdjacentManagedSetEnv(out, block.start, block.end, orphanIdx); ok {
-				if setEnvIdx < removeStart {
-					removeStart = setEnvIdx
-				}
-				if setEnvIdx > removeEnd {
-					removeEnd = setEnvIdx
+				drop[setEnvIdx] = true
+			}
+			newOut := make([]string, 0, len(out)-len(drop))
+			for i, line := range out {
+				if !drop[i] {
+					newOut = append(newOut, line)
 				}
 			}
-			out = append(out[:removeStart], out[removeEnd+1:]...)
-			block.end -= removeEnd - removeStart + 1
+			out = newOut
+			block.end -= len(drop)
 		}
 	}
 	return out, removed
@@ -1015,7 +1236,7 @@ func validateHost(host string) error {
 		// included) into ~/.ssh/config that ssh -G would then refuse to
 		// resolve or that could trip a downstream parser on \r / NUL.
 		if r > 0x7e || r < 0x20 {
-			return fmt.Errorf("%w: non-ASCII or non-printable character %U", ErrInvalidHost, r)
+			return fmt.Errorf("%w: non-printable or non-ASCII-printable character %U", ErrInvalidHost, r)
 		}
 	}
 	if strings.Contains(host, ">>>") || strings.Contains(host, "<<<") {
@@ -1055,9 +1276,26 @@ func validateEnvValue(value string) error {
 		if r == '\n' || r == '\r' || r == 0 {
 			return fmt.Errorf("%w: contains newline or NUL", ErrInvalidEnvValue)
 		}
+		// Reject literal backslash. OpenSSH's ssh_config tokenizer does NOT
+		// interpret `\\` or `\"` inside a quoted SetEnv value the same way
+		// this package round-trips them: OpenSSH treats the backslash as
+		// literal, so an Apply round-trip through `ssh -G` would deliver a
+		// different byte sequence to the remote than we wrote. Unix paths
+		// (the CC_CLIP_STATE_DIR source) do not legitimately contain
+		// backslashes; rejecting them keeps the Apply→remote round-trip
+		// byte-identical to the input.
+		if r == '\\' {
+			return fmt.Errorf("%w: contains backslash (cannot round-trip through OpenSSH's ssh_config parser)", ErrInvalidEnvValue)
+		}
 	}
 	return nil
 }
+
+// maxSSHConfigSize caps the bytes readConfig will accept from
+// ~/.ssh/config. See ErrSSHConfigTooLarge. The cap is enforced by
+// reading maxSSHConfigSize+1 bytes: if the extra byte materialises the
+// file is over the cap and we fail closed.
+const maxSSHConfigSize = 1 << 20 // 1 MiB
 
 // fileMeta carries the pre-existing file's mode, uid, and gid across
 // readConfig → writeAtomic so the atomic rename can restore both the
@@ -1104,9 +1342,17 @@ func readConfig(path string) ([]byte, fileMeta, error) {
 	if err != nil {
 		return nil, meta, err
 	}
-	data, err := io.ReadAll(f)
+	// Cap the read at maxSSHConfigSize+1 bytes. If the extra byte was
+	// actually read, the file is over the cap — fail closed with
+	// ErrSSHConfigTooLarge. io.LimitReader alone wouldn't distinguish
+	// "file is exactly maxSSHConfigSize" from "file was truncated"; the
+	// +1 detection byte makes the distinction explicit.
+	data, err := io.ReadAll(io.LimitReader(f, maxSSHConfigSize+1))
 	if err != nil {
 		return nil, meta, err
+	}
+	if len(data) > maxSSHConfigSize {
+		return nil, meta, fmt.Errorf("%w: %s exceeds %d bytes", ErrSSHConfigTooLarge, path, maxSSHConfigSize)
 	}
 	meta.mode = info.Mode().Perm()
 	meta.uid, meta.gid, meta.hasOwnerID = captureOwnership(info)
@@ -1142,16 +1388,28 @@ func splitLines(data []byte) ([]string, fileFormat) {
 		body = data[:len(data)-1]
 	}
 	lines := strings.Split(string(body), "\n")
+	// Decide the dominant EOL style by majority, not "any one line wins".
+	// A stray `\r` from a hand-edit in an otherwise-LF file should not
+	// flip every subsequent write to CRLF. We pick CRLF only when the
+	// majority of populated lines carried `\r`. Ties fall through to LF,
+	// matching the common Unix-authored case.
+	crlfCount := 0
+	lfCount := 0
 	for _, l := range lines {
 		if strings.HasSuffix(l, "\r") {
-			f.crlf = true
-			break
+			crlfCount++
+		} else {
+			lfCount++
 		}
 	}
-	if f.crlf {
-		for i, l := range lines {
-			lines[i] = strings.TrimSuffix(l, "\r")
-		}
+	if crlfCount > lfCount {
+		f.crlf = true
+	}
+	// Always strip trailing `\r` from every line so a stray CR on a minority
+	// line cannot leak into the re-emitted output; the chosen EOL is
+	// reapplied in joinLines.
+	for i, l := range lines {
+		lines[i] = strings.TrimSuffix(l, "\r")
 	}
 	return lines, f
 }
@@ -1194,6 +1452,37 @@ func writeAtomic(path string, data []byte, meta fileMeta) error {
 		cleanup()
 		return err
 	}
+	mode := meta.mode
+	if mode == 0 {
+		// When the source info reports a zero permission mode (possible on
+		// some Windows / FUSE paths), default to 0600. os.CreateTemp already
+		// creates at 0600 on Unix, but making the intent explicit avoids a
+		// future refactor silently flipping to 0644 if Go's default changes.
+		mode = 0o600
+	}
+	// Apply chmod and chown via fd BEFORE Close. The previous form
+	// chmod'd by name after Close, leaving a window in which an
+	// attacker with write access to ~/.ssh/ could swap the temp file
+	// for a symlink between Close and Chmod/Chown — the chmod/chown
+	// would then land on the swap target. fchmod/fchown operate on the
+	// open inode and are immune.
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		cleanup()
+		return err
+	}
+	if meta.hasOwnerID {
+		// Preserve ownership so a privileged rewrite (e.g. sudo cc-clip
+		// setup) does not silently flip ~/.ssh/config from user-owned to
+		// root-owned. If the process lacks CAP_CHOWN we abort rather than
+		// rename over the user's file with the wrong owner; the user can
+		// then re-run without sudo.
+		if err := applyOwnershipFd(tmp.Fd(), meta.uid, meta.gid); err != nil {
+			tmp.Close()
+			cleanup()
+			return fmt.Errorf("preserve ~/.ssh/config ownership: %w", err)
+		}
+	}
 	// Sync the temp file before close so a crash between Rename and the next
 	// OS flush can't leave ~/.ssh/config referencing an inode whose data is
 	// still in the page cache. Paired with the parent-dir Sync below, this
@@ -1207,30 +1496,11 @@ func writeAtomic(path string, data []byte, meta fileMeta) error {
 		cleanup()
 		return err
 	}
-	mode := meta.mode
-	if mode == 0 {
-		// When the source info reports a zero permission mode (possible on
-		// some Windows / FUSE paths), default to 0600. os.CreateTemp already
-		// creates at 0600 on Unix, but making the intent explicit avoids a
-		// future refactor silently flipping to 0644 if Go's default changes.
-		mode = 0o600
-	}
-	if err := os.Chmod(tmpName, mode); err != nil {
-		cleanup()
-		return err
-	}
-	if meta.hasOwnerID {
-		// Preserve ownership so a privileged rewrite (e.g. sudo cc-clip
-		// setup) does not silently flip ~/.ssh/config from user-owned to
-		// root-owned. If the process lacks CAP_CHOWN we abort rather than
-		// rename over the user's file with the wrong owner; the user can
-		// then re-run without sudo.
-		if err := applyOwnership(tmpName, meta.uid, meta.gid); err != nil {
-			cleanup()
-			return fmt.Errorf("preserve ~/.ssh/config ownership: %w", err)
-		}
-	}
-	if err := os.Rename(tmpName, path); err != nil {
+	// Defense-in-depth against a rename-vs-symlink-swap race: even with
+	// the advisory flock held and the pre-write O_NOFOLLOW open, an
+	// attacker with write access to ~/.ssh/ could swap the target for a
+	// symlink between our locked read and this rename.
+	if err := renameAtomic(tmpName, path); err != nil {
 		cleanup()
 		return err
 	}
@@ -1252,6 +1522,72 @@ func writeAtomic(path string, data []byte, meta fileMeta) error {
 		if closeErr != nil {
 			return fmt.Errorf("close ssh_config dir handle: %w", closeErr)
 		}
+	} else if shouldLogFsyncSkip() {
+		// This branch fires when os.Open(dir) itself FAILED — we never
+		// got a directory handle to sync. On Linux/Darwin a directory
+		// fsync is the standard recipe for making a rename durable, so
+		// parent-dir open failure means fsync was skipped entirely and
+		// durability of the just-completed rename is best-effort on
+		// this platform/filesystem (e.g. a restricted shell or FUSE
+		// mount that refuses O_RDONLY on directories). Surface a
+		// best-effort warning so the operator knows; the rename itself
+		// already succeeded, so we do not return the error. Windows has
+		// different fsync semantics on directories so we stay silent
+		// there via shouldLogFsyncSkip().
+		fmt.Fprintf(os.Stderr, "cc-clip: warning: could not open ssh_config parent dir %q to fsync after rename; durability is best-effort: %v\n", dir, err)
 	}
 	return nil
+}
+
+// renameAtomic moves tmp → dst while rejecting symlink-swap attacks.
+//
+// On Linux, it first attempts renameat2 with RENAME_NOREPLACE. On
+// Darwin, it first attempts renamex_np with RENAME_EXCL. Both are
+// exclusive renames: if dst already exists the kernel returns EEXIST
+// rather than silently replacing, so we then Lstat and confirm it is
+// NOT a symlink before falling back to the normal replacing os.Rename.
+// This closes the symlink-plant race: an attacker who swapped a symlink
+// into dst between our initial O_NOFOLLOW open and here would be caught
+// by the post-EEXIST Lstat, because the exclusive-rename syscall could
+// not have silently followed the link and succeeded.
+//
+// On other platforms (non-Darwin BSDs, Windows) renameNoReplace is a
+// no-op stub and we fall straight through to the Lstat-then-Rename path,
+// which has a residual TOCTOU window: an attacker with directory write
+// access can swap the regular file for a symlink between our final
+// Lstat and os.Rename. On Windows, creating a symlink requires
+// SeCreateSymbolicLinkPrivilege so the residual window is narrow by
+// policy; on the BSDs we accept the window rather than ship another
+// platform-specific syscall layer.
+func renameAtomic(tmp, dst string) error {
+	if renameNoReplaceSupported {
+		ok, rerr := renameNoReplace(tmp, dst)
+		if ok {
+			// dst did not exist; rename succeeded atomically.
+			return nil
+		}
+		if rerr != nil && !errors.Is(rerr, os.ErrExist) {
+			// Real error from the syscall — propagate.
+			return rerr
+		}
+		// rerr == os.ErrExist: dst already exists (the normal case).
+		// rerr == nil: platform fallback signaled (unsupported kernel).
+		// Either way, fall through to Lstat + replacing Rename.
+	}
+	if lstat, lerr := os.Lstat(dst); lerr == nil && lstat.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrSymlinkConfig, dst)
+	}
+	return os.Rename(tmp, dst)
+}
+
+// shouldLogFsyncSkip reports whether a silent parent-dir fsync skip is
+// a genuine durability warning (Unix) or an expected platform quirk
+// (Windows has different fsync semantics on directories).
+func shouldLogFsyncSkip() bool {
+	switch runtime.GOOS {
+	case "linux", "darwin", "freebsd", "netbsd", "openbsd", "dragonfly":
+		return true
+	default:
+		return false
+	}
 }

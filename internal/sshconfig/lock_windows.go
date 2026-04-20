@@ -32,6 +32,11 @@ package sshconfig
 // the function signature compatible and update lock_unix.go's contract
 // comment to match. Tests that simulate concurrent Apply on Windows must
 // document the lost-update window or skip on runtime.GOOS=="windows".
-func acquireConfigLock(path string) (release func(), err error) {
+//
+// The owner-uid/gid parameters are accepted for signature parity with
+// the Unix variant and intentionally ignored — Windows ownership uses
+// SIDs, not POSIX uid/gid, and the no-op lock has no sidecar file to
+// chown anyway.
+func acquireConfigLock(path string, _ownerUID, _ownerGID int, _hasOwnerID bool) (release func(), err error) {
 	return func() {}, nil
 }

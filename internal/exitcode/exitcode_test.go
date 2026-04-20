@@ -23,6 +23,9 @@ func TestExitCodeValuesArePinned(t *testing.T) {
 		{"InternalError", InternalError, 20},
 		{"UsageError", UsageError, 21},
 		{"PeerNotFound", PeerNotFound, 22},
+		{"DaemonShuttingDown", DaemonShuttingDown, 23},
+		{"AmbiguousTunnelState", AmbiguousTunnelState, 24},
+		{"DaemonTunnelControlTokenUnavailable", DaemonTunnelControlTokenUnavailable, 25},
 	}
 	// Track duplicates by `want` (the pinned contract) rather than `got`:
 	// if a refactor flips two constants to the same new value, both of

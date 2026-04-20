@@ -2,11 +2,14 @@ package token
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 func TestGenerateAndValidate(t *testing.T) {
@@ -89,6 +92,56 @@ func TestCurrent(t *testing.T) {
 	}
 	if cur.Token != s.Token {
 		t.Fatal("Current token mismatch")
+	}
+}
+
+// fakeUserhomeResolver is a minimal test double satisfying the
+// userhome.Resolver interface.
+type fakeUserhomeResolver struct {
+	lookup func(string) (*user.User, error)
+	home   func() (string, error)
+	sudo   func() bool
+}
+
+func (f fakeUserhomeResolver) LookupUser(name string) (*user.User, error) {
+	return f.lookup(name)
+}
+
+func (f fakeUserhomeResolver) UserHomeDir() (string, error) {
+	return f.home()
+}
+
+func (f fakeUserhomeResolver) IsSudoRoot() bool {
+	if f.sudo == nil {
+		return false
+	}
+	return f.sudo()
+}
+
+func TestTokenDirUsesSUDOUserHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SUDO_USER", "alice")
+	t.Setenv("SUDO_UID", "501")
+	userhome.SetResolverForTest(t, fakeUserhomeResolver{
+		lookup: func(name string) (*user.User, error) {
+			if name != "alice" {
+				t.Fatalf("LookupUser(%q), want alice", name)
+			}
+			return &user.User{Username: "alice", Uid: "501", HomeDir: home}, nil
+		},
+		home: func() (string, error) {
+			return "/var/root", nil
+		},
+		sudo: func() bool { return true },
+	})
+
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir: %v", err)
+	}
+	want := filepath.Join(home, ".cache", "cc-clip")
+	if dir != want {
+		t.Fatalf("TokenDir = %q, want %q", dir, want)
 	}
 }
 
@@ -210,12 +263,13 @@ func TestLoadOrGenerateTunnelControlToken(t *testing.T) {
 	}
 }
 
-// TestReadTunnelControlTokenTightensPermissiveMode pins the rescue path
-// where a token file on disk is readable but world/group-accessible. A
-// log-only warning would leave every subsequent read observing the same
-// leak; the reader tightens to 0600 in place so the next caller sees the
-// repaired mode.
-func TestReadTunnelControlTokenTightensPermissiveMode(t *testing.T) {
+// TestReadTunnelControlTokenRejectsPermissiveMode pins the strict-security
+// response to a token file found at mode wider than 0600: the secret is
+// treated as compromised (every local user had a window to snapshot it),
+// so the reader removes the file and surfaces errOpaqueTokenInvalid to
+// force regeneration. Earlier behavior "warn + tighten + return" was
+// unsafe because it kept trusting a potentially-replayed token.
+func TestReadTunnelControlTokenRejectsPermissiveMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows chmod semantics differ; Unix-only regression")
 	}
@@ -237,16 +291,93 @@ func TestReadTunnelControlTokenTightensPermissiveMode(t *testing.T) {
 		t.Fatalf("chmod 0644: %v", err)
 	}
 
-	if _, err := ReadTunnelControlToken(); err != nil {
-		t.Fatalf("ReadTunnelControlToken: %v", err)
+	_, err = ReadTunnelControlToken()
+	if err == nil {
+		t.Fatalf("expected error for permissive-mode token file, got nil")
+	}
+	if !IsOpaqueTokenInvalid(err) {
+		t.Fatalf("err = %v, want errOpaqueTokenInvalid", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("compromised token file still present: stat err = %v", statErr)
+	}
+}
+
+// TestLoadOrGenerateOpaqueTokenFileRegeneratesAfterPermissiveMode pins the
+// downstream effect: after a permissive-mode read fails, the very next
+// LoadOrGenerate call must produce a fresh token (reused=false) written at
+// 0600, not propagate the compromised bytes.
+func TestLoadOrGenerateOpaqueTokenFileRegeneratesAfterPermissiveMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows chmod semantics differ; Unix-only regression")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	first, _, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+	dir, err := TokenDir()
+	if err != nil {
+		t.Fatalf("TokenDir: %v", err)
+	}
+	path := filepath.Join(dir, tunnelControlTokenFileName)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod 0644: %v", err)
 	}
 
+	second, reused, err := LoadOrGenerateTunnelControlToken()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+	if reused {
+		t.Fatalf("expected regeneration after permissive-mode leak, got reused=true")
+	}
+	if second == first {
+		t.Fatalf("new token is identical to the compromised one; regeneration did not happen")
+	}
 	info, err := os.Stat(path)
 	if err != nil {
-		t.Fatalf("Stat after read: %v", err)
+		t.Fatalf("Stat after regenerate: %v", err)
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("post-read perm = %o, want 0600", got)
+		t.Fatalf("post-regenerate perm = %o, want 0600", got)
+	}
+}
+
+func TestReadTunnelControlTokenSkipsPermissiveModeRejectionOnWindows(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpDir := filepath.Join(home, ".cache", "cc-clip")
+	TokenDirOverride = tmpDir
+	defer func() { TokenDirOverride = "" }()
+
+	oldGOOS := runtimeGOOS
+	runtimeGOOS = "windows"
+	t.Cleanup(func() { runtimeGOOS = oldGOOS })
+
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	const want = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	path := filepath.Join(tmpDir, tunnelControlTokenFileName)
+	if err := os.WriteFile(path, []byte(want+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := ReadTunnelControlToken()
+	if err != nil {
+		t.Fatalf("ReadTunnelControlToken: %v", err)
+	}
+	if got != want {
+		t.Fatalf("token = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("Stat: %v", err)
 	}
 }
 

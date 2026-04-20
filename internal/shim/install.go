@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 type Target string
@@ -82,7 +84,7 @@ func findRealBinary(name string, shimDir string) (string, error) {
 }
 
 func defaultInstallDir() string {
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return filepath.Join("/tmp", ".local", "bin")
 	}

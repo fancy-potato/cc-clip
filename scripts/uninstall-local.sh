@@ -1,5 +1,9 @@
 #!/bin/sh
+# POSIX sh only — no bashisms (runs under dash on Debian)
 set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 INSTALL_DIR=${CC_CLIP_INSTALL_DIR:-"$HOME/.local/bin"}
 
@@ -95,6 +99,24 @@ remove_managed_ssh_config_blocks() {
 
 	TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/cc-clip-ssh-config.XXXXXX")
 	trap 'rm -f "$TMP_FILE"' EXIT HUP INT TERM
+	# Preserve the existing file's owner/mode on the temp copy before we
+	# rewrite it. If an operator runs this script under sudo, writing the
+	# awk output straight to a mktemp-owned file and then mv'ing it over
+	# ~/.ssh/config would replace the user's config with temp-file metadata.
+	# Copying with -p first gives the temp path the same metadata, and the
+	# shell redirection below truncates that file in place without changing
+	# owner/mode.
+	#
+	# SECURITY: cp -p overwrites the existing regular file that mktemp
+	# created, which closes a symlink-in-TMPDIR race that would otherwise
+	# exist between `rm -f "$TMP_FILE"` and the later `cp`. A previous
+	# revision rm'd the temp file between mktemp and cp, opening a window
+	# where a malicious actor with write access to TMPDIR could plant a
+	# symlink at the same path pointing anywhere writable by the user
+	# running this script; `cp -p --follow-symlinks` would then clobber
+	# the symlink target. Keep the rm-via-EXIT-trap (to clean up after a
+	# successful run or a panic), but do not pre-delete the mktemp file.
+	cp -p "$SSH_CONFIG" "$TMP_FILE"
 
 	awk '
 	function flush_buffer(    i) {
@@ -107,7 +129,16 @@ remove_managed_ssh_config_blocks() {
 		skip = 1
 		block_kind = kind
 		buffered_count = 0
-		buffered[++buffered_count] = $0
+		# Buffer the RAW (pre-trim) start-marker line so that on an
+		# unterminated-block recovery via the END flush_buffer path we
+		# reproduce the original leading whitespace verbatim. $0 here
+		# still carries the original line (awk implicit $0 is not
+		# mutated by the trim below, which acts on a separate line
+		# variable), so this is already correct for the normal case;
+		# making the intent explicit via raw keeps both scripts
+		# consistent and protects against future edits that mutate $0
+		# before calling begin_block.
+		buffered[++buffered_count] = raw
 	}
 	function end_matches(line) {
 		if (block_kind == "setenv" && line == "# <<< cc-clip SetEnv (do not edit) <<<") return 1
@@ -155,6 +186,18 @@ resolve_existing_cc_clip_bin() {
 	fi
 	if command -v cc-clip >/dev/null 2>&1; then
 		command -v cc-clip
+		return 0
+	fi
+	# Only fall back to the repo-local build when the operator explicitly
+	# opts in via CC_CLIP_PREFER_REPO=1. Running this script from a clone
+	# of the repo should NOT silently prefer a stale `./cc-clip` binary
+	# that's older than whatever is installed on PATH — the prior
+	# unconditional fallback could, for example, invoke an old uninstall
+	# code path against a remote that expects the newer CLI contract. Keep
+	# the fallback as an opt-in for development (`CC_CLIP_PREFER_REPO=1
+	# ./scripts/uninstall-local.sh`) but not as default behavior.
+	if [ "${CC_CLIP_PREFER_REPO:-0}" = "1" ] && [ -x "$REPO_ROOT/cc-clip" ]; then
+		printf '%s\n' "$REPO_ROOT/cc-clip"
 		return 0
 	fi
 	return 1

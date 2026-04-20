@@ -11,6 +11,7 @@ import (
 
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 type CheckResult struct {
@@ -114,7 +115,7 @@ func checkTokenExpiry() []CheckResult {
 
 // checkLaunchdService checks if the cc-clip launchd service is installed (macOS).
 func checkLaunchdService() []CheckResult {
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return []CheckResult{{"launchd", false, "cannot determine home directory"}}
 	}

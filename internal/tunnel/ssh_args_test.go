@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -292,6 +293,115 @@ func TestRequireTrustedSSHBinaryPrefixAcceptsWindowsSystemSSH(t *testing.T) {
 	if err := requireTrustedSSHBinaryPrefix(`C:\Windows\System32\OpenSSH\ssh.exe`); err != nil {
 		t.Fatalf("requireTrustedSSHBinaryPrefix: %v", err)
 	}
+}
+
+func TestResolveSSHBinaryOverrideRejectsTrustedPrefixSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink override test is pinned on Unix path policy")
+	}
+	resetSSHBinaryCacheForTest(t)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUDO_USER", "")
+
+	trustedDir := filepath.Join(home, ".local", "bin")
+	untrustedDir := filepath.Join(home, "evil-bin")
+	if err := os.MkdirAll(trustedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll trustedDir: %v", err)
+	}
+	if err := os.MkdirAll(untrustedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll untrustedDir: %v", err)
+	}
+
+	untrustedTarget := filepath.Join(untrustedDir, "ssh")
+	if err := os.WriteFile(untrustedTarget, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("WriteFile untrustedTarget: %v", err)
+	}
+
+	override := filepath.Join(trustedDir, "ssh")
+	if err := os.Symlink(untrustedTarget, override); err != nil {
+		t.Fatalf("Symlink(%q -> %q): %v", override, untrustedTarget, err)
+	}
+	t.Setenv("CC_CLIP_SSH", override)
+
+	_, err := resolveSSHBinary()
+	if err == nil {
+		t.Fatal("resolveSSHBinary = nil, want symlink-escape rejection")
+	}
+	if !strings.Contains(err.Error(), "resolves to") {
+		t.Fatalf("err = %v, want symlink-resolution context", err)
+	}
+	if !strings.Contains(err.Error(), filepath.Clean(untrustedTarget)) {
+		t.Fatalf("err = %v, want untrusted real path %q", err, filepath.Clean(untrustedTarget))
+	}
+}
+
+func TestResolveSSHBinaryOverrideReturnsTrustedRealPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink override test is pinned on Unix path policy")
+	}
+	resetSSHBinaryCacheForTest(t)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUDO_USER", "")
+
+	trustedDir := filepath.Join(home, ".local", "bin")
+	linkDir := filepath.Join(home, "links")
+	if err := os.MkdirAll(trustedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll trustedDir: %v", err)
+	}
+	if err := os.MkdirAll(linkDir, 0755); err != nil {
+		t.Fatalf("MkdirAll linkDir: %v", err)
+	}
+
+	realSSH := filepath.Join(trustedDir, "ssh-real")
+	if err := os.WriteFile(realSSH, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("WriteFile realSSH: %v", err)
+	}
+
+	override := filepath.Join(linkDir, "ssh-link")
+	if err := os.Symlink(realSSH, override); err != nil {
+		t.Fatalf("Symlink(%q -> %q): %v", override, realSSH, err)
+	}
+	t.Setenv("CC_CLIP_SSH", override)
+
+	got, err := resolveSSHBinary()
+	if err != nil {
+		t.Fatalf("resolveSSHBinary: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(realSSH)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(realSSH): %v", err)
+	}
+	if got != want {
+		t.Fatalf("resolveSSHBinary() = %q, want resolved real path %q", got, want)
+	}
+}
+
+func resetSSHBinaryCacheForTest(t *testing.T) {
+	t.Helper()
+
+	sshBinaryMu.Lock()
+	oldPath := sshBinaryPath
+	oldErr := sshBinaryErr
+	oldOverride := sshBinaryOverride
+	oldCached := sshBinaryCached
+	sshBinaryPath = ""
+	sshBinaryErr = nil
+	sshBinaryOverride = ""
+	sshBinaryCached = false
+	sshBinaryMu.Unlock()
+
+	t.Cleanup(func() {
+		sshBinaryMu.Lock()
+		sshBinaryPath = oldPath
+		sshBinaryErr = oldErr
+		sshBinaryOverride = oldOverride
+		sshBinaryCached = oldCached
+		sshBinaryMu.Unlock()
+	})
 }
 
 func TestBuildSSHTunnelArgsFiltersForwardsFromResolvedConfig(t *testing.T) {

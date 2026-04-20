@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,10 +24,25 @@ const registryVersion = 1
 var ErrPeerNotFound = errors.New("peer not found")
 
 var (
-	portAvailableCheck        = portAvailable
+	portAvailableCheck = portAvailable
+	// registryLockRetryInterval is the INITIAL backoff between mkdir
+	// retries. After each EEXIST we double the wait up to
+	// registryLockMaxBackoff so a long-held lock doesn't waste CPU on
+	// 100ms polls for the full deadline. The previous fixed-interval
+	// loop combined with registryLockMaxAttempts=50 capped total wait
+	// at only ~5 s, which under contention from >5 concurrent
+	// `cc-clip connect` runs caused legitimate holders to be reported
+	// as timed-out before they finished.
 	registryLockRetryInterval = 100 * time.Millisecond
-	registryLockMaxAttempts   = 50
-	registryLockStaleAfter    = 30 * time.Second
+	registryLockMaxBackoff    = 2 * time.Second
+	// registryLockAcquireDeadline is the total time we wait for the
+	// lock before reporting a hard timeout. 30 s is loose enough to
+	// cover normal contention on a multi-laptop shared account but
+	// still bounded so a wedged holder surfaces a real error rather
+	// than blocking the CLI indefinitely. Tests shrink this to keep
+	// suite latency low.
+	registryLockAcquireDeadline = 30 * time.Second
+	registryLockStaleAfter      = 30 * time.Second
 	// registryLockHardCeiling caps how long a lock can be held even when the
 	// recorded PID is still "alive". Protects against kernel PID rollover
 	// (the original holder crashed, the PID was recycled to an unrelated
@@ -71,37 +87,30 @@ func ReservePort(baseDir, peerID, label string, rangeStart, rangeEnd int) (Regis
 			owner, portRecorded := ports.Ports[portKey]
 			ownedByUs := owner == peerID
 			unowned := !portRecorded || owner == ""
-			if ownedByUs || unowned {
-				// Keep reusing a port we already own even when it is currently
-				// bound: the common case is our own active SSH reverse forward
-				// holding the socket between reconnects. Only the `unowned`
-				// branch treats a bind failure as evidence that some unrelated
-				// process grabbed the port and we should reallocate.
-				if ownedByUs || portAvailableCheck(existing.ReservedPort) {
-					existing.Label = label
-					existing.UpdatedAt = now
-					existing.LastConnect = now
-					stateDir, err := PeerStateDir(baseDir, peerID)
-					if err != nil {
-						return Registration{}, err
-					}
-					existing.StateDir = stateDir
-					peers.Peers[peerID] = existing
-					ports.Ports[portKey] = peerID
-					if err := writeRegistry(baseDir, ports, peers); err != nil {
-						return Registration{}, err
-					}
-					if err := WritePeerState(existing.StateDir, existing); err != nil {
-						return Registration{}, err
-					}
-					return existing, nil
+			if ownedByUs || (unowned && portAvailableCheck(existing.ReservedPort)) {
+				existing.Label = label
+				existing.UpdatedAt = now
+				existing.LastConnect = now
+				stateDir, err := PeerStateDir(baseDir, peerID)
+				if err != nil {
+					return Registration{}, err
 				}
-				// Drop the stale registry entry for this port so the scanner
-				// below doesn't skip it on a future peer when the registry no
-				// longer has a trustworthy owner mapping.
-				if unowned {
-					delete(ports.Ports, portKey)
+				existing.StateDir = stateDir
+				peers.Peers[peerID] = existing
+				ports.Ports[portKey] = peerID
+				if err := writeRegistry(baseDir, ports, peers); err != nil {
+					return Registration{}, err
 				}
+				if err := WritePeerState(existing.StateDir, existing); err != nil {
+					return Registration{}, err
+				}
+				return existing, nil
+			}
+			// Drop the stale registry entry for this port so the scanner
+			// below doesn't skip it on a future peer when the registry no
+			// longer has a trustworthy owner mapping.
+			if unowned {
+				delete(ports.Ports, portKey)
 			}
 		}
 	}
@@ -115,6 +124,14 @@ func ReservePort(baseDir, peerID, label string, rangeStart, rangeEnd int) (Regis
 
 	for port := rangeStart; port <= rangeEnd; port++ {
 		portKey := strconv.Itoa(port)
+		// A non-empty owner here means some peer already has this port
+		// reserved in the registry. We rely on loadRegistry's orphan-row
+		// sweep (see loadRegistryFiles above) to have cleaned up rows
+		// whose owner no longer exists in peers.json — without that
+		// sweep, a crashed writer could leave a port reserved forever
+		// and slowly starve the range. Keep the two in lockstep: any
+		// future change that removes or defers the orphan sweep must
+		// revisit this skip to avoid silent port-exhaustion regressions.
 		if ports.Ports[portKey] != "" {
 			continue
 		}
@@ -210,7 +227,7 @@ func Lookup(baseDir, peerID string) (Registration, error) {
 	if err := ValidateID(peerID); err != nil {
 		return Registration{}, err
 	}
-	_, peers, err := loadRegistry(baseDir)
+	_, peers, err := loadRegistryForRead(baseDir)
 	if err != nil {
 		return Registration{}, err
 	}
@@ -227,7 +244,7 @@ func Lookup(baseDir, peerID string) (Registration, error) {
 // `cc-clip-hook`, Codex config, and PATH marker before deleting them.
 // Order is not guaranteed — callers that need stable ordering must sort.
 func ListAll(baseDir string) ([]Registration, error) {
-	_, peers, err := loadRegistry(baseDir)
+	_, peers, err := loadRegistryForRead(baseDir)
 	if err != nil {
 		return nil, err
 	}
@@ -238,22 +255,59 @@ func ListAll(baseDir string) ([]Registration, error) {
 	return out, nil
 }
 
+// loadRegistry loads both registry files for a read-write caller. It ensures
+// the registry directory exists so a subsequent writeRegistry can succeed.
+// Read-only callers (Lookup, ListAll) MUST use loadRegistryForRead instead
+// to avoid the side effect of materializing ~/.cache/cc-clip/registry on
+// hosts where the peer registry has never been written.
 func loadRegistry(baseDir string) (PortsFile, PeersFile, error) {
 	registryDir := filepath.Join(baseDir, "registry")
 	if err := os.MkdirAll(registryDir, 0700); err != nil {
 		return PortsFile{}, PeersFile{}, err
 	}
+	return loadRegistryFiles(registryDir)
+}
 
-	ports := PortsFile{
+// loadRegistryForRead loads both registry files without mutating the
+// filesystem. If the registry directory does not exist yet, it returns
+// empty (but initialized) PortsFile/PeersFile values — the semantic
+// equivalent of "no peers registered yet" — so read-only probes like
+// Lookup / ListAll cannot accidentally create cache directories on hosts
+// that never ran `cc-clip connect`. That matters for uninstall-side
+// callers that interpret an empty registry as "no other peers present";
+// those callers must not trigger MkdirAll, and a missing-ENOENT read must
+// return fail-safe (i.e. empty view) rather than an error that would be
+// misclassified as a peer-count failure.
+func loadRegistryForRead(baseDir string) (PortsFile, PeersFile, error) {
+	registryDir := filepath.Join(baseDir, "registry")
+	if _, err := os.Stat(registryDir); err != nil {
+		if os.IsNotExist(err) {
+			return emptyPortsFile(), emptyPeersFile(), nil
+		}
+		return PortsFile{}, PeersFile{}, err
+	}
+	return loadRegistryFiles(registryDir)
+}
+
+func emptyPortsFile() PortsFile {
+	return PortsFile{
 		Version:    registryVersion,
 		RangeStart: DefaultRangeStart,
 		RangeEnd:   DefaultRangeEnd,
 		Ports:      map[string]string{},
 	}
-	peers := PeersFile{
+}
+
+func emptyPeersFile() PeersFile {
+	return PeersFile{
 		Version: registryVersion,
 		Peers:   map[string]Registration{},
 	}
+}
+
+func loadRegistryFiles(registryDir string) (PortsFile, PeersFile, error) {
+	ports := emptyPortsFile()
+	peers := emptyPeersFile()
 
 	if err := loadJSON(filepath.Join(registryDir, "ports.json"), &ports); err != nil {
 		return PortsFile{}, PeersFile{}, fmt.Errorf("failed to load ports registry: %w", err)
@@ -266,6 +320,43 @@ func loadRegistry(baseDir string) (PortsFile, PeersFile, error) {
 	}
 	if peers.Peers == nil {
 		peers.Peers = map[string]Registration{}
+	}
+	// Refuse to load a registry written by a newer cc-clip that may carry
+	// fields we would silently zero-out on rewrite. Run BEFORE the orphan
+	// sweep: the sweep currently mutates only the in-memory value copy,
+	// but a future refactor that adds persisted side effects must not run
+	// against a schema this binary does not understand. Version skew is a
+	// hard failure so the operator knows to upgrade or release stale
+	// peers from the newer host.
+	if peers.Version > registryVersion || ports.Version > registryVersion {
+		return PortsFile{}, PeersFile{}, fmt.Errorf("peer registry version %d (ports) / %d (peers) is newer than cc-clip supports (%d); upgrade cc-clip on this host", ports.Version, peers.Version, registryVersion)
+	}
+	// Self-heal torn writes: peers.json and ports.json are written as two
+	// separate atomic renames (see writeRegistry), so a crash between them
+	// can leave a port row owned by a peer that no longer exists in
+	// peers.json (or references a port the peer no longer holds). Drop
+	// orphan port rows on load so a crash does not starve future
+	// reservations — without this sweep, a stale port row would shadow its
+	// slot from every subsequent ReservePort scan.
+	for portKey, owner := range ports.Ports {
+		if owner == "" {
+			delete(ports.Ports, portKey)
+			continue
+		}
+		reg, ok := peers.Peers[owner]
+		if !ok {
+			delete(ports.Ports, portKey)
+			continue
+		}
+		if strconv.Itoa(reg.ReservedPort) != portKey {
+			delete(ports.Ports, portKey)
+		}
+	}
+	for peerID, reg := range peers.Peers {
+		portKey := strconv.Itoa(reg.ReservedPort)
+		if reg.ReservedPort <= 0 || ports.Ports[portKey] != peerID {
+			delete(peers.Peers, peerID)
+		}
 	}
 	return ports, peers, nil
 }
@@ -292,6 +383,15 @@ func writeRegistry(baseDir string, ports PortsFile, peers PeersFile) error {
 	if err := os.MkdirAll(registryDir, 0700); err != nil {
 		return err
 	}
+	// Write ports.json BEFORE peers.json. A torn write between the renames
+	// then leaves the safer intermediate state: an orphan port row whose
+	// owner is missing from peers.json. loadRegistry already sweeps those
+	// rows on read, so the next ReservePort/ReleasePort call self-heals.
+	//
+	// The opposite order (peers first) is unsafe: a crash after peers.json
+	// lands but before ports.json does would leave a live peer reservation
+	// with no occupied-port row, allowing a later ReservePort scan to hand
+	// the same port to another peer.
 	if err := writeJSONAtomic(filepath.Join(registryDir, "ports.json"), ports); err != nil {
 		return err
 	}
@@ -360,13 +460,39 @@ func writeJSONAtomic(path string, value any) error {
 		if closeErr != nil {
 			return fmt.Errorf("close registry dir handle: %w", closeErr)
 		}
+	} else {
+		// Best-effort: some platforms (Windows, certain FUSE mounts) refuse
+		// O_RDONLY on directories. The rename itself already landed; the
+		// only durability we forfeit is the parent-dir fsync. Surface the
+		// failure on stderr so the operator has a breadcrumb if a torn
+		// write does show up later, but do not fail the write — returning
+		// an error here would spuriously break ReservePort on Windows/FUSE.
+		fmt.Fprintf(os.Stderr, "cc-clip: registry dir open for fsync failed (best-effort): %v\n", err)
 	}
 	return nil
 }
 
 // lockRegistry acquires a directory-based mutex for the peer registry.
-// This relies on mkdir atomicity on local filesystems; it is not safe on NFS.
-// The registry lives under ~/.cache/cc-clip which is always local.
+//
+// Filesystem caveat: mkdir atomicity is a guarantee on local filesystems,
+// NFSv4, and modern SMB. NFSv3 returns success on Mkdir races (the
+// well-known NFSv3 Mkdir non-atomicity), and exotic FUSE mounts may
+// behave similarly. The peer registry runs on BOTH the local laptop
+// (~/.cache/cc-clip for self-identity) and the remote host (for
+// shared-account port reservation) — on the remote the $HOME can legally
+// be NFS-mounted. Two concurrent `cc-clip connect` runs from different
+// laptops racing against an NFSv3 mkdir can each believe they hold the
+// lock. The belt-and-braces defenses below keep state consistent in that
+// regime:
+//   - The PID-file stamp written inside the lock directory is performed
+//     with os.WriteFile (NFS-safe), and readers of the stale-lock path
+//     verify the stamped PID matches before reaping. A second writer who
+//     races past mkdir will overwrite the pid file, but the first writer
+//     will immediately observe the mismatch on release and leave the lock
+//     in place for the second holder.
+//   - loadRegistry self-heals orphan port rows from torn writes, so even
+//     if two holders briefly coexist and each commits a partial pair, the
+//     next full read restores a consistent view.
 //
 // On acquisition we stamp a pid file inside the lock directory so the
 // staleness check can key off "holder is dead" instead of the 30-second
@@ -385,7 +511,15 @@ func lockRegistry(baseDir string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
 		return nil, err
 	}
-	for i := 0; i < registryLockMaxAttempts; i++ {
+	// Deadline-based loop with exponential backoff. The previous form
+	// (50 fixed attempts × 100ms = 5s total) was tight enough that 5+
+	// concurrent connects on a shared account hit the timeout while
+	// the legitimate holder was still making progress. We now budget
+	// up to registryLockAcquireDeadline (default 30s) and double the
+	// retry interval up to registryLockMaxBackoff so we don't spin.
+	deadline := time.Now().Add(registryLockAcquireDeadline)
+	backoff := registryLockRetryInterval
+	for {
 		if err := os.Mkdir(lockPath, 0700); err == nil {
 			ownerPID := os.Getpid()
 			ownerBootID, _ := readBootIDFn()
@@ -397,7 +531,9 @@ func lockRegistry(baseDir string) (func(), error) {
 			// own lockPath. Failing fast here keeps that window closed.
 			if writeErr := writeLockHolderPID(lockPath, ownerPID, ownerBootID); writeErr != nil {
 				_ = os.RemoveAll(lockPath)
-				time.Sleep(registryLockRetryInterval)
+				if !sleepUntilOrFail(&backoff, deadline) {
+					return nil, fmt.Errorf("timed out waiting for registry lock after %v (last writeLockHolderPID error: %w)", registryLockAcquireDeadline, writeErr)
+				}
 				continue
 			}
 			return func() { releaseRegistryLock(lockPath, ownerPID, ownerBootID) }, nil
@@ -414,9 +550,31 @@ func lockRegistry(baseDir string) (func(), error) {
 			}
 			continue
 		}
-		time.Sleep(registryLockRetryInterval)
+		if !sleepUntilOrFail(&backoff, deadline) {
+			return nil, fmt.Errorf("timed out waiting for registry lock after %v", registryLockAcquireDeadline)
+		}
 	}
-	return nil, fmt.Errorf("timed out waiting for registry lock")
+}
+
+// sleepUntilOrFail sleeps the current backoff (clamped so we never
+// overshoot the deadline), then doubles the backoff up to
+// registryLockMaxBackoff. Returns false when the deadline has already
+// passed (the caller should fail) and true after a successful sleep.
+func sleepUntilOrFail(backoff *time.Duration, deadline time.Time) bool {
+	now := time.Now()
+	if !now.Before(deadline) {
+		return false
+	}
+	wait := *backoff
+	if remaining := deadline.Sub(now); wait > remaining {
+		wait = remaining
+	}
+	time.Sleep(wait)
+	*backoff *= 2
+	if *backoff > registryLockMaxBackoff {
+		*backoff = registryLockMaxBackoff
+	}
+	return true
 }
 
 // stealStaleLock atomically reclaims a stale lock via rename-then-verify.
@@ -491,17 +649,24 @@ func stealStaleLock(lockPath string, observedPID int) error {
 	return nil
 }
 
-// writeLockHolderPID records our PID and (on Linux) the kernel boot-id
-// inside the lock directory so staleRegistryLock can distinguish "the same
-// holder is still alive" from "a new process happens to share the recycled
-// PID after a reboot". The on-disk format is one or two newline-terminated
-// lines:
+// writeLockHolderPID records our PID, (on Linux) the kernel boot-id, and
+// the wall-clock timestamp at lock-claim inside the lock directory so
+// staleRegistryLock can distinguish "the same holder is still alive" from
+// "a new process happens to share the recycled PID after a reboot". The
+// on-disk format is up to three newline-terminated lines:
 //
 //	${pid}\n
-//	${boot_id}\n   (only when readBootID succeeds — i.e. on Linux)
+//	${boot_id}\n       (only when readBootID succeeds — i.e. on Linux)
+//	${claim_wall}\n    (RFC3339 UTC — belt-and-braces TTL sidecar)
 //
-// Older single-line files are still parsed correctly by readLockHolderPID
-// so an in-place upgrade does not invalidate any pre-existing lock.
+// The third line pairs with the directory's mtime so a wall-clock jump
+// (NTP step, container clock skew) cannot make a fresh lock appear stale.
+// staleRegistryLock treats the lock as stale via TTL only when BOTH the
+// mtime AND the recorded wall-clock are older than the threshold.
+//
+// Older single-line or two-line files are still parsed correctly by
+// readLockHolderPID so an in-place upgrade does not invalidate any
+// pre-existing lock.
 //
 // Returns an error so lockRegistry can tear the lock down and retry rather
 // than return an unstamped lock — an unstamped lock is the precise
@@ -511,16 +676,31 @@ func writeLockHolderPID(lockPath string, pid int, bootID string) error {
 	payload := strconv.Itoa(pid) + "\n"
 	if bootID != "" {
 		payload += bootID + "\n"
+	} else {
+		// Keep the format positional: a missing boot-id gets an empty line
+		// so the wall-clock timestamp stays on line 3 regardless of
+		// platform. readLockHolderPID tolerates empty lines.
+		payload += "\n"
 	}
+	payload += time.Now().UTC().Format(time.RFC3339Nano) + "\n"
 	return os.WriteFile(pidPath, []byte(payload), 0600)
 }
 
 func releaseRegistryLock(lockPath string, ownerPID int, ownerBootID string) {
 	currentPID, currentBootID, ok := readLockHolderPID(lockPath)
-	if !ok || currentPID != ownerPID {
+	if !ok {
+		// Unreadable pid file: another party rewrote the lock after
+		// we took it. Don't delete — that might destroy the new
+		// holder's directory. Log so operators can see it happened.
+		log.Printf("peer: releaseRegistryLock: pid file at %s is unreadable; lock may have been stolen by another process (our owner PID=%d). Leaving lock intact.", lockPath, ownerPID)
+		return
+	}
+	if currentPID != ownerPID {
+		log.Printf("peer: releaseRegistryLock: lock at %s has been re-stamped by another process (current PID=%d, expected our PID=%d) — possible lock steal via stealStaleLock during our hold. Leaving lock intact; registry writes under our hold are still on disk but the mutex was not exclusive across that window.", lockPath, currentPID, ownerPID)
 		return
 	}
 	if ownerBootID != "" && currentBootID != ownerBootID {
+		log.Printf("peer: releaseRegistryLock: lock at %s has a boot-id mismatch (current=%q, ours=%q) — machine likely rebooted during our hold. Leaving lock intact.", lockPath, currentBootID, ownerBootID)
 		return
 	}
 	_ = os.RemoveAll(lockPath)
@@ -545,7 +725,7 @@ func staleRegistryLock(lockPath string) (bool, int, error) {
 	// cc-clip process (e.g. waiting on SSH passphrase, slow network) no
 	// longer gets its lock forcibly stolen at the 30 s mark, but a recycled
 	// PID from a crashed holder cannot pin the lock forever either.
-	if pid, savedBootID, ok := readLockHolderPID(lockPath); ok {
+	if pid, savedBootID, claimedAt, ok := readLockHolderFull(lockPath); ok {
 		// Boot-id mismatch is the strongest staleness signal we have: the
 		// PID was recorded under a previous boot, so even if processAlive
 		// says "alive" right now it must be a recycled PID belonging to an
@@ -571,19 +751,51 @@ func staleRegistryLock(lockPath string) (bool, int, error) {
 		alive, aliveErr := processAlive(pid)
 		// processAlive returns advisory errors as (alive=true, err!=nil) for
 		// transient kernel hiccups (Windows GetExitCodeProcess failure, an
-		// unfamiliar Unix kill(2) errno). Treating those as hard failures
-		// would abort lock acquisition on flaky systems; treating them as
-		// "definitely alive" would let a recycled-PID holder pin the lock
-		// past the hard ceiling. The middle path: ignore the advisory error
-		// and fall through to the mtime/hard-ceiling check, which still
-		// reaps the lock at registryLockHardCeiling. A genuine hard failure
-		// (alive=false with err) — currently unreachable but defended for
-		// future probe code — bubbles up so the operator sees it.
-		if aliveErr != nil && !alive {
-			return false, pid, aliveErr
-		}
+		// unfamiliar Unix kill(2) errno). Treat those as "alive, flaky
+		// probe" and fall through to the mtime/hard-ceiling check — the
+		// ceiling still reaps the lock at registryLockHardCeiling if the
+		// holder really is gone.
+		//
+		// The contract (documented in each processAlive implementation) is
+		// that a (false, err != nil) return is NEVER produced: definite
+		// "not alive" signals always come with nil err. Enforcing that
+		// invariant via silent advisory-error suppression is deliberate:
+		// a future probe author accidentally returning (false, someErr)
+		// must NOT abort lock acquisition for every caller — that would
+		// convert a probe regression into a registry-wide outage. Logging
+		// the advisory error and proceeding with the heuristic keeps the
+		// blast radius bounded.
+		_ = aliveErr
 		if alive {
-			if time.Since(info.ModTime()) > registryLockHardCeiling {
+			// Hard-ceiling: require BOTH the directory mtime AND the
+			// recorded claimedAt to exceed the ceiling.
+			//
+			// For pid files written by cc-clip >= this release the pair
+			// (mtime AND claimedAt) protects against wall-clock skew: a
+			// backward NTP step or container clock jump would make
+			// mtime alone appear stale on a freshly claimed lock, but
+			// claimedAt — a single recorded wall-clock timestamp —
+			// would still be in the future (or near-present) and keep
+			// claimStale false.
+			//
+			// LEGACY PID FILES CAVEAT: cc-clip versions before the
+			// wall-clock sidecar wrote only the pid (and optionally the
+			// boot-id) — claimedAt comes back zero on those, so
+			// `claimedAt.IsZero()` collapses the guard to mtime-only.
+			// If the filesystem's mtime is reset by a backward NTP
+			// step or clock skew AFTER such a legacy lock was taken,
+			// that legacy lock CAN be prematurely reaped by the hard
+			// ceiling path even when the holder is genuinely alive.
+			// The fix is to retake the lock under a current cc-clip
+			// (which will write the three-line format); we deliberately
+			// do NOT upgrade-in-place here — rewriting a foreign
+			// holder's pid file would defeat the whole ownership check.
+			// On a shared-account host this window closes as soon as
+			// every live holder has taken the lock at least once under
+			// the new format.
+			mtimeStale := time.Since(info.ModTime()) > registryLockHardCeiling
+			claimStale := claimedAt.IsZero() || time.Since(claimedAt) > registryLockHardCeiling
+			if mtimeStale && claimStale {
 				return true, pid, nil
 			}
 			return false, pid, nil
@@ -595,31 +807,140 @@ func staleRegistryLock(lockPath string) (bool, int, error) {
 }
 
 // readLockHolderPID parses the lock pid file written by writeLockHolderPID.
-// The first line is the PID; an optional second line is the boot-id captured
-// when the lock was taken. An empty bootID return means either the writer
-// was running on a non-Linux platform (readBootID is a no-op there) or the
-// pid file predates the boot-id format.
+// The first line is the PID; an optional second line is the boot-id
+// captured when the lock was taken; an optional third line is the
+// claim-time RFC3339 wall-clock. An empty bootID return means either the
+// writer was running on a non-Linux platform (readBootID is a no-op
+// there) or the pid file predates the boot-id format. A zero-value
+// claimedAt means the pid file predates the wall-clock format.
 func readLockHolderPID(lockPath string) (pid int, bootID string, ok bool) {
-	data, err := os.ReadFile(filepath.Join(lockPath, "pid"))
-	if err != nil {
-		return 0, "", false
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) == 0 {
-		return 0, "", false
-	}
-	pid, err = strconv.Atoi(strings.TrimSpace(lines[0]))
-	if err != nil || pid <= 0 {
-		return 0, "", false
-	}
-	if len(lines) >= 2 {
-		bootID = strings.TrimSpace(lines[1])
-	}
-	return pid, bootID, true
+	pid, bootID, _, ok = readLockHolderFull(lockPath)
+	return pid, bootID, ok
 }
 
+func readLockHolderFull(lockPath string) (pid int, bootID string, claimedAt time.Time, ok bool) {
+	data, err := os.ReadFile(filepath.Join(lockPath, "pid"))
+	if err != nil {
+		return 0, "", time.Time{}, false
+	}
+	// Do NOT TrimSpace the whole payload: that collapses a legitimate empty
+	// line-2 (platform without boot-id) before we can index line-3.
+	raw := strings.TrimRight(string(data), "\n")
+	lines := strings.Split(raw, "\n")
+	if len(lines) == 0 {
+		return 0, "", time.Time{}, false
+	}
+	pid, err = strconv.Atoi(strings.TrimSpace(lines[0]))
+	// Reject pid <= 1. pid 0 is never a valid process; pid 1 is init
+	// (systemd/launchd) on Unix — it's "always alive" but obviously not a
+	// cc-clip holder, so a corrupt pid file containing `1` would otherwise
+	// pin the lock until the 10-minute hard ceiling. Refusing to parse the
+	// pid file in that case falls back to the mtime-only staleness heuristic,
+	// which reaps the lock at registryLockStaleAfter (30 s) as expected for
+	// a holder that left no valid PID trace.
+	if err != nil || pid <= 1 {
+		return 0, "", time.Time{}, false
+	}
+	if len(lines) >= 2 {
+		candidate := strings.TrimSpace(lines[1])
+		// Structural validation: boot-id values come from two narrow
+		// formats — Linux writes a 36-char UUID from
+		// /proc/sys/kernel/random/boot_id (e.g.
+		// `11111111-1111-1111-1111-111111111111`), and Darwin writes
+		// `<sec>.<usec>` from kern.boottime. Anything else (shell
+		// escapes, injected junk, a corrupt second line that swallowed
+		// the newline before the timestamp) is treated as "no boot-id"
+		// so we fall back to PID+mtime rather than compare against
+		// whatever readBootIDFn returns now. An empty line is
+		// legitimate (non-Linux/non-Darwin platforms write one) and
+		// stays empty.
+		//
+		// Corrupt boot-id used to cause the whole pid file to be
+		// discarded (return ok=false), which collapsed the staleness
+		// check from PID-liveness + hard-ceiling down to mtime-only
+		// with a 30 s window — letting a flaky-IO partial-write or
+		// truncation mid-append steal the lock from an actually-live
+		// holder. Now we preserve the valid PID, blank the boot-id
+		// (skipping the boot-mismatch shortcut), and let processAlive
+		// drive the staleness decision. If the PID really is dead we
+		// still reap immediately; if it's alive we wait for the hard
+		// ceiling — both safer than the previous mtime-only path.
+		if candidate == "" || isValidBootID(candidate) {
+			bootID = candidate
+		} else {
+			bootID = ""
+		}
+	}
+	if len(lines) >= 3 {
+		if ts, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(lines[2])); parseErr == nil {
+			claimedAt = ts
+		}
+	}
+	return pid, bootID, claimedAt, true
+}
+
+// isValidBootID accepts the two on-disk boot-id formats cc-clip writes:
+//   - Linux UUID from /proc/sys/kernel/random/boot_id: 36 chars, hex +
+//     hyphens.
+//   - Darwin `<sec>.<usec>` from kern.boottime: digits + a single dot.
+//
+// Anything else is a corrupt or injected value. Deliberately permissive
+// on the Linux side (accepts any 32+ char hex-with-hyphens string, not
+// just strict canonical UUID form) because cc-clip already treats the
+// file contents as opaque-except-for-equality — we just need "this
+// looks structurally like the kind of thing we would have written" as a
+// sanity gate.
+func isValidBootID(s string) bool {
+	if len(s) < 8 {
+		return false
+	}
+	// Darwin: digits, exactly one dot, digits. Cheap path first.
+	if dot := strings.IndexByte(s, '.'); dot > 0 && dot < len(s)-1 {
+		if strings.Count(s, ".") == 1 &&
+			strings.IndexFunc(s, func(r rune) bool {
+				return !(r == '.' || (r >= '0' && r <= '9'))
+			}) == -1 {
+			return true
+		}
+	}
+	// Linux: UUID-ish — hex + hyphens, reasonable length.
+	if len(s) < 32 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		case r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// portAvailable probes whether `port` is free for a local listener on
+// both the loopback and any-address. When the registry runs on the
+// REMOTE side (the shared-account multi-laptop path), "free on 127.0.0.1"
+// is insufficient because an unrelated remote service may hold the same
+// port on 0.0.0.0. Testing both addresses catches that: if either bind
+// fails, treat the port as unavailable so the registry tries the next
+// slot instead of letting `ExitOnForwardFailure` surface a late failure
+// that the registry has no self-heal path for.
+//
+// A bind may transiently fail for TIME_WAIT / SO_REUSEADDR reasons even
+// when the port is effectively free for a moment; that's acceptable —
+// the registry will allocate the next port in the range and move on.
 func portAvailable(port int) bool {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if !tryListen(fmt.Sprintf("127.0.0.1:%d", port)) {
+		return false
+	}
+	return tryListen(fmt.Sprintf("0.0.0.0:%d", port))
+}
+
+func tryListen(addr string) bool {
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return false
 	}

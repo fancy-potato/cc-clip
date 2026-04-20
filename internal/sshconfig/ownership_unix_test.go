@@ -29,14 +29,18 @@ func TestApplyOwnershipReturnsNilWhenChownSucceeds(t *testing.T) {
 	}
 }
 
-// TestApplyOwnershipIgnoresEPERMWhenUIDMatches pins the P1-1 review fix. On
-// Linux, chown(uid, supplementary_gid) fails EPERM for a non-privileged
-// process even when uid == euid. If we propagated that EPERM we would abort
-// the atomic rewrite in the common multi-user-lab scenario (~/.ssh/config
-// has a gid other than the user's primary gid). The fallback accepts the
-// gid drift in this case because the temp file was created with our egid
-// so ownership is still user-readable; the alternative — aborting the
-// rewrite — would disable the entire SetEnv feature for those users.
+// TestApplyOwnershipIgnoresEPERMWhenUIDMatches pins the P1-1 review fix
+// (and the P3-D narrowing to EPERM-ONLY swallow). On Linux,
+// chown(uid, supplementary_gid) fails EPERM for a non-privileged
+// process even when uid == euid. If we propagated that EPERM we would
+// abort the atomic rewrite in the common multi-user-lab scenario
+// (~/.ssh/config has a gid other than the user's primary gid). The
+// fallback accepts the gid drift in this case because the temp file
+// was created with our egid so ownership is still user-readable; the
+// alternative — aborting the rewrite — would disable the entire
+// SetEnv feature for those users. After P3-D the swallow is strictly
+// scoped to errno EPERM — every other error class from the fallback
+// gid-only chown propagates, see TestApplyOwnershipPropagatesNonEPERMErrors.
 func TestApplyOwnershipIgnoresEPERMWhenUIDMatches(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file")
@@ -86,5 +90,43 @@ func TestApplyOwnershipPropagatesEPERMWhenUIDDiffers(t *testing.T) {
 	}
 	if !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("expected EPERM, got %v", err)
+	}
+}
+
+// TestApplyOwnershipPropagatesNonEPERMErrors pins P3-D: applyOwnership
+// must only swallow errno EPERM. Every other errno class from either
+// the primary chown or the gid-only fallback (EIO, ENOENT, EROFS, …)
+// indicates a real filesystem problem and must propagate — otherwise
+// writeAtomic would rename a temp file whose ownership is wrong in a
+// way we never diagnosed.
+//
+// We cover this at the primary-chown level by pointing applyOwnership
+// at a non-existent path: the first os.Chown returns ENOENT, not
+// EPERM, so the function must NOT enter the EPERM-fallback branch —
+// it must propagate the ENOENT directly. A regression that widened
+// the EPERM mask to "any err" would silently turn this into a nil
+// return and fail the test.
+//
+// The gid-only fallback's non-EPERM branch is hard to trigger
+// deterministically (the only way to reach it is an EPERM from the
+// combined chown followed by a non-EPERM from the gid-only chown on
+// the same path, which would require racing a concurrent unlink). The
+// code path mirrors the primary chown's errors.Is(err, syscall.EPERM)
+// gate exactly, so the primary-chown coverage plus direct code review
+// pins the fallback's behavior.
+func TestApplyOwnershipPropagatesNonEPERMErrors(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "does-not-exist")
+	// No WriteFile — path doesn't exist. The primary os.Chown will
+	// return ENOENT (wrapped by os).
+	err := applyOwnership(missing, os.Geteuid(), os.Getegid())
+	if err == nil {
+		t.Fatal("expected ENOENT from chown on missing path, got nil")
+	}
+	if errors.Is(err, syscall.EPERM) {
+		t.Fatalf("expected non-EPERM error, got EPERM: %v", err)
+	}
+	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected ENOENT, got %v", err)
 	}
 }

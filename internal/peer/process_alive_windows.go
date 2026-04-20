@@ -9,7 +9,19 @@ import (
 
 const (
 	windowsProcessStillActive = 259
-	windowsErrInvalidParam    = syscall.Errno(87)
+	// windowsErrInvalidParameter is ERROR_INVALID_PARAMETER (87). OpenProcess
+	// returns this errno for a nonexistent PID (the pid was never allocated
+	// or has been fully reaped), which is the definitive "not alive" signal
+	// we want to short-circuit the stale-lock wait on.
+	windowsErrInvalidParameter = syscall.Errno(87)
+	// windowsErrInvalidHandle is ERROR_INVALID_HANDLE (6). It is NOT what
+	// OpenProcess returns for a missing pid (OpenProcess uses
+	// ERROR_INVALID_PARAMETER for that), but it can surface on the
+	// GetExitCodeProcess / CloseHandle paths when an already-closed or
+	// malformed handle is passed — treat it as a definite "not alive"
+	// there as well so a transient kernel quirk does not pin the registry
+	// lock until the 10-minute hard ceiling hits.
+	windowsErrInvalidHandle = syscall.Errno(6)
 
 	// PROCESS_QUERY_LIMITED_INFORMATION is the canonical "does this pid refer
 	// to a live process?" primitive on Vista+; unlike PROCESS_QUERY_INFORMATION
@@ -46,9 +58,28 @@ const (
 // from a flaky kernel call would let a recycled-PID holder pin the lock
 // forever once the original holder crashed.
 func processAlive(pid int) (bool, error) {
+	// Defense-in-depth: pid 0 is the System Idle Process on Windows and
+	// is never a cc-clip holder. OpenProcess with pid=0 can return a
+	// handle in some configurations, so we short-circuit here to avoid
+	// falsely reporting the idle process as a live holder. pid 1 is also
+	// rejected for symmetry with the Unix variants, where pid 1 is init.
+	// readLockHolderFull already rejects these, but the per-platform
+	// guard protects against a future caller that bypasses the pid-file
+	// parser.
+	if pid <= 1 {
+		return false, nil
+	}
 	handle, err := syscall.OpenProcess(windowsProcessQueryLimitedInformation, false, uint32(pid))
 	if err != nil {
-		if errors.Is(err, windowsErrInvalidParam) {
+		// OpenProcess's "no such pid" errno is ERROR_INVALID_PARAMETER (87).
+		// ERROR_INVALID_HANDLE (6) is not what OpenProcess uses here, but we
+		// tolerate it as a definite "not alive" hint too for robustness
+		// against edge cases (e.g. a pid that straddles a process-table
+		// reshuffle). Anything else is an advisory error.
+		if errors.Is(err, windowsErrInvalidParameter) {
+			return false, nil
+		}
+		if errors.Is(err, windowsErrInvalidHandle) {
 			return false, nil
 		}
 		return true, err
@@ -57,6 +88,12 @@ func processAlive(pid int) (bool, error) {
 
 	var exitCode uint32
 	if err := syscall.GetExitCodeProcess(handle, &exitCode); err != nil {
+		// ERROR_INVALID_HANDLE on GetExitCodeProcess means the handle we just
+		// opened was invalidated out from under us (extremely rare, but the
+		// conservative read is "process gone").
+		if errors.Is(err, windowsErrInvalidHandle) {
+			return false, nil
+		}
 		return true, err
 	}
 	return exitCode == windowsProcessStillActive, nil

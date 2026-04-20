@@ -2,6 +2,7 @@ package peer
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 const (
@@ -20,6 +24,13 @@ const (
 
 var labelSanitizer = regexp.MustCompile(`[^a-z0-9]+`)
 var peerIDValidator = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// loadLocalIdentityLabelLogOnce gates the stderr warning emitted when
+// LoadLocalIdentity hits a hard I/O error reading local-peer-label.
+// Callers that invoke LoadLocalIdentity in a loop (status refresh, tunnel
+// inspector polls, etc.) would otherwise spam a well-known misconfig
+// once per call — once per process is the right frequency for operators.
+var loadLocalIdentityLabelLogOnce sync.Once
 
 // ErrLocalIdentityNotFound reports that the local peer identity files are
 // missing or incomplete. Bare `cc-clip uninstall --peer` uses this sentinel
@@ -61,6 +72,13 @@ func BaseDir() (string, error) {
 	return dir, nil
 }
 
+// BaseDirPath returns the cc-clip cache path without creating it. Read-only
+// callers should prefer this over BaseDir so status/list probes do not
+// materialize ~/.cache/cc-clip as a side effect.
+func BaseDirPath() (string, error) {
+	return baseDirPath()
+}
+
 // baseDirPath returns the cc-clip cache path without creating the directory.
 // LoadLocalIdentity (and any other strictly read-only caller) goes through
 // this helper so asking "what is the local peer id?" does not have the side
@@ -69,7 +87,7 @@ func BaseDir() (string, error) {
 // already gone, probing for the identity must fail with
 // ErrLocalIdentityNotFound rather than silently recreate the directory.
 func baseDirPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return "", err
 	}
@@ -91,8 +109,34 @@ func PeerStateDir(baseDir, peerID string) (string, error) {
 	return filepath.Join(baseDir, "peers", peerID), nil
 }
 
+// AliasForHost returns the deterministic local alias cc-clip uses for a
+// (host, label) pair. Distinct `host` inputs that sanitize to the same
+// label base (`user@box` vs `user-box`) would collide on the sanitized
+// form alone, so we fold a short SHA-256 fingerprint of the ORIGINAL
+// host into the alias. The fingerprint is 16 hex chars (64 bits) —
+// previously 8 hex chars (32 bits) but widened because birthday-
+// collision odds at 32 bits become non-negligible once a user accrues
+// hundreds of remote hosts across their career (p ~ 10^-4 at 10k hosts).
+// The alias is per-laptop local state, not a security boundary — the
+// goal is avoiding accidental cross-routing, not defending against
+// deliberate preimage attacks. An empty host gets an empty fingerprint,
+// preserving the legacy "peer" fallback for tests.
 func AliasForHost(host, label string) string {
-	return fmt.Sprintf("%s-cc-clip-%s", aliasBaseHost(host), sanitizeLabel(label))
+	trimmed := strings.TrimSpace(host)
+	base := aliasBaseHost(trimmed)
+	fingerprint := hostFingerprint(trimmed)
+	if fingerprint != "" {
+		base = base + "-" + fingerprint
+	}
+	return fmt.Sprintf("%s-cc-clip-%s", base, sanitizeLabel(label))
+}
+
+func hostFingerprint(host string) string {
+	if host == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(host))
+	return hex.EncodeToString(sum[:8])
 }
 
 func aliasBaseHost(host string) string {
@@ -179,6 +223,19 @@ func LoadLocalIdentity() (Identity, error) {
 	case err == nil && label == "":
 		label = ""
 	default:
+		// TODO: consider surfacing this via a package-level logger once
+		// one exists. A hard I/O error on local-peer-label (e.g. the
+		// file has been replaced by a directory) is intentionally NOT
+		// fatal here — the self-targeted uninstall path only needs the
+		// ID — but a silent swallow hides the misconfiguration from
+		// operators. Pinned by TestLoadLocalIdentitySwallowsLabelReadErrors.
+		// Wrapped in sync.Once: callers that invoke LoadLocalIdentity
+		// in a loop (e.g. status refresh) would otherwise spam this line
+		// on every poll. Once per process is enough to surface the
+		// misconfig without drowning the operator's terminal.
+		loadLocalIdentityLabelLogOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "cc-clip: local-peer-label read error (non-fatal, logged once): %v\n", err)
+		})
 		label = ""
 	}
 
@@ -228,8 +285,14 @@ func WritePeerState(stateDir string, reg Registration) error {
 	return os.WriteFile(filepath.Join(stateDir, "state.json"), append(data, '\n'), 0600)
 }
 
+// RFC3339Now returns the current UTC time formatted with nanosecond
+// precision. Unified on time.RFC3339Nano so the registry entries
+// (CreatedAt/UpdatedAt/LastConnect) and the lock-holder claim-time all
+// share a single format — simplifies diffing state files and avoids
+// accidental precision mismatches between equal-looking timestamps that
+// round differently.
 func RFC3339Now() string {
-	return time.Now().UTC().Format(time.RFC3339)
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func readTrimmedFile(path string) (string, error) {

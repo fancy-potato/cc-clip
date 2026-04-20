@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -31,6 +32,7 @@ import (
 	"github.com/shunmei/cc-clip/internal/sshconfig"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -58,6 +60,33 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatalf("ReadAll: %v", err)
 	}
 	return string(out)
+}
+
+type fakeUserhomeResolver struct {
+	lookup func(string) (*user.User, error)
+	home   func() (string, error)
+	sudo   func() bool
+}
+
+func (f fakeUserhomeResolver) LookupUser(name string) (*user.User, error) {
+	if f.lookup == nil {
+		return nil, fmt.Errorf("unexpected LookupUser(%q)", name)
+	}
+	return f.lookup(name)
+}
+
+func (f fakeUserhomeResolver) UserHomeDir() (string, error) {
+	if f.home == nil {
+		return "", errors.New("unexpected UserHomeDir call")
+	}
+	return f.home()
+}
+
+func (f fakeUserhomeResolver) IsSudoRoot() bool {
+	if f.sudo == nil {
+		return false
+	}
+	return f.sudo()
 }
 
 func TestStopLocalProcessDoesNotKillUnexpectedCommand(t *testing.T) {
@@ -136,6 +165,177 @@ func helperSleepProcess(t *testing.T) *exec.Cmd {
 	}
 	t.Cleanup(func() { _ = stdin.Close() })
 	return cmd
+}
+
+func TestEnsureSetupLocalDaemonInstallsServiceWhenDaemonAlreadyRunningWithoutAutostart(t *testing.T) {
+	t.Setenv("CC_CLIP_PROBE_TIMEOUT_MS", "1")
+
+	installCalled := 0
+	sleepCalled := 0
+	lines, err := ensureSetupLocalDaemon(18339, setupLocalDaemonOps{
+		goos:  "darwin",
+		probe: func(addr string, timeout time.Duration) error { return nil },
+		serviceStatus: func() (bool, error) {
+			return false, nil
+		},
+		executable: func() (string, error) {
+			return "/tmp/cc-clip", nil
+		},
+		evalSymlinks: func(path string) (string, error) {
+			if path != "/tmp/cc-clip" {
+				t.Fatalf("evalSymlinks path = %q, want /tmp/cc-clip", path)
+			}
+			return "/opt/homebrew/bin/cc-clip", nil
+		},
+		install: func(path string, port int) error {
+			installCalled++
+			if path != "/opt/homebrew/bin/cc-clip" {
+				t.Fatalf("install path = %q, want /opt/homebrew/bin/cc-clip", path)
+			}
+			if port != 18339 {
+				t.Fatalf("install port = %d, want 18339", port)
+			}
+			return nil
+		},
+		sleep: func(d time.Duration) {
+			sleepCalled++
+			if d != 500*time.Millisecond {
+				t.Fatalf("sleep duration = %v, want 500ms", d)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("ensureSetupLocalDaemon() error = %v", err)
+	}
+	if installCalled != 1 {
+		t.Fatalf("install called %d times, want 1", installCalled)
+	}
+	if sleepCalled != 1 {
+		t.Fatalf("sleep called %d times, want 1", sleepCalled)
+	}
+	wantLines := []string{
+		"      daemon already running on :18339",
+		"      auto-start not configured; installing service",
+		"      launchd service installed and started",
+	}
+	if !reflect.DeepEqual(lines, wantLines) {
+		t.Fatalf("lines = %#v, want %#v", lines, wantLines)
+	}
+}
+
+func TestEnsureSetupLocalDaemonSkipsInstallWhenDaemonAlreadyRunningAndAutostartConfigured(t *testing.T) {
+	t.Setenv("CC_CLIP_PROBE_TIMEOUT_MS", "1")
+
+	lines, err := ensureSetupLocalDaemon(18339, setupLocalDaemonOps{
+		goos:  "darwin",
+		probe: func(addr string, timeout time.Duration) error { return nil },
+		serviceStatus: func() (bool, error) {
+			return true, nil
+		},
+		executable: func() (string, error) {
+			t.Fatal("executable should not be called")
+			return "", nil
+		},
+		evalSymlinks: func(path string) (string, error) {
+			t.Fatal("evalSymlinks should not be called")
+			return "", nil
+		},
+		install: func(path string, port int) error {
+			t.Fatal("install should not be called")
+			return nil
+		},
+		sleep: func(d time.Duration) {
+			t.Fatal("sleep should not be called")
+		},
+	})
+	if err != nil {
+		t.Fatalf("ensureSetupLocalDaemon() error = %v", err)
+	}
+	wantLines := []string{"      daemon already running on :18339"}
+	if !reflect.DeepEqual(lines, wantLines) {
+		t.Fatalf("lines = %#v, want %#v", lines, wantLines)
+	}
+}
+
+func TestEnsureSetupLocalDaemonInstallsServiceWhenDaemonNotRunningOnDarwin(t *testing.T) {
+	t.Setenv("CC_CLIP_PROBE_TIMEOUT_MS", "1")
+
+	installCalled := 0
+	lines, err := ensureSetupLocalDaemon(18339, setupLocalDaemonOps{
+		goos: "darwin",
+		probe: func(addr string, timeout time.Duration) error {
+			return errors.New("connection refused")
+		},
+		serviceStatus: func() (bool, error) {
+			t.Fatal("serviceStatus should not be called")
+			return false, nil
+		},
+		executable: func() (string, error) {
+			return "/tmp/cc-clip", nil
+		},
+		evalSymlinks: func(path string) (string, error) {
+			return path, nil
+		},
+		install: func(path string, port int) error {
+			installCalled++
+			return nil
+		},
+		sleep: func(d time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("ensureSetupLocalDaemon() error = %v", err)
+	}
+	if installCalled != 1 {
+		t.Fatalf("install called %d times, want 1", installCalled)
+	}
+	wantLines := []string{"      launchd service installed and started"}
+	if !reflect.DeepEqual(lines, wantLines) {
+		t.Fatalf("lines = %#v, want %#v", lines, wantLines)
+	}
+}
+
+func TestEnsureSetupLocalDaemonInstallsServiceWhenDaemonAlreadyRunningAndStatusCheckErrors(t *testing.T) {
+	t.Setenv("CC_CLIP_PROBE_TIMEOUT_MS", "1")
+
+	installCalled := 0
+	lines, err := ensureSetupLocalDaemon(18339, setupLocalDaemonOps{
+		goos:  "windows",
+		probe: func(addr string, timeout time.Duration) error { return nil },
+		serviceStatus: func() (bool, error) {
+			return false, errors.New("not installed")
+		},
+		executable: func() (string, error) {
+			return `C:\cc-clip.exe`, nil
+		},
+		evalSymlinks: func(path string) (string, error) {
+			return path, nil
+		},
+		install: func(path string, port int) error {
+			installCalled++
+			if path != `C:\cc-clip.exe` {
+				t.Fatalf("install path = %q, want %q", path, `C:\cc-clip.exe`)
+			}
+			if port != 18339 {
+				t.Fatalf("install port = %d, want 18339", port)
+			}
+			return nil
+		},
+		sleep: func(d time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("ensureSetupLocalDaemon() error = %v", err)
+	}
+	if installCalled != 1 {
+		t.Fatalf("install called %d times, want 1", installCalled)
+	}
+	wantLines := []string{
+		"      daemon already running on :18339",
+		"      auto-start not configured; installing service",
+		"      scheduled task installed and started",
+	}
+	if !reflect.DeepEqual(lines, wantLines) {
+		t.Fatalf("lines = %#v, want %#v", lines, wantLines)
+	}
 }
 
 func TestReleaseVersion(t *testing.T) {
@@ -400,43 +600,87 @@ func TestRunShimUninstallWithHostSkipsLocalShim(t *testing.T) {
 	}
 }
 
-func TestRunShimUninstallWithHostPreservesLocalSetEnvBlockWhenRemoteCleanupFails(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	prevAdvisor := legacyManagedBlockAdvisor
-	legacyManagedBlockAdvisor = func(string) string { return "" }
-	t.Cleanup(func() { legacyManagedBlockAdvisor = prevAdvisor })
-
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0o700); err != nil {
-		t.Fatalf("mkdir .ssh: %v", err)
-	}
+// TestRunShimUninstallDoesNotTouchSSHConfig pins the invariant that
+// `runShimUninstall` (the host-scoped uninstall path, NOT --peer) MUST NOT
+// modify ~/.ssh/config under ANY combination of remote cleanup success or
+// failure. Per AGENTS.md the only paths permitted to remove the
+// `# >>> cc-clip SetEnv … >>>` marker block are --peer self-release
+// (`cmdUninstallPeer`) and the equivalent `--host H --peer` flow. A future
+// refactor that added `removeLaptopSSHConfigSetEnv(host)` to runShimUninstall
+// would break the multi-laptop contract: it would delete one laptop's per-peer
+// SSH routing whenever the user ran a host-scoped uninstall on a different
+// laptop.
+//
+// Both the success and failure remote-cleanup branches are exercised here —
+// the previous test only ran the failure branch, which left half the
+// invariant unpinned (a regression that touched ssh_config only on the
+// success path would have slipped through).
+func TestRunShimUninstallDoesNotTouchSSHConfig(t *testing.T) {
 	original := `Host example
   HostName example.com
   # >>> cc-clip SetEnv (do not edit) >>>
   SetEnv CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/me/.cache/cc-clip/peers/peer-a
   # <<< cc-clip SetEnv (do not edit) <<<
 `
-	configPath := filepath.Join(sshDir, "config")
-	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
-		t.Fatalf("write ssh config: %v", err)
+	cases := []struct {
+		name        string
+		remoteError error
+	}{
+		{"remote-cleanup-succeeds", nil},
+		{"remote-cleanup-fails", errors.New("ssh down")},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
 
-	err := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
-		uninstallLocalShim: func(shim.Target, string) error { return nil },
-		removeRemotePath:   func(string) error { return errors.New("ssh down") },
-	})
-	if err != nil {
-		t.Fatalf("runShimUninstall returned error: %v", err)
-	}
+			prevAdvisor := legacyManagedBlockAdvisor
+			legacyManagedBlockAdvisor = func(string) string { return "" }
+			t.Cleanup(func() { legacyManagedBlockAdvisor = prevAdvisor })
 
-	got, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("read ssh config: %v", err)
-	}
-	if string(got) != original {
-		t.Fatalf("local SetEnv block should be preserved on remote failure:\n--- got\n%s\n--- want\n%s", got, original)
+			sshDir := filepath.Join(home, ".ssh")
+			if err := os.MkdirAll(sshDir, 0o700); err != nil {
+				t.Fatalf("mkdir .ssh: %v", err)
+			}
+			configPath := filepath.Join(sshDir, "config")
+			if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
+				t.Fatalf("write ssh config: %v", err)
+			}
+			beforeStat, err := os.Stat(configPath)
+			if err != nil {
+				t.Fatalf("stat ssh config: %v", err)
+			}
+
+			runErr := runShimUninstall(shim.TargetXclip, "/tmp/local-bin", "example", uninstallOps{
+				uninstallLocalShim: func(shim.Target, string) error { return nil },
+				removeRemotePath: func(string) error {
+					return tc.remoteError
+				},
+			})
+			if runErr != nil {
+				t.Fatalf("runShimUninstall returned error: %v", runErr)
+			}
+
+			got, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatalf("read ssh config: %v", err)
+			}
+			if string(got) != original {
+				t.Fatalf("ssh config must be byte-identical:\n--- got\n%s\n--- want\n%s", got, original)
+			}
+			afterStat, err := os.Stat(configPath)
+			if err != nil {
+				t.Fatalf("stat ssh config: %v", err)
+			}
+			// Both ModTime *and* size must match — runShimUninstall must
+			// not have opened the file for write at all.
+			if !beforeStat.ModTime().Equal(afterStat.ModTime()) {
+				t.Fatalf("ssh config mtime must not change: before=%v after=%v", beforeStat.ModTime(), afterStat.ModTime())
+			}
+			if beforeStat.Size() != afterStat.Size() {
+				t.Fatalf("ssh config size must not change: before=%d after=%d", beforeStat.Size(), afterStat.Size())
+			}
+		})
 	}
 }
 
@@ -690,6 +934,122 @@ func TestPostGenericNotificationDeliversExpectedPayload(t *testing.T) {
 	}
 }
 
+func TestRunCmdNotifySoundRequiresTerminalNotifier(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("notify-sound is only supported on macOS")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	err := runCmdNotifySound("Glass", cmdNotifySoundDeps{
+		lookPath: func(string) (string, error) {
+			return "", errors.New("not found")
+		},
+		writeSound: func(string) error {
+			t.Fatal("writeSound should not be called when terminal-notifier is missing")
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("expected missing terminal-notifier error")
+	}
+	if !strings.Contains(err.Error(), "brew install terminal-notifier") {
+		t.Fatalf("expected install hint, got %v", err)
+	}
+}
+
+func TestRunCmdNotifySoundPersistsSound(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("notify-sound is only supported on macOS")
+	}
+	t.Setenv("HOME", t.TempDir())
+
+	stdout := captureStdout(t, func() {
+		if err := runCmdNotifySound("Glass", cmdNotifySoundDeps{
+			lookPath: func(string) (string, error) {
+				return "/opt/homebrew/bin/terminal-notifier", nil
+			},
+			writeSound: daemon.WriteNotificationSound,
+		}); err != nil {
+			t.Fatalf("runCmdNotifySound: %v", err)
+		}
+	})
+
+	got, err := daemon.ReadNotificationSound()
+	if err != nil {
+		t.Fatalf("ReadNotificationSound: %v", err)
+	}
+	if got != "Glass" {
+		t.Fatalf("sound = %q, want %q", got, "Glass")
+	}
+	if !strings.Contains(stdout, `Set cc-clip notification sound to "Glass"`) {
+		t.Fatalf("stdout = %q, want success message", stdout)
+	}
+}
+
+func TestRunCmdNotifySoundClearsSound(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("notify-sound is only supported on macOS")
+	}
+	t.Setenv("HOME", t.TempDir())
+	if err := daemon.WriteNotificationSound("Ping"); err != nil {
+		t.Fatalf("seed WriteNotificationSound: %v", err)
+	}
+
+	stdout := captureStdout(t, func() {
+		if err := runCmdNotifySound("off", cmdNotifySoundDeps{
+			lookPath: func(string) (string, error) {
+				return "/opt/homebrew/bin/terminal-notifier", nil
+			},
+			writeSound: daemon.WriteNotificationSound,
+		}); err != nil {
+			t.Fatalf("runCmdNotifySound: %v", err)
+		}
+	})
+
+	got, err := daemon.ReadNotificationSound()
+	if err != nil {
+		t.Fatalf("ReadNotificationSound: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("sound = %q, want empty after off", got)
+	}
+	if !strings.Contains(stdout, "Disabled terminal-notifier sound") {
+		t.Fatalf("stdout = %q, want disabled message", stdout)
+	}
+}
+
+func TestRunCmdNotifySoundClearsSoundWithoutTerminalNotifier(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("notify-sound is only supported on macOS")
+	}
+	t.Setenv("HOME", t.TempDir())
+	if err := daemon.WriteNotificationSound("Ping"); err != nil {
+		t.Fatalf("seed WriteNotificationSound: %v", err)
+	}
+
+	stdout := captureStdout(t, func() {
+		if err := runCmdNotifySound("off", cmdNotifySoundDeps{
+			lookPath: func(string) (string, error) {
+				return "", errors.New("not found")
+			},
+			writeSound: daemon.WriteNotificationSound,
+		}); err != nil {
+			t.Fatalf("runCmdNotifySound: %v", err)
+		}
+	})
+
+	got, err := daemon.ReadNotificationSound()
+	if err != nil {
+		t.Fatalf("ReadNotificationSound: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("sound = %q, want empty after off", got)
+	}
+	if !strings.Contains(stdout, "Disabled terminal-notifier sound") {
+		t.Fatalf("stdout = %q, want disabled message", stdout)
+	}
+}
+
 func TestClaudeHookConfigJSONIncludesNotificationAndStop(t *testing.T) {
 	cfg := claudeHookConfigJSON()
 	if !strings.Contains(cfg, `"Notification"`) {
@@ -862,6 +1222,27 @@ func TestLoadIdentityForUninstallPeerExplicitPeerToleratesMissingIdentity(t *tes
 	}
 	if ident != (peer.Identity{}) {
 		t.Fatalf("ident = %#v, want zero identity when local identity is absent", ident)
+	}
+}
+
+func TestLocalPeerRegistrationFailsClosedWithoutIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	reg, err := localPeerRegistration(nil, "~/.local/bin/cc-clip")
+	if !errors.Is(err, peer.ErrLocalIdentityNotFound) {
+		t.Fatalf("err = %v, want ErrLocalIdentityNotFound", err)
+	}
+	if reg != nil {
+		t.Fatalf("reg = %#v, want nil when local identity is missing", reg)
+	}
+
+	baseDir, baseErr := peer.BaseDir()
+	if baseErr != nil {
+		t.Fatalf("BaseDir: %v", baseErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(baseDir, "local-peer-id")); !os.IsNotExist(statErr) {
+		t.Fatalf("localPeerRegistration should not create local identity, stat err = %v", statErr)
 	}
 }
 
@@ -1644,6 +2025,89 @@ func TestCodexCleanupStateDirsDeduplicatesLegacyFallback(t *testing.T) {
 	}
 }
 
+func TestCodexCleanupStateDirsWithLocalIdentityFallbackAddsPeerCodexDir(t *testing.T) {
+	prev := loadLocalPeerIdentity
+	t.Cleanup(func() { loadLocalPeerIdentity = prev })
+	loadLocalPeerIdentity = func() (peer.Identity, error) {
+		return peer.Identity{ID: "peer-a"}, nil
+	}
+
+	got := codexCleanupStateDirsWithLocalIdentityFallback(nil, errors.New("remote lookup failed"))
+	want := []string{
+		legacyCodexStateDir,
+		"~/.cache/cc-clip/peers/peer-a/codex",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected cleanup state dirs %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cleanup state dirs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCodexCleanupStateDirsWithLocalIdentityFallbackPreservesExplicitPeerState(t *testing.T) {
+	prev := loadLocalPeerIdentity
+	t.Cleanup(func() { loadLocalPeerIdentity = prev })
+	loadLocalPeerIdentity = func() (peer.Identity, error) {
+		return peer.Identity{ID: "peer-b"}, nil
+	}
+
+	reg := &peer.Registration{PeerID: "peer-a", StateDir: "~/.cache/cc-clip/peers/peer-a"}
+	got := codexCleanupStateDirsWithLocalIdentityFallback(reg, nil)
+	want := []string{
+		legacyCodexStateDir,
+		"~/.cache/cc-clip/peers/peer-a/codex",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected cleanup state dirs %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cleanup state dirs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCmdUninstallCodexLocalSkipsRelativeCleanupWhenHomeLookupFails(t *testing.T) {
+	prevDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	cwd := t.TempDir()
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if chdirErr := os.Chdir(prevDir); chdirErr != nil {
+			t.Fatalf("restore cwd: %v", chdirErr)
+		}
+	})
+
+	userhome.SetResolverForTest(t, fakeUserhomeResolver{
+		home: func() (string, error) {
+			return "", errors.New("boom")
+		},
+	})
+
+	relativeStateDir := filepath.Join(cwd, ".cache", "cc-clip", "codex")
+	if err := os.MkdirAll(relativeStateDir, 0700); err != nil {
+		t.Fatalf("MkdirAll relative state dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(relativeStateDir, "bridge.pid"), []byte("123\n"), 0600); err != nil {
+		t.Fatalf("WriteFile bridge pid: %v", err)
+	}
+
+	output := captureStdout(t, cmdUninstallCodexLocal)
+	if !strings.Contains(output, "cannot determine local home directory") {
+		t.Fatalf("expected home-directory warning, got:\n%s", output)
+	}
+	if _, err := os.Stat(relativeStateDir); err != nil {
+		t.Fatalf("relative state dir should be preserved, stat err=%v", err)
+	}
+}
+
 func TestCompatStateDirsIncludesPeerAndLegacyState(t *testing.T) {
 	got := compatStateDirs("~/.cache/cc-clip/peers/peer-a")
 	want := []string{"~/.cache/cc-clip/peers/peer-a", legacyStateDir}
@@ -1986,6 +2450,10 @@ func TestUninstallPeerRemoteAndConfigInvokesPATHCleanup(t *testing.T) {
 			pathCalls++
 			return nil
 		},
+		// countRemainingPeers=0 is required for shared-asset cleanup to
+		// fire: a nil counter is now treated as "unknown → preserve"
+		// (fail-safe invariant pinned in AGENTS.md).
+		countRemainingPeers:    func() (int, error) { return 0, nil },
 		removePersistentTunnel: func(string, int) error { return nil },
 	})
 	if err != nil {
@@ -2009,6 +2477,10 @@ func TestUninstallPeerRemoteAndConfigSurfacesPATHCleanupErrors(t *testing.T) {
 		removeRemotePath: func() error {
 			return errors.New("rc file missing")
 		},
+		// countRemainingPeers=0 is required for the shared-asset cleanup
+		// path to execute — otherwise removeRemotePath is skipped under
+		// the fail-safe default and no error would be surfaced.
+		countRemainingPeers:    func() (int, error) { return 0, nil },
 		removePersistentTunnel: func(string, int) error { return nil },
 	})
 	if err == nil || !strings.Contains(err.Error(), "PATH marker") {
@@ -2263,6 +2735,44 @@ func TestUninstallPeerRemoteAndConfigFailsSafeOnCountQueryError(t *testing.T) {
 	}
 	if pathCalls != 0 {
 		t.Fatalf("removeRemotePath called %d times, want 0 on count failure (fail safe)", pathCalls)
+	}
+}
+
+// TestUninstallPeerRemoteAndConfigFailsSafeWhenCountOpNotWired pins the
+// stricter half of the fail-safe invariant: a caller that does NOT wire
+// countRemainingPeers is treated as "unknown peer count → preserve",
+// not "assume solo ownership → delete". Without this test a future
+// refactor could quietly re-enable the old nil=allow default and a
+// caller that forgot to wire the op would silently wipe shared assets
+// on a multi-laptop account. AGENTS.md pins this fail-closed behavior.
+func TestUninstallPeerRemoteAndConfigFailsSafeWhenCountOpNotWired(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	notifyCalls := 0
+	pathCalls := 0
+	err := uninstallPeerRemoteAndConfigWithOps("myserver", func() (*peer.Registration, error) {
+		return &peer.Registration{PeerID: "peer-a", Label: "imac", ReservedPort: 18340}, nil
+	}, uninstallPeerCleanupOps{
+		removeNotify: func(*peer.Registration) error {
+			notifyCalls++
+			return nil
+		},
+		removeRemotePath: func() error {
+			pathCalls++
+			return nil
+		},
+		// countRemainingPeers intentionally unwired — the contract says
+		// this must PRESERVE shared assets, not delete them.
+		removePersistentTunnel: func(string, int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if notifyCalls != 0 {
+		t.Fatalf("removeNotify called %d times, want 0 when count op is not wired (fail safe)", notifyCalls)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("removeRemotePath called %d times, want 0 when count op is not wired (fail safe)", pathCalls)
 	}
 }
 
@@ -3234,11 +3744,14 @@ func TestRunConnectCallsApplyLaptopSSHConfigSetEnvOnBothPaths(t *testing.T) {
 	// At least one call must be followed by a `return` within a few lines —
 	// that is the token-only fast-path signature. Without it the test would
 	// pass trivially on a refactor that kept only the full-path call site.
+	// Accept both bare `return` (void era) and `return nil` (error-returning
+	// era) since runConnect's signature changed when we routed the Codex
+	// failure through an error return instead of os.Exit(1).
 	foundReturnAfter := false
 	for _, ci := range callLines {
 		for j := ci + 1; j < len(body) && j <= ci+10; j++ {
 			trimmed := strings.TrimSpace(body[j])
-			if trimmed == "return" {
+			if trimmed == "return" || trimmed == "return nil" {
 				foundReturnAfter = true
 				break
 			}
@@ -3358,6 +3871,71 @@ func TestClassifyErrorPreservesExitCodeSegments(t *testing.T) {
 			got := classifyError(tc.err)
 			if got != tc.want {
 				t.Fatalf("classifyError(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateOrchestrationFlagsRejectsBadCombinations pins the rule that
+// --token-only is mutually exclusive with --force, --codex, and --no-notify.
+// The token-only branch in runConnect returns before Codex / notification
+// deploy steps, so silent acceptance of the combinations would let
+// `cc-clip connect host --token-only --codex` print "Setup complete" while
+// never deploying Codex support.
+func TestValidateOrchestrationFlagsRejectsBadCombinations(t *testing.T) {
+	cases := []struct {
+		name      string
+		cmd       string
+		force     bool
+		tokenOnly bool
+		codex     bool
+		noNotify  bool
+		wantSub   string
+	}{
+		{"connect-force-and-token-only", "connect", true, true, false, false, "--force and --token-only are mutually exclusive"},
+		{"connect-token-only-and-codex", "connect", false, true, true, false, "--token-only cannot be combined with --codex"},
+		{"connect-token-only-and-no-notify", "connect", false, true, false, true, "--token-only cannot be combined with --no-notify"},
+		{"setup-force-and-token-only", "setup", true, true, false, false, "--force and --token-only are mutually exclusive"},
+		{"setup-token-only-and-codex", "setup", false, true, true, false, "--token-only cannot be combined with --codex"},
+		{"setup-token-only-and-no-notify", "setup", false, true, false, true, "--token-only cannot be combined with --no-notify"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := validateOrchestrationFlags(tc.cmd, tc.force, tc.tokenOnly, tc.codex, tc.noNotify)
+			if got == "" {
+				t.Fatalf("expected validation error, got empty string for %+v", tc)
+			}
+			if !strings.HasPrefix(got, tc.cmd+":") {
+				t.Fatalf("error should be prefixed with %q, got %q", tc.cmd+":", got)
+			}
+			if !strings.Contains(got, tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", got, tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestValidateOrchestrationFlagsAcceptsValidCombinations(t *testing.T) {
+	cases := []struct {
+		name      string
+		force     bool
+		tokenOnly bool
+		codex     bool
+		noNotify  bool
+	}{
+		{"all-false", false, false, false, false},
+		{"force-only", true, false, false, false},
+		{"token-only", false, true, false, false},
+		{"codex-only", false, false, true, false},
+		{"no-notify-only", false, false, false, true},
+		{"force-and-codex", true, false, true, false},
+		{"force-and-no-notify", true, false, false, true},
+		{"force-codex-and-no-notify", true, false, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validateOrchestrationFlags("connect", tc.force, tc.tokenOnly, tc.codex, tc.noNotify); got != "" {
+				t.Fatalf("expected combination to validate, got error: %q", got)
 			}
 		})
 	}

@@ -3,6 +3,7 @@
 /.cache/
 /cc-clip
 *.exe
+*.test
 
 # Go telemetry / sandbox artifacts
 .home/
@@ -14,3 +15,14 @@
 .idea/
 .vscode/
 dist/
+
+# cc-clip secrets / local state (should never be committed even if a dev
+# accidentally runs the daemon inside a worktree). Scoped paths rather
+# than bare `*.token` so a future test fixture named `*.token` (e.g.
+# golden files for a token-format round-trip) can still be committed.
+/session.token
+/tunnel-control.token
+**/.cache/cc-clip/*.token
+**/.cache/cc-clip/**/*.token
+local-peer-id
+notify.nonce

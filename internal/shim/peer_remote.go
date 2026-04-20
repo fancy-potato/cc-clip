@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/shunmei/cc-clip/internal/exitcode"
 	"github.com/shunmei/cc-clip/internal/peer"
@@ -22,10 +24,24 @@ import (
 // propagate or synthesise an exit status of 22 would otherwise be
 // misclassified as an idempotent "peer already released" — causing
 // uninstall to treat a broken remote session as a clean success and
-// leaking the peer's reserved port in the registry. `exec.Cmd.Output()`
-// populates ExitError.Stderr automatically, so the sentinel check comes
-// for free wherever the caller used `session.Exec()` (which uses Output()
-// internally).
+// leaking the peer's reserved port in the registry.
+//
+// Load-bearing exec-path invariant (P3-H): this function reads
+// exitErr.Stderr directly. Go's *exec.ExitError.Stderr is ONLY populated
+// when the command was started with cmd.Output() (or equivalent wrappers
+// that internally call Output); cmd.Run() with an explicit
+// cmd.Stderr = &buf leaves exitErr.Stderr nil. This classifier is safe
+// today because SSHSession.Exec — the sole production caller — uses
+// cmd.Output() internally (see internal/shim/ssh.go). If a future
+// refactor changes SSHSession.Exec to capture stderr via an explicit
+// sink, the sentinel check here will silently start returning false and
+// idempotent uninstall will mis-diagnose transport failures as clean
+// "peer already released" successes. In that case, switch this classifier
+// to take an explicit stderr []byte argument (mirroring
+// classifyDoctorPeerNotFound in internal/doctor/remote.go). Pinned
+// indirectly by TestClassifyPeerNotFoundTranslatesExitCode in
+// peer_remote_test.go, which uses cmd.Output() via exitErrorWithSentinel
+// to mirror the production capture.
 func classifyPeerNotFound(err error) error {
 	if err == nil {
 		return nil
@@ -52,6 +68,18 @@ func classifyPeerNotFound(err error) error {
 // caller passing an operator-supplied --local-bin value containing e.g. a
 // space, `$(...)`, or `;`. The peerID/label args on each call site are
 // already shellQuote'd; this closes the remaining unquoted hole.
+//
+// Tilde handling: `~` is accepted ANYWHERE in the path, not just as a
+// prefix. POSIX shells only expand `~` at the start of a word or
+// immediately after a `:` in certain assignments, so a `~` embedded
+// mid-path (e.g. "/opt/foo~1/cc-clip") passes through literally rather
+// than expanding. The permissive acceptance matches the current callers
+// (cmdConnect / cmdUninstall pass `~/.local/bin/cc-clip`; tests cover
+// `~/alt/cc-clip-0.7.0`, `/usr/local/bin/cc-clip`, and bare `cc-clip`)
+// and avoids a second regex layer for a character that is already safe
+// in the accepted set. If a future caller needs stricter prefix-only
+// tilde handling, add that at the call site rather than tightening this
+// validator for everyone.
 func ValidateRemoteBin(b string) error {
 	if b == "" {
 		return errors.New("remote binary path is empty")
@@ -87,7 +115,7 @@ func ReservePeerViaSession(session *SSHSession, remoteBin, peerID, label string,
 	}
 	var reg peer.Registration
 	if err := json.Unmarshal([]byte(out), &reg); err != nil {
-		return peer.Registration{}, fmt.Errorf("failed to decode peer reservation: %w", err)
+		return peer.Registration{}, fmt.Errorf("failed to decode peer reservation: %w (got: %s)", err, truncateForError(out))
 	}
 	return reg, nil
 }
@@ -110,7 +138,7 @@ func ReleasePeerViaSession(session *SSHSession, remoteBin, peerID string) (peer.
 	}
 	var reg peer.Registration
 	if err := json.Unmarshal([]byte(out), &reg); err != nil {
-		return peer.Registration{}, fmt.Errorf("failed to decode peer release: %w", err)
+		return peer.Registration{}, fmt.Errorf("failed to decode peer release: %w (got: %s)", err, truncateForError(out))
 	}
 	return reg, nil
 }
@@ -126,7 +154,7 @@ func LookupPeerViaSession(session *SSHSession, remoteBin, peerID string) (peer.R
 	}
 	var reg peer.Registration
 	if err := json.Unmarshal([]byte(out), &reg); err != nil {
-		return peer.Registration{}, fmt.Errorf("failed to decode peer registry entry: %w", err)
+		return peer.Registration{}, fmt.Errorf("failed to decode peer registry entry: %w (got: %s)", err, truncateForError(out))
 	}
 	return reg, nil
 }
@@ -166,10 +194,47 @@ func ListPeersViaSession(session *SSHSession, remoteBin string) ([]peer.Registra
 	}
 	var regs []peer.Registration
 	if err := json.Unmarshal(trimmed, &regs); err != nil {
-		return nil, fmt.Errorf("failed to decode peer list: %w", err)
+		return nil, fmt.Errorf("failed to decode peer list: %w (got: %s)", err, truncateForError(string(trimmed)))
 	}
 	if regs == nil {
 		return nil, fmt.Errorf("failed to decode peer list: expected JSON array, got null")
 	}
 	return regs, nil
+}
+
+// truncateForError returns a bounded prefix of `out` suitable for embedding
+// in error messages. rc-file prompt fragments and stray echoes on the
+// remote side routinely land before the intended JSON body, so surfacing
+// a short quoted snippet (rather than the raw `%w: <entire output>`)
+// keeps the message readable while still giving the operator enough
+// context to recognise a prompt leak or wrapper shim without having to
+// rerun with ssh -v.
+func truncateForError(out string) string {
+	const maxLen = 120
+	out = strings.TrimSpace(out)
+	if len(out) <= maxLen {
+		return fmt.Sprintf("%q", out)
+	}
+	// Rune-safe cut: back up to the last rune boundary before appending
+	// the truncation marker so multi-byte characters are not split.
+	return fmt.Sprintf("%q …[truncated]", runeSafePrefix(out, maxLen))
+}
+
+// runeSafePrefix returns out[:n] adjusted back to the nearest rune
+// boundary. The fmt.Sprintf("%q", …) caller renders the result with Go
+// escape syntax, so any control bytes in the prefix are still safe to
+// print; this function's job is only to avoid cutting inside a rune.
+func runeSafePrefix(out string, n int) string {
+	if n > len(out) {
+		n = len(out)
+	}
+	for n > 0 {
+		r, size := utf8.DecodeLastRuneInString(out[:n])
+		if r == utf8.RuneError && size == 1 {
+			n--
+			continue
+		}
+		break
+	}
+	return out[:n]
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/fileutil"
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 // Status represents the current state of a tunnel.
@@ -98,7 +99,7 @@ func shortStateHash(host string, localPort int) string {
 
 // DefaultStateDir returns the default directory for tunnel state files.
 func DefaultStateDir() string {
-	home, err := os.UserHomeDir()
+	home, err := userhome.Dir()
 	if err != nil {
 		return filepath.Join(os.TempDir(), "cc-clip", "tunnels")
 	}
@@ -306,8 +307,20 @@ func validateTunnelState(s *TunnelState, requireLocalPort bool) error {
 	if s.Config.RemotePort < 1 || s.Config.RemotePort > maxTunnelStatePort {
 		return fmt.Errorf("%w: invalid remote port %d", ErrInvalidTunnelState, s.Config.RemotePort)
 	}
+	// Cache-pin invariant: SSHOptions is only trustworthy when the file also
+	// marks SSHConfigResolved=true. An earlier version of this function
+	// auto-promoted `len(SSHOptions) > 0` to resolved=true, which defeated
+	// the whole point of the resolved flag: an attacker or stale migration
+	// could plant SSHOptions without SSHConfigResolved and have them
+	// silently adopted on the next manager startup, skipping the ssh -G
+	// re-query. Instead, clear the un-vouched-for slice and log a warning
+	// so Manager.Up's resolveSSHTunnelConfig path will re-run ssh -G before
+	// spawning the reverse forward. The state file remains usable (we
+	// don't reject it outright, which would wedge an otherwise recoverable
+	// tunnel) but the cached options no longer short-circuit resolution.
 	if len(s.Config.SSHOptions) > 0 && !s.Config.SSHConfigResolved {
-		s.Config.SSHConfigResolved = true
+		log.Printf("tunnel-state: clearing %d cached ssh option(s) for host=%q local_port=%d: SSHConfigResolved=false (forcing ssh -G re-query on next Up)", len(s.Config.SSHOptions), s.Config.Host, s.Config.LocalPort)
+		s.Config.SSHOptions = nil
 	}
 	if s.Config.SSHConfigResolved {
 		if err := validateResolvedTunnelOptions(s.Config.SSHOptions); err != nil {

@@ -2,14 +2,17 @@ package doctor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shunmei/cc-clip/internal/exitcode"
 	"github.com/shunmei/cc-clip/internal/peer"
@@ -59,6 +62,8 @@ var readLocalSSHConfig = func() ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+var loadDoctorLocalIdentity = peer.LoadLocalIdentity
+
 func RunRemote(host string, port int) []CheckResult {
 	var results []CheckResult
 
@@ -72,7 +77,7 @@ func RunRemote(host string, port int) []CheckResult {
 		return results
 	}
 
-	ident, identErr := peer.LoadOrCreateLocalIdentity()
+	ident, identErr := loadDoctorLocalIdentity()
 	var reg *peer.Registration
 	var (
 		deployState *shim.DeployState
@@ -173,39 +178,83 @@ func RunRemote(host string, port int) []CheckResult {
 	if remotePort == 0 {
 		results = append(results, CheckResult{"tunnel", false, "cannot determine remote tunnel port (missing peer registration and no matching saved tunnel state)"})
 	} else {
+		// The probe emits one of three distinct sentinels:
+		//   tunnel ok               — verified HTTP 2xx from /health (real)
+		//   tunnel ok (tcp-only)    — bare TCP listener, no HTTP verified
+		//   tunnel fail             — nothing listens at all
+		//
+		// Previously, `nc -z` and `bash /dev/tcp` returning success were
+		// reported as "tunnel ok" indistinguishably from a verified
+		// HTTP round-trip. On a curl-less remote (alpine/busybox), a
+		// dead daemon with a leftover SSH reverse forward would still
+		// TCP-accept and be reported as healthy — defeating the whole
+		// purpose of the check. Tag the degraded branches so operators
+		// can see when the probe couldn't fully verify.
 		probeScript := fmt.Sprintf(`sh -c '
 p=%d
 if command -v curl >/dev/null 2>&1; then
   if curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:$p/health"; then echo tunnel ok; exit 0; fi
+  # curl ran but could not reach /health — daemon is down or /health
+  # endpoint is unexpectedly disabled. Do NOT fall through to the
+  # TCP-only probe: if curl is installed, it is authoritative.
+  echo tunnel fail
+  exit 0
 fi
 if command -v nc >/dev/null 2>&1; then
-  if nc -z -w 3 127.0.0.1 "$p" 2>/dev/null; then echo tunnel ok; exit 0; fi
+  if nc -z -w 3 127.0.0.1 "$p" 2>/dev/null; then echo tunnel ok tcp-only; exit 0; fi
 fi
 if command -v bash >/dev/null 2>&1; then
-  if bash -c "exec 3<>/dev/tcp/127.0.0.1/$p" 2>/dev/null; then echo tunnel ok; exit 0; fi
+  if bash -c "exec 3<>/dev/tcp/127.0.0.1/$p" 2>/dev/null; then echo tunnel ok tcp-only; exit 0; fi
 fi
 echo tunnel fail
 '`, remotePort)
 		out, err = remoteExecNoForward(host, probeScript)
-		if strings.Contains(out, "tunnel ok") {
+		trimmed := strings.TrimSpace(out)
+		switch {
+		case strings.Contains(trimmed, "tunnel ok tcp-only"):
+			results = append(results, CheckResult{"tunnel", true, fmt.Sprintf("port %d forwarded (TCP-only; install curl on remote for HTTP health verification)", remotePort)})
+		case strings.Contains(trimmed, "tunnel ok"):
 			results = append(results, CheckResult{"tunnel", true, fmt.Sprintf("port %d forwarded", remotePort)})
-		} else {
-			results = append(results, CheckResult{"tunnel", false, fmt.Sprintf("port %d not reachable from remote (%s)", remotePort, strings.TrimSpace(out))})
+		default:
+			results = append(results, CheckResult{"tunnel", false, fmt.Sprintf("port %d not reachable from remote (%s)", remotePort, trimmed)})
 		}
 	}
 
 	// Check token on remote
 	stateDir := resolveDoctorStateDir(reg, managedEnv)
 	stateDirExpr := remotePathExpr(stateDir)
-	out, err = remoteExecNoForward(host, fmt.Sprintf("test -f %s/session.token && echo 'present' || echo 'missing'", stateDirExpr))
-	if strings.Contains(out, "present") {
+	// P2-25: distinguish "file missing" from "SSH failed". The old code
+	// treated any non-"present" output as missing, which silently hid SSH
+	// transport errors. Check err first so operators can tell the two apart.
+	// P2-C: include sanitized stderr in the "cannot probe" message so the
+	// operator can distinguish a network/auth failure ("Permission denied
+	// (publickey)") from a harmless path-expansion issue. stderr is already
+	// captured by runRemoteSSHCommand; without surfacing it here, the
+	// advertised "SSH-failure vs file-missing" distinction provided no
+	// extra signal beyond the bare Go error string.
+	out, stderr, err := remoteExecNoForwardWithStderr(host, fmt.Sprintf("test -f %s/session.token && echo 'present' || echo 'missing'", stateDirExpr))
+	if err != nil {
+		msg := fmt.Sprintf("cannot probe session.token over ssh: %v", err)
+		if s := strings.TrimSpace(sanitizeRemoteOutput(stderr)); s != "" {
+			msg = fmt.Sprintf("%s (stderr: %s)", msg, s)
+		}
+		results = append(results, CheckResult{"remote-token", false, msg})
+	} else if strings.Contains(out, "present") {
 		results = append(results, CheckResult{"remote-token", true, "token file present"})
 	} else {
 		results = append(results, CheckResult{"remote-token", false, "token file missing"})
 	}
 
-	out, err = remoteExecNoForward(host, fmt.Sprintf("test -f %s/notify.nonce && echo 'present' || echo 'missing'", stateDirExpr))
-	results = append(results, remoteNonceResult(deployState, strings.Contains(out, "present")))
+	out, stderr, err = remoteExecNoForwardWithStderr(host, fmt.Sprintf("test -f %s/notify.nonce && echo 'present' || echo 'missing'", stateDirExpr))
+	if err != nil {
+		msg := fmt.Sprintf("cannot probe notify.nonce over ssh: %v", err)
+		if s := strings.TrimSpace(sanitizeRemoteOutput(stderr)); s != "" {
+			msg = fmt.Sprintf("%s (stderr: %s)", msg, s)
+		}
+		results = append(results, CheckResult{"remote-nonce", false, msg})
+	} else {
+		results = append(results, remoteNonceResult(deployState, strings.Contains(out, "present")))
+	}
 
 	// Check remote token matches local token
 	results = append(results, checkTokenMatch(host, stateDir)...)
@@ -250,7 +299,89 @@ func resolveDoctorStateDir(reg *peer.Registration, managedEnv map[string]string)
 // Every invocation is bounded by remoteExecTimeout and uses a short
 // ConnectTimeout so an unreachable host fails fast instead of blocking the
 // whole doctor run on OS-level TCP retry defaults.
+//
+// stdout and stderr are captured separately (P1-5). stdout is sanitized via
+// sanitizeRemoteOutput: control characters (including ANSI escape sequences)
+// are stripped and the string is length-capped. Callers embed the output
+// directly into CheckResult messages shown in the user's terminal — without
+// this sanitization, a compromised remote could emit terminal-manipulating
+// escape sequences that rewrite the operator's view.
+//
+// Why stdout/stderr are split (P1-5): earlier code used CombinedOutput(),
+// which concatenated SSH client warnings ("Warning: Permanently added …",
+// "mux_client_forward", etc.) with the remote command's stdout. Callers
+// that parse stdout as JSON (readDeployState, lookupPeer) would then fail
+// to unmarshal. stderr is now returned inside the error message on
+// failure but not merged into stdout on success.
 func remoteExecNoForward(host string, args ...string) (string, error) {
+	out, _, err := remoteExecNoForwardWithStderr(host, args...)
+	return out, err
+}
+
+// remoteExecNoForwardRaw is the same as remoteExecNoForward but SKIPS
+// sanitizeRemoteOutput on stdout — intended for JSON/structured parsers
+// (readDeployState, lookupPeer). ANSI/control-character stripping can drop
+// characters that are legitimate inside a JSON string, and the length cap
+// would clip a large-enough deploy.json or peer list mid-byte. The raw
+// stdout is ONLY safe to pass through a structured parser; do not echo it
+// directly into CheckResult messages shown in the terminal.
+//
+// stderr is still captured separately and surfaced in the error message on
+// failure, so SSH-client warnings never pollute the JSON body.
+func remoteExecNoForwardRaw(host string, args ...string) (string, error) {
+	out, _, err := remoteExecNoForwardRawWithStderr(host, args...)
+	return out, err
+}
+
+// remoteExecNoForwardWithStderr returns (sanitized-stdout, raw-stderr, error).
+// The stderr return value lets callers distinguish "file missing" from
+// "SSH transport failed" (P2-25): both paths might return a stdout that
+// does not contain "present", but only the latter has a populated stderr.
+func remoteExecNoForwardWithStderr(host string, args ...string) (string, string, error) {
+	stdout, stderr, err := runRemoteSSHCommand(host, args...)
+	return sanitizeRemoteOutput(stdout), stderr, err
+}
+
+// remoteExecNoForwardRawWithStderr returns (raw-stdout, raw-stderr, error)
+// and ALSO wraps stderr into the error message when err != nil. This lets
+// structured-JSON consumers (readDeployState, lookupPeer) both:
+//  1. Inspect raw stderr bytes directly — required by
+//     classifyDoctorPeerNotFound, which looks for exitcode.PeerNotFoundSentinel
+//     that the remote emits on stderr (see cmd/cc-clip/main.go ~line 3903).
+//     Go's *exec.ExitError.Stderr is ONLY populated by cmd.Output(), never by
+//     cmd.Run() with an explicit cmd.Stderr sink (which is what
+//     runRemoteSSHCommand uses), so without this return channel the sentinel
+//     would be unreachable from the classifier.
+//  2. Get a human-readable error with stderr spliced in, so the caller's
+//     fallback path (no classification match) still surfaces the remote's
+//     complaint instead of a bare "exit status 22".
+func remoteExecNoForwardRawWithStderr(host string, args ...string) (string, string, error) {
+	stdout, stderr, err := runRemoteSSHCommand(host, args...)
+	if err != nil {
+		if strings.TrimSpace(stderr) != "" {
+			return stdout, stderr, fmt.Errorf("%w (stderr: %s)", err, sanitizeRemoteOutput(stderr))
+		}
+		return stdout, stderr, err
+	}
+	return stdout, stderr, nil
+}
+
+// maxRemoteCommandOutput caps each of stdout and stderr captured from a
+// single SSH doctor probe. Without this cap, a runaway remote command
+// (e.g. `cat /dev/urandom`) or a transport layer dribbling infinite
+// diagnostics on stderr could grow the in-process buffers without bound.
+// 1 MiB is generously above any legitimate doctor probe output
+// (deploy.json is typically under a KiB, the largest check is peer list
+// which grows with the number of peers but stays well under this).
+const maxRemoteCommandOutput = 1 << 20 // 1 MiB per stream
+
+// runRemoteSSHCommand is the shared primitive. It returns (raw-stdout,
+// raw-stderr, error). Callers are responsible for sanitization. Both
+// stdout and stderr are each capped at maxRemoteCommandOutput bytes; if
+// the cap is hit, the buffer is truncated and a stable marker is appended
+// so callers (and operators reading the doctor output) can see that data
+// was discarded rather than silently received a partial read.
+func runRemoteSSHCommand(host string, args ...string) (string, string, error) {
 	cmdStr := strings.Join(args, " ")
 	ctx, cancel := context.WithTimeout(context.Background(), remoteExecTimeout)
 	defer cancel()
@@ -263,11 +394,136 @@ func remoteExecNoForward(host string, args ...string) (string, error) {
 		"-o", "ServerAliveCountMax=2",
 		host, cmdStr)
 	hideConsoleWindow(cmd)
-	out, err := cmd.CombinedOutput()
+	stdout := &cappedBuffer{cap: maxRemoteCommandOutput}
+	stderr := &cappedBuffer{cap: maxRemoteCommandOutput}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return strings.TrimSpace(string(out)), fmt.Errorf("ssh to %s timed out after %s", host, remoteExecTimeout)
+		return stdout.String(), stderr.String(), fmt.Errorf("ssh to %s timed out after %s", host, remoteExecTimeout)
 	}
-	return strings.TrimSpace(string(out)), err
+	return stdout.String(), stderr.String(), err
+}
+
+// cappedBuffer is an io.Writer that accepts at most `cap` bytes into its
+// underlying buffer. Writes beyond the cap are silently dropped but the
+// first time the cap is crossed a stable marker is appended so callers can
+// detect truncation. The Write signature still returns len(p) and nil
+// error (rather than short-writing) because the ssh exec path treats a
+// short write on stdout/stderr as a broken pipe — which would then cause
+// ssh to exit non-zero even though the remote command succeeded.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	cap       int
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := c.cap - c.buf.Len()
+	if remaining <= 0 {
+		if !c.truncated {
+			c.truncated = true
+			c.buf.WriteString("\n... [output truncated after ")
+			c.buf.WriteString(fmt.Sprintf("%d", c.cap))
+			c.buf.WriteString(" bytes] ...")
+		}
+		return n, nil
+	}
+	if len(p) > remaining {
+		c.buf.Write(p[:remaining])
+		if !c.truncated {
+			c.truncated = true
+			c.buf.WriteString("\n... [output truncated after ")
+			c.buf.WriteString(fmt.Sprintf("%d", c.cap))
+			c.buf.WriteString(" bytes] ...")
+		}
+		return n, nil
+	}
+	c.buf.Write(p)
+	return n, nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+
+// sanitizeRemoteOutput strips ANSI escape sequences and non-printable
+// control characters from remote command output before it is embedded in
+// user-facing check messages. Output longer than maxRemoteOutputLen is
+// truncated with an explicit marker so tokens or secrets accidentally
+// printed by a compromised daemon cannot be flooded into the terminal.
+// Newlines and tabs are preserved because doctor messages legitimately
+// span multiple lines (e.g. `head -2 ~/.local/bin/xclip`).
+//
+// C1 escape notes: we strip 7-bit CSI (ESC '[' …) and OSC (ESC ']' …)
+// explicitly, but do NOT special-case the 8-bit C1 controls CSI (0x9B)
+// or DCS (0x90). In a UTF-8 terminal (the baseline assumption for
+// cc-clip output), lone bytes in 0x80-0xBF are invalid UTF-8 continuation
+// bytes; Go's []rune conversion replaces each with U+FFFD (REPLACEMENT
+// CHARACTER), which is a visible glyph but is not interpreted as a
+// terminal-escape trigger. The 8-bit forms only activate on VT100/VT220
+// terminals configured for 8-bit C1 mode, which modern terminals almost
+// never are. If that assumption changes, add an explicit strip for
+// 0x80-0x9F before the UTF-8 decode.
+func sanitizeRemoteOutput(s string) string {
+	const maxRemoteOutputLen = 4096
+	var b strings.Builder
+	b.Grow(len(s))
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		// Strip ESC-prefixed sequences (CSI, OSC, etc.). ANSI CSI is ESC
+		// followed by '[' and parameter bytes ending in a byte in 0x40-0x7e;
+		// we conservatively consume ESC + the next non-alphanumeric run.
+		if r == 0x1b {
+			// skip ESC and up to 32 following bytes of an ANSI/OSC sequence
+			j := i + 1
+			if j < len(runes) && (runes[j] == '[' || runes[j] == ']') {
+				j++
+				for j < len(runes) && j-i < 32 {
+					c := runes[j]
+					j++
+					// Terminators for CSI (final byte 0x40-0x7e) or OSC (BEL/ST).
+					if (c >= 0x40 && c <= 0x7e) || c == 0x07 {
+						break
+					}
+				}
+			} else if j < len(runes) {
+				j++
+			}
+			i = j - 1
+			continue
+		}
+		if r == '\n' || r == '\t' {
+			b.WriteRune(r)
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := strings.TrimSpace(b.String())
+	// Rune-safe truncation (P2-26): cutting at a byte boundary could split
+	// a multi-byte UTF-8 rune, leaving an invalid trailing sequence that
+	// renders as a mojibake glyph in the operator's terminal. Walk back to
+	// the nearest rune boundary via utf8.DecodeLastRuneInString before
+	// appending the "[truncated]" marker.
+	if len(out) > maxRemoteOutputLen {
+		cut := maxRemoteOutputLen
+		for cut > 0 {
+			r, size := utf8.DecodeLastRuneInString(out[:cut])
+			if r == utf8.RuneError && size == 1 {
+				// Landed on a continuation byte; back up one more and
+				// retry. In the worst case (3-byte rune split), this
+				// iterates at most 3 times.
+				cut--
+				continue
+			}
+			break
+		}
+		out = out[:cut] + " …[truncated]"
+	}
+	return out
 }
 
 func resolveInInteractiveShell(host, bin string) (string, error) {
@@ -350,13 +606,22 @@ func runImageProbe(host string, port int, stateDir string) []CheckResult {
 }
 
 // checkTokenMatch verifies the remote token matches the local daemon token.
+//
+// Uses the raw-output variant (NOT remoteExecNoForward, which strips
+// control bytes via sanitizeRemoteOutput). Today's token formats are
+// base64/hex and survive the sanitizer intact, but a future format
+// that contains any byte <0x20 (a literal NUL terminator, a UTF-8
+// encoding with a trailing BOM, etc.) would be corrupted by the
+// sanitizer and produce a misleading "remote token differs" report —
+// telling the operator to rerun `cc-clip connect` when in fact the
+// tokens are byte-identical. The token comparison must be byte-exact.
 func checkTokenMatch(host string, stateDir string) []CheckResult {
 	localToken, err := token.ReadTokenFile()
 	if err != nil {
 		return []CheckResult{{"token-match", false, "cannot read local token to compare"}}
 	}
 
-	remoteToken, err := remoteExecNoForward(host, fmt.Sprintf("cat %s/session.token 2>/dev/null", remotePathExpr(stateDir)))
+	remoteToken, err := remoteExecNoForwardRaw(host, fmt.Sprintf("cat %s/session.token 2>/dev/null", remotePathExpr(stateDir)))
 	if err != nil || strings.TrimSpace(remoteToken) == "" {
 		return []CheckResult{{"token-match", false, "cannot read remote token"}}
 	}
@@ -373,8 +638,34 @@ func checkTokenMatch(host string, stateDir string) []CheckResult {
 }
 
 // checkDeployState checks if the deploy state file exists on the remote.
+//
+// The deploy state file is intentionally at the canonical path
+// `~/.cache/cc-clip/deploy.json` rather than a per-peer stateDir location:
+// deploy.json tracks binary hash / shim install / path-fix state which is
+// shared across all peers on the same Unix account (each peer does NOT
+// re-upload the binary or re-install the shim — those are one-shot, shared
+// remote assets). Per-peer state lives under the peer's stateDir
+// (session.token, notify.nonce, notify-health.log). Keeping deploy.json
+// canonical is what lets a second-laptop `cc-clip connect` skip the binary
+// upload entirely via the hash check.
+//
+// Uses the raw-output variant so ANSI sanitizer never corrupts a
+// structured JSON body. stderr is surfaced in the error message rather
+// than spliced into stdout.
+//
+// The remote command intentionally splits "missing" from "unreadable":
+// the previous form `cat … 2>/dev/null || echo __NOTFOUND__` swallowed
+// permission/quota/IO errors as `__NOTFOUND__`, so doctor reported a
+// healthy host as "deploy.json not found" and steered users toward
+// `cc-clip connect --force` instead of investigating. Now `test -e`
+// distinguishes the two: file absent → __NOTFOUND__; file present →
+// `cat` runs WITHOUT stderr redirection so any read failure surfaces as
+// a non-zero ssh exit and is propagated as an error. Pinned by
+// TestReadDeployStateRemoteCommandSurfacesReadErrors.
+const readDeployStateRemoteCommand = "if [ ! -e ~/.cache/cc-clip/deploy.json ]; then printf '__NOTFOUND__\\n'; else cat ~/.cache/cc-clip/deploy.json; fi"
+
 func readDeployState(host string) (*shim.DeployState, error) {
-	out, err := remoteExecNoForward(host, "cat ~/.cache/cc-clip/deploy.json 2>/dev/null || echo '__NOTFOUND__'")
+	out, err := remoteExecNoForwardRaw(host, readDeployStateRemoteCommand)
 	if err != nil {
 		return nil, err
 	}
@@ -425,32 +716,61 @@ func checkPathFix(host string) []CheckResult {
 }
 
 func lookupPeer(host, peerID string) (*peer.Registration, error) {
-	// peerID is always generated by peer.LoadOrCreateLocalIdentity as a
-	// hex string, and the caller (RunRemote) routes it through
-	// peer.LoadOrCreateLocalIdentity before we ever see it. That said,
-	// shellQuote is the only defense on this line, so if a future
-	// contributor ever threads an operator-supplied peer ID in here they
-	// MUST also validate it with peer.ValidateID first. Do not remove
-	// the shellQuote wrapper.
-	out, err := remoteExecNoForward(host, fmt.Sprintf("~/.local/bin/cc-clip peer show --peer-id %s", shellQuote(peerID)))
+	// peerID reaches this function through the local-identity loader, so it
+	// should already satisfy peer.ValidateID. That said, shellQuote is the
+	// only defense on this line, so if a future contributor ever threads an
+	// operator-supplied peer ID in here they MUST also validate it with
+	// peer.ValidateID first. Do not remove the shellQuote wrapper.
+	//
+	// Uses the raw-output variant with explicit stderr capture (P2-27 +
+	// P1-A): the stdout must round-trip through json.Unmarshal unchanged,
+	// and the ANSI/control-character sanitizer in the default
+	// remoteExecNoForward would strip bytes that are legitimate inside a
+	// JSON string (e.g. an escape sequence inside a peer label). The raw
+	// stderr is required separately because classifyDoctorPeerNotFound
+	// matches on exitcode.PeerNotFoundSentinel that the remote emits to
+	// stderr — cmd.Run() with an explicit cmd.Stderr sink (our path) does
+	// NOT populate *exec.ExitError.Stderr, so the classifier cannot read
+	// the sentinel from the error object; it must be passed in explicitly.
+	out, stderr, err := remoteExecNoForwardRawWithStderr(host, fmt.Sprintf("~/.local/bin/cc-clip peer show --peer-id %s", shellQuote(peerID)))
 	out = strings.TrimSpace(out)
 	if err != nil {
-		if classifyDoctorPeerNotFound(err, out) {
+		if classifyDoctorPeerNotFound(err, out, stderr) {
 			return nil, fmt.Errorf("peer lookup failed: %w", peer.ErrPeerNotFound)
 		}
+		// Sanitize before embedding in the operator-facing error message:
+		// the raw JSON path intentionally skipped sanitization, so ANSI
+		// escapes from a compromised remote could otherwise rewrite the
+		// operator's terminal. Keep the raw `out` for the JSON-parse step
+		// above; only the error-message version goes through sanitation.
 		if out != "" {
-			return nil, fmt.Errorf("%s", out)
+			return nil, fmt.Errorf("%s", sanitizeRemoteOutput(out))
 		}
 		return nil, err
 	}
 	var reg peer.Registration
 	if err := json.Unmarshal([]byte(out), &reg); err != nil {
-		return nil, fmt.Errorf("unexpected peer registry output: %s", out)
+		return nil, fmt.Errorf("unexpected peer registry output: %s", sanitizeRemoteOutput(out))
 	}
 	return &reg, nil
 }
 
-func classifyDoctorPeerNotFound(err error, out string) bool {
+// classifyDoctorPeerNotFound returns true iff the remote cc-clip peer
+// command exited with exitcode.PeerNotFound AND emitted
+// exitcode.PeerNotFoundSentinel on stderr (or in the fallback path, on
+// stdout — see below). BOTH signals are required as defense in depth: a
+// transport layer exiting 22 for unrelated reasons (ssh plugin, sandbox)
+// would otherwise be misclassified as an idempotent "peer already
+// released".
+//
+// The stderr argument is the raw stderr captured by runRemoteSSHCommand —
+// callers MUST pass it explicitly. Reading exitErr.Stderr here does NOT
+// work because our SSH exec path uses cmd.Run() with cmd.Stderr = &buf,
+// which leaves exitErr.Stderr nil (Go only populates that field when the
+// caller uses cmd.Output()). The stdout-sentinel branch remains as a
+// belt-and-suspenders fallback for a remote wrapper that redirects stderr
+// into stdout.
+func classifyDoctorPeerNotFound(err error, stdout, stderr string) bool {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
 		return false
@@ -458,7 +778,16 @@ func classifyDoctorPeerNotFound(err error, out string) bool {
 	if exitErr.ExitCode() != exitcode.PeerNotFound {
 		return false
 	}
-	return strings.Contains(out, exitcode.PeerNotFoundSentinel)
+	if strings.Contains(stderr, exitcode.PeerNotFoundSentinel) {
+		return true
+	}
+	// Belt-and-suspenders: exitErr.Stderr is populated only when the caller
+	// used cmd.Output(). We do NOT in production, but a future refactor or
+	// a different test harness might, so honor it if it's populated.
+	if bytes.Contains(exitErr.Stderr, []byte(exitcode.PeerNotFoundSentinel)) {
+		return true
+	}
+	return strings.Contains(stdout, exitcode.PeerNotFoundSentinel)
 }
 
 func peerLookupCheckResult(reg *peer.Registration, err error) CheckResult {
@@ -474,13 +803,20 @@ func peerLookupCheckResult(reg *peer.Registration, err error) CheckResult {
 	}
 }
 
+// isLegacyPeerLookupError detects the narrow case where the REMOTE binary
+// is too old to know about the `peer` subcommand at all. The signal we trust
+// is the dispatcher's `unknown command: peer\n` line (cmd/cc-clip/main.go).
+//
+// We deliberately do NOT match the broader substring `usage: cc-clip`: a
+// modern remote that fails on a `peer show` argument prints
+// `usage: cc-clip peer show ...` to stderr too. Treating that as "remote is
+// legacy" silently hides real broken-arg / version-mismatch failures behind
+// a green check.
 func isLegacyPeerLookupError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "unknown command: peer") ||
-		strings.Contains(msg, "usage: cc-clip")
+	return strings.Contains(err.Error(), "unknown command: peer")
 }
 
 // checkTunnelStateAlignment validates that the locally-saved tunnel state for
@@ -562,14 +898,15 @@ func checkSetEnvAlignment(host string, reg *peer.Registration, managedEnv map[st
 
 	wantPort := fmt.Sprintf("%d", reg.ReservedPort)
 	wantStateDir := strings.TrimSpace(reg.StateDir)
-	expectedLine := ""
+	expectedEnv := map[string]string{
+		"CC_CLIP_PORT": wantPort,
+	}
 	if wantStateDir != "" {
-		if line, lineErr := sshconfig.ManagedSetEnvLine(map[string]string{
-			"CC_CLIP_PORT":      wantPort,
-			"CC_CLIP_STATE_DIR": wantStateDir,
-		}); lineErr == nil {
-			expectedLine = line
-		}
+		expectedEnv["CC_CLIP_STATE_DIR"] = wantStateDir
+	}
+	expectedLine := ""
+	if line, lineErr := sshconfig.ManagedSetEnvLine(expectedEnv); lineErr == nil {
+		expectedLine = line
 	}
 
 	if managedEnv == nil {
@@ -726,6 +1063,14 @@ func legacyManagedBlockHosts(config string) []string {
 		if alias != "" {
 			hosts = append(hosts, alias)
 		}
+	}
+	// bufio.Scanner silently drops its final error if the caller never
+	// checks Err() — e.g. an unterminated last line past the 1 MiB buffer
+	// (bufio.ErrTooLong) would truncate the scan without any signal. Log
+	// so a user whose ssh_config is corrupt or pathologically long sees
+	// why the doctor check appears to miss a legacy block.
+	if err := scanner.Err(); err != nil {
+		log.Printf("doctor: warning: ssh_config scan truncated: %v", err)
 	}
 	return hosts
 }

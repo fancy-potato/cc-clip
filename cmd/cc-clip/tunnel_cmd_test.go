@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/shunmei/cc-clip/internal/daemon"
+	"github.com/shunmei/cc-clip/internal/exitcode"
 	"github.com/shunmei/cc-clip/internal/session"
 	"github.com/shunmei/cc-clip/internal/token"
 	"github.com/shunmei/cc-clip/internal/tunnel"
@@ -649,6 +650,9 @@ func TestResolveTunnelUpPortsRejectsCorruptStateWithZeroLocalPort(t *testing.T) 
 			t.Fatalf("error %q missing %q", msg, want)
 		}
 	}
+	if !errors.Is(err, errTunnelUpPortResolutionUsage) {
+		t.Fatalf("err = %v, want errTunnelUpPortResolutionUsage", err)
+	}
 }
 
 // TestCannotDetermineRemotePortMessageWording pins the actionable wording
@@ -714,6 +718,9 @@ func TestResolveTunnelUpPortsRequiresExplicitDaemonWhenRemotePortExplicitAndOwne
 	if err == nil {
 		t.Fatal("expected ambiguity error when explicit --remote-port cannot infer daemon owner")
 	}
+	if !errors.Is(err, tunnel.ErrAmbiguousTunnelState) {
+		t.Fatalf("err = %v, want ErrAmbiguousTunnelState", err)
+	}
 	for _, want := range []string{"--port <local-port>", "multiple saved daemon owners exist"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err, want)
@@ -738,6 +745,9 @@ func TestResolveTunnelUpPortsRejectsImplicitDaemonWhenZeroLocalPortStateAndRemot
 	_, _, err := resolveTunnelUpPorts("example", 29999, 18339, false)
 	if err == nil || !strings.Contains(err.Error(), "--port <local-port> explicitly") {
 		t.Fatalf("err = %v, want explicit daemon guidance", err)
+	}
+	if !errors.Is(err, errTunnelUpPortResolutionUsage) {
+		t.Fatalf("err = %v, want errTunnelUpPortResolutionUsage", err)
 	}
 }
 
@@ -838,6 +848,9 @@ func TestResolveTunnelUpPortsRejectsExplicitDaemonPortThatDiffersFromSavedLocalP
 	if err == nil || !strings.Contains(err.Error(), "uses local port 18444") {
 		t.Fatalf("err = %v, want saved-local-port mismatch error", err)
 	}
+	if !errors.Is(err, errTunnelUpPortResolutionUsage) {
+		t.Fatalf("err = %v, want errTunnelUpPortResolutionUsage", err)
+	}
 }
 
 func TestResolveTunnelUpPortsRejectsEnvConfiguredDaemonPortThatDiffersFromSavedLocalPort(t *testing.T) {
@@ -872,6 +885,9 @@ func TestResolveTunnelUpPortsRejectsEnvConfiguredDaemonPortThatDiffersFromSavedL
 	if err == nil || !strings.Contains(err.Error(), "uses local port 18444") {
 		t.Fatalf("err = %v, want saved-local-port mismatch error", err)
 	}
+	if !errors.Is(err, errTunnelUpPortResolutionUsage) {
+		t.Fatalf("err = %v, want errTunnelUpPortResolutionUsage", err)
+	}
 }
 
 func TestResolveTunnelUpPortsRejectsSavedTunnelOnDifferentExplicitDaemonWhenRemotePortExplicit(t *testing.T) {
@@ -898,6 +914,9 @@ func TestResolveTunnelUpPortsRejectsSavedTunnelOnDifferentExplicitDaemonWhenRemo
 	}
 	if !strings.Contains(err.Error(), "--port 18444") {
 		t.Fatalf("error should point at the owning daemon port, got: %v", err)
+	}
+	if !errors.Is(err, errTunnelUpPortResolutionUsage) {
+		t.Fatalf("err = %v, want errTunnelUpPortResolutionUsage", err)
 	}
 }
 
@@ -928,6 +947,9 @@ func TestResolveTunnelUpPortsRequiresExplicitPortWhenAmbiguousIncludesDefaultDae
 	_, _, err := resolveTunnelUpPorts("example", 29999, 18339, false)
 	if err == nil || !strings.Contains(err.Error(), "pass --port <local-port> explicitly") {
 		t.Fatalf("err = %v, want explicit --port guidance", err)
+	}
+	if !errors.Is(err, tunnel.ErrAmbiguousTunnelState) {
+		t.Fatalf("err = %v, want ErrAmbiguousTunnelState", err)
 	}
 }
 
@@ -1170,6 +1192,14 @@ func TestPostTunnelDownReturnsErrTunnelNotFoundOn404(t *testing.T) {
 	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The CLI performs a preflight GET /tunnels without auth before
+		// attaching the tunnel-control token. Respond 401 here so the
+		// preflight succeeds; the real assertion is on the authenticated
+		// /tunnels/down 404 response.
+		if r.URL.Path == "/tunnels" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		if r.URL.Path != "/tunnels/down" {
 			t.Fatalf("path = %q, want /tunnels/down", r.URL.Path)
 		}
@@ -1190,6 +1220,84 @@ func TestPostTunnelDownReturnsErrTunnelNotFoundOn404(t *testing.T) {
 	err = postTunnelDown(port, "missing")
 	if !errors.Is(err, tunnel.ErrTunnelNotFound) {
 		t.Fatalf("err = %v, want ErrTunnelNotFound", err)
+	}
+}
+
+func TestPostTunnelRemoveRefusesUnknownListenerBeforeSendingToken(t *testing.T) {
+	setupLocalOnlyTokenDir(t)
+
+	if _, _, err := token.LoadOrGenerateTunnelControlToken(); err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+
+	removeCalls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tunnels":
+			http.NotFound(w, r)
+		case "/tunnels/remove":
+			removeCalls++
+			t.Fatalf("preflight should have refused the listener before POST /tunnels/remove")
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	hostPort := strings.TrimPrefix(ts.URL, "http://")
+	_, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", hostPort, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi(%q): %v", portStr, err)
+	}
+
+	err = postTunnelRemove(port, "example")
+	if err == nil || !errors.Is(err, errDaemonTunnelListUnreachable) {
+		t.Fatalf("err = %v, want errDaemonTunnelListUnreachable", err)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("removeCalls = %d, want 0", removeCalls)
+	}
+}
+
+func TestPostTunnelUpMissingTokenUsesTunnelControlExitCode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cache := filepath.Join(home, ".cache", "cc-clip")
+	if err := os.MkdirAll(cache, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	prev := token.TokenDirOverride
+	token.TokenDirOverride = cache
+	t.Cleanup(func() { token.TokenDirOverride = prev })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tunnels" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	hostPort := strings.TrimPrefix(ts.URL, "http://")
+	_, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", hostPort, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi(%q): %v", portStr, err)
+	}
+
+	err = postTunnelUp(port, "example", 19001)
+	if err == nil || !errors.Is(err, errDaemonTunnelControlTokenUnavailable) {
+		t.Fatalf("err = %v, want errDaemonTunnelControlTokenUnavailable", err)
+	}
+	if got := exitCodeForTunnelError(err); got != exitcode.DaemonTunnelControlTokenUnavailable {
+		t.Fatalf("exitCodeForTunnelError = %d, want %d", got, exitcode.DaemonTunnelControlTokenUnavailable)
 	}
 }
 
@@ -1214,8 +1322,8 @@ func TestPostTunnelUpReturnsUnavailableForMissingRoute(t *testing.T) {
 	}
 
 	err = postTunnelUp(port, "missing", 19001)
-	if !errors.Is(err, errDaemonTunnelControlUnavailable) {
-		t.Fatalf("err = %v, want daemon tunnel control unavailable", err)
+	if !errors.Is(err, errDaemonTunnelListUnreachable) {
+		t.Fatalf("err = %v, want errDaemonTunnelListUnreachable", err)
 	}
 }
 
@@ -1240,8 +1348,8 @@ func TestPostTunnelDownReturnsUnavailableForMissingRoute(t *testing.T) {
 	}
 
 	err = postTunnelDown(port, "missing")
-	if !errors.Is(err, errDaemonTunnelControlUnavailable) {
-		t.Fatalf("err = %v, want daemon tunnel control unavailable", err)
+	if !errors.Is(err, errDaemonTunnelListUnreachable) {
+		t.Fatalf("err = %v, want errDaemonTunnelListUnreachable", err)
 	}
 }
 
@@ -1848,6 +1956,29 @@ func TestFallbackDaemonPortSurfacesStateLoadError(t *testing.T) {
 	}
 }
 
+func TestFallbackDaemonPortRejectsLegacyStatesWithoutLocalPort(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dir := tunnel.DefaultStateDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := tunnel.StateFilePath(dir, "example", 0)
+	payload := []byte(`{"config":{"host":"example","local_port":0,"remote_port":19001,"enabled":true}}`)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, retry, err := fallbackDaemonPort("example", 18339)
+	if err == nil || !strings.Contains(err.Error(), "have no local_port") {
+		t.Fatalf("err = %v, want explicit legacy-state guidance", err)
+	}
+	if retry {
+		t.Fatal("retry should be false for legacy states without a local_port owner")
+	}
+}
+
 func TestStopTunnelDoesNotPersistOfflineForDaemonHTTPError(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	setupLocalOnlyTokenDir(t)
@@ -1888,7 +2019,7 @@ func TestStopTunnelDoesNotPersistOfflineForDaemonHTTPError(t *testing.T) {
 	}
 }
 
-func TestLoadTunnelStatesForListFallsBackOfflineWithoutTokenWhenDaemonUnreachable(t *testing.T) {
+func TestLoadTunnelStatesForListFallsBackToDiskWhenTokenMissing(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	setupLocalOnlyTokenDir(t)
 
@@ -1907,13 +2038,13 @@ func TestLoadTunnelStatesForListFallsBackOfflineWithoutTokenWhenDaemonUnreachabl
 
 	states, err := loadTunnelStatesForList(port)
 	if err != nil {
-		t.Fatalf("loadTunnelStatesForList: %v", err)
+		t.Fatalf("err = %v, want nil", err)
 	}
 	if len(states) != 1 {
-		t.Fatalf("len(states) = %d, want 1", len(states))
+		t.Fatalf("states len = %d, want 1", len(states))
 	}
 	if states[0].Status != tunnel.StatusDisconnected || states[0].PID != 0 {
-		t.Fatalf("offline state = %+v, want disconnected with cleared pid", states[0])
+		t.Fatalf("states = %+v, want normalized offline state", states)
 	}
 }
 
@@ -1982,6 +2113,35 @@ func TestLoadTunnelStatesForListFallsBackOfflineOnlyWhenDaemonUnreachable(t *tes
 	}
 	if len(states) != 1 || states[0].Status != tunnel.StatusDisconnected || states[0].PID != 0 {
 		t.Fatalf("offline states were not normalized: %+v", states)
+	}
+}
+
+func TestLoadTunnelStatesForListFallsBackToDiskWhenControlTokenUnavailable(t *testing.T) {
+	loadCalls := 0
+
+	states, err := loadTunnelStatesForListWith(18339,
+		func(int) ([]*tunnel.TunnelState, error) {
+			return nil, fmt.Errorf("%w; showing saved state only", errDaemonTunnelControlTokenUnavailable)
+		},
+		func(string) ([]*tunnel.TunnelState, error) {
+			loadCalls++
+			return []*tunnel.TunnelState{
+				{
+					Config: tunnel.TunnelConfig{Host: "example", Enabled: true},
+					Status: tunnel.StatusConnected,
+					PID:    4321,
+				},
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("loadCalls = %d, want 1", loadCalls)
+	}
+	if len(states) != 1 || states[0].Status != tunnel.StatusDisconnected || states[0].PID != 0 {
+		t.Fatalf("states = %+v, want normalized offline state", states)
 	}
 }
 
@@ -2061,33 +2221,32 @@ func TestLoadTunnelStatesForListSurfacesNonRecoverableDaemonHTTPError(t *testing
 	}
 }
 
-func TestLoadTunnelStatesForListFallsBackWhenTunnelAPIUnavailable(t *testing.T) {
+func TestLoadTunnelStatesForListFallsBackToDiskWhenTunnelAPIUnavailable(t *testing.T) {
 	loadCalls := 0
-	offline := []*tunnel.TunnelState{
-		{
-			Config: tunnel.TunnelConfig{Host: "example", Enabled: true},
-			Status: tunnel.StatusConnected,
-			PID:    4321,
-		},
-	}
 
 	states, err := loadTunnelStatesForListWith(18339,
 		func(int) ([]*tunnel.TunnelState, error) {
-			return nil, fmt.Errorf("%w: daemon returned 404: not found", errDaemonTunnelListUnavailable)
+			return nil, fmt.Errorf("%w: daemon returned 404: not found", errDaemonTunnelListUnreachable)
 		},
 		func(string) ([]*tunnel.TunnelState, error) {
 			loadCalls++
-			return offline, nil
+			return []*tunnel.TunnelState{
+				{
+					Config: tunnel.TunnelConfig{Host: "example", Enabled: true},
+					Status: tunnel.StatusConnected,
+					PID:    4321,
+				},
+			}, nil
 		},
 	)
 	if err != nil {
-		t.Fatalf("loadTunnelStatesForListWith: %v", err)
+		t.Fatalf("err = %v, want nil", err)
 	}
 	if loadCalls != 1 {
 		t.Fatalf("loadCalls = %d, want 1", loadCalls)
 	}
 	if len(states) != 1 || states[0].Status != tunnel.StatusDisconnected || states[0].PID != 0 {
-		t.Fatalf("offline states were not normalized: %+v", states)
+		t.Fatalf("states = %+v, want normalized offline state", states)
 	}
 }
 
@@ -2752,5 +2911,150 @@ func TestDecodeTunnelRequestRejectsEmptyJSONObject(t *testing.T) {
 				t.Fatalf("status = %d, want 400 for {} body", resp.StatusCode)
 			}
 		})
+	}
+}
+
+// TestExitCodeForTunnelErrorClassifiesSentinels pins the segmented-exit-code
+// contract documented in exitcode.go. Scripted consumers (SwiftBar retry
+// loops, install scripts, wrapper CLIs) branch on these codes; a silent
+// reclassification breaks automation without a human-readable log line.
+//
+// Each case exercises a sentinel against a wrapped error shape that the
+// real call sites emit (see fetchTunnelList, postTunnelDown, etc.), so the
+// classifier is tested against the actual error shapes it has to handle.
+func TestExitCodeForTunnelErrorClassifiesSentinels(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"nil", nil, exitcode.Success},
+		{"manager shutting down", fmt.Errorf("%w: 503 shutting down", errDaemonManagerShuttingDown), exitcode.DaemonShuttingDown},
+		{"ambiguous tunnel state", fmt.Errorf("%w: example", tunnel.ErrAmbiguousTunnelState), exitcode.AmbiguousTunnelState},
+		{"tunnel not found", fmt.Errorf("%w: example", tunnel.ErrTunnelNotFound), exitcode.UsageError},
+		{"control token unavailable (specific)", fmt.Errorf("%w; retry later", errDaemonTunnelControlTokenUnavailable), exitcode.DaemonTunnelControlTokenUnavailable},
+		{"tunnel control unavailable", fmt.Errorf("%w: 503", errDaemonTunnelControlUnavailable), exitcode.DaemonTunnelControlTokenUnavailable},
+		{"tunnel list unreachable (404/405)", fmt.Errorf("%w: daemon returned 404: not found", errDaemonTunnelListUnreachable), exitcode.TunnelUnreachable},
+		{"tunnel list umbrella (legacy)", fmt.Errorf("%w", errDaemonTunnelListUnavailable), exitcode.DaemonTunnelControlTokenUnavailable},
+		{"daemon unreachable", fmt.Errorf("%w (connection refused)", errDaemonUnreachable), exitcode.TunnelUnreachable},
+		{"daemon auth", fmt.Errorf("%w: 401", errDaemonAuth), exitcode.TokenInvalid},
+		{"unclassified", errors.New("some other failure"), exitcode.InternalError},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := exitCodeForTunnelError(c.err); got != c.want {
+				t.Fatalf("exitCodeForTunnelError(%v) = %d, want %d", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsTunnelUpPortResolutionUsageErrorClassifiesUsagePaths(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"usage sentinel", fmt.Errorf("%w: choose a daemon", errTunnelUpPortResolutionUsage), true},
+		{"ambiguous state", fmt.Errorf("%w: example", tunnel.ErrAmbiguousTunnelState), true},
+		{"load failure", errors.New("state dir unreadable"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isTunnelUpPortResolutionUsageError(c.err); got != c.want {
+				t.Fatalf("isTunnelUpPortResolutionUsageError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExitCodeForTunnelErrorSpecificSentinelsStillMatchUmbrella documents
+// the wire-contract promise: errDaemonTunnelControlTokenUnavailable and
+// errDaemonTunnelListUnreachable wrap errDaemonTunnelListUnavailable, so
+// downstream callers that match on the umbrella via errors.Is continue to
+// work. If a future refactor makes the two specific sentinels standalone,
+// this test fails loudly and the author must either adjust the caller or
+// keep the wrap in place.
+func TestExitCodeForTunnelErrorSpecificSentinelsStillMatchUmbrella(t *testing.T) {
+	cases := []error{
+		errDaemonTunnelControlTokenUnavailable,
+		errDaemonTunnelListUnreachable,
+	}
+	for _, err := range cases {
+		if !errors.Is(err, errDaemonTunnelListUnavailable) {
+			t.Fatalf("errors.Is(%v, errDaemonTunnelListUnavailable) = false, want true", err)
+		}
+	}
+}
+
+// TestFetchTunnelListWrapsListUnreachableOn404 verifies that a 404 from
+// GET /tunnels routes through the new errDaemonTunnelListUnreachable
+// sentinel, so exitCodeForTunnelError emits TunnelUnreachable. Without
+// this the P2-C split is defined in code but not actually reachable from
+// the real HTTP call site (the feedback called out the "not just defined
+// in exitcode.go and unreachable" audit requirement).
+func TestFetchTunnelListWrapsListUnreachableOn404(t *testing.T) {
+	setupLocalOnlyTokenDir(t)
+
+	if _, _, err := token.LoadOrGenerateTunnelControlToken(); err != nil {
+		t.Fatalf("LoadOrGenerateTunnelControlToken: %v", err)
+	}
+
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	hostPort := strings.TrimPrefix(ts.URL, "http://")
+	_, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", hostPort, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi(%q): %v", portStr, err)
+	}
+
+	_, err = fetchTunnelList(port)
+	if err == nil {
+		t.Fatal("expected error for 404")
+	}
+	if !errors.Is(err, errDaemonTunnelListUnreachable) {
+		t.Fatalf("err = %v, want errDaemonTunnelListUnreachable", err)
+	}
+	if got := exitCodeForTunnelError(err); got != exitcode.TunnelUnreachable {
+		t.Fatalf("exitCodeForTunnelError = %d, want TunnelUnreachable=%d", got, exitcode.TunnelUnreachable)
+	}
+}
+
+// TestFetchTunnelListWrapsControlTokenUnavailableWhenAuthMissing verifies
+// that the "local control token missing" branch of fetchTunnelList routes
+// through errDaemonTunnelControlTokenUnavailable, landing in the
+// DaemonTunnelControlTokenUnavailable exit code. Together with the 404
+// test above, this covers both P2-C call sites.
+func TestFetchTunnelListWrapsControlTokenUnavailableWhenAuthMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Point the token store at the tmp home but do NOT generate a token;
+	// ReadTunnelControlToken will return os.ErrNotExist.
+	cache := filepath.Join(home, ".cache", "cc-clip")
+	if err := os.MkdirAll(cache, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	prev := token.TokenDirOverride
+	token.TokenDirOverride = cache
+	t.Cleanup(func() { token.TokenDirOverride = prev })
+
+	// Point at any unreachable port — the function returns before dialing
+	// because authed==false.
+	_, err := fetchTunnelList(65500)
+	if err == nil {
+		t.Fatal("expected error when tunnel control token is missing")
+	}
+	if !errors.Is(err, errDaemonTunnelControlTokenUnavailable) {
+		t.Fatalf("err = %v, want errDaemonTunnelControlTokenUnavailable", err)
+	}
+	if got := exitCodeForTunnelError(err); got != exitcode.DaemonTunnelControlTokenUnavailable {
+		t.Fatalf("exitCodeForTunnelError = %d, want DaemonTunnelControlTokenUnavailable=%d", got, exitcode.DaemonTunnelControlTokenUnavailable)
 	}
 }

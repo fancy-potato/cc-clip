@@ -9,21 +9,31 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 // DarwinNotifier delivers macOS notifications with image thumbnails
 // via terminal-notifier, falling back to osascript (text-only) if unavailable.
 type DarwinNotifier struct {
-	previewDir         string
-	terminalNotifier   string // path to terminal-notifier binary, empty if not found
+	previewDir       string
+	terminalNotifier string // path to terminal-notifier binary, empty if not found
 }
 
 // maxPreviewFiles limits the number of preview images retained on disk.
 const maxPreviewFiles = 50
 
+func darwinPreviewDir() string {
+	home, err := userhome.Dir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".cache", "cc-clip", "previews")
+	}
+	return filepath.Join(os.TempDir(), "cc-clip", "previews")
+}
+
 func NewDarwinNotifier() *DarwinNotifier {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".cache", "cc-clip", "previews")
+	dir := darwinPreviewDir()
 	os.MkdirAll(dir, 0700)
 	cleanupPreviews(dir, maxPreviewFiles)
 
@@ -81,10 +91,7 @@ func (n *DarwinNotifier) Deliver(_ context.Context, env NotifyEnvelope) error {
 			if p.Format == "jpeg" {
 				ext = ".jpeg"
 			}
-			sid := p.SessionID
-			if len(sid) > 8 {
-				sid = sid[:8]
-			}
+			sid := sanitizePreviewSessionID(p.SessionID)
 			path := filepath.Join(n.previewDir, fmt.Sprintf("preview-%s-%d%s", sid, p.Seq, ext))
 			if err := os.WriteFile(path, p.ImageData, 0600); err == nil {
 				imagePath = path
@@ -112,10 +119,7 @@ func (n *DarwinNotifier) Notify(_ context.Context, evt NotifyEvent) error {
 		if evt.Format == "jpeg" {
 			ext = ".jpeg"
 		}
-		sid := evt.SessionID
-		if len(sid) > 8 {
-			sid = sid[:8]
-		}
+		sid := sanitizePreviewSessionID(evt.SessionID)
 		previewPath = filepath.Join(n.previewDir, fmt.Sprintf("preview-%s-%d%s", sid, evt.Seq, ext))
 		if err := os.WriteFile(previewPath, evt.ImageData, 0600); err != nil {
 			previewPath = ""
@@ -145,6 +149,9 @@ func (n *DarwinNotifier) sendViaTerminalNotifier(title, subtitle, body, imagePat
 		"-message", body,
 		"-group", "cc-clip",
 	}
+	if sound, err := ReadNotificationSound(); err == nil && sound != "" {
+		args = append(args, "-sound", sound)
+	}
 	if imagePath != "" {
 		args = append(args, "-contentImage", imagePath)
 		args = append(args, "-open", "file://"+imagePath)
@@ -152,10 +159,63 @@ func (n *DarwinNotifier) sendViaTerminalNotifier(title, subtitle, body, imagePat
 	return exec.Command(n.terminalNotifier, args...).Run()
 }
 
+// sanitizePreviewSessionID truncates the sessionID to at most 8 characters
+// and replaces any rune outside [A-Za-z0-9_-] with underscore. Without this
+// guard a malicious sessionID like "../evil" would traverse out of previewDir
+// when embedded in a filepath.Join call — even though len("../evil")==7
+// passes the 8-char truncation, the resulting path lands above previewDir.
+// Always returns a non-empty string (empty sessionID yields "unknown").
+func sanitizePreviewSessionID(sid string) string {
+	if len(sid) > 8 {
+		sid = sid[:8]
+	}
+	b := make([]byte, 0, len(sid))
+	for i := 0; i < len(sid); i++ {
+		c := sid[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+			b = append(b, c)
+		default:
+			b = append(b, '_')
+		}
+	}
+	if len(b) == 0 {
+		return "unknown"
+	}
+	return string(b)
+}
+
+// sanitizeForAppleScript strips every rune outside printable ASCII (0x20-0x7E)
+// plus horizontal tab, and explicitly drops the Unicode line terminators
+// U+2028/U+2029 that AppleScript's tokenizer treats as line breaks. After
+// sanitization the string contains only characters for which Go's %q and
+// AppleScript's `"…"` string literal syntax agree, so embedding via fmt.Sprintf
+// with %q is safe — a hostile sender cannot escape the string literal,
+// inject newlines, or smuggle an AppleScript command.
+func sanitizeForAppleScript(s string) string {
+	b := make([]rune, 0, len(s))
+	for _, r := range s {
+		// U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR: AppleScript
+		// treats these as line breaks even though they are valid UTF-8.
+		if r == '\u2028' || r == '\u2029' {
+			b = append(b, '_')
+			continue
+		}
+		if r == '\t' || (r >= 0x20 && r <= 0x7E) {
+			b = append(b, r)
+			continue
+		}
+		b = append(b, '_')
+	}
+	return string(b)
+}
+
 func (n *DarwinNotifier) sendViaOsascript(title, subtitle, body string) error {
 	script := fmt.Sprintf(
 		`display notification %q with title %q subtitle %q`,
-		body, title, subtitle,
+		sanitizeForAppleScript(body),
+		sanitizeForAppleScript(title),
+		sanitizeForAppleScript(subtitle),
 	)
 	return exec.Command("osascript", "-e", script).Run()
 }

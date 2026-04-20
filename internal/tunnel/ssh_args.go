@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/shunmei/cc-clip/internal/userhome"
 	"github.com/shunmei/cc-clip/internal/win32"
 )
 
@@ -28,14 +29,18 @@ var (
 // operator that flips the env var at runtime doesn't keep getting the stale
 // value forever, and drops the cache when the cached path has disappeared
 // from disk (e.g., package upgrade replaced the binary).
+//
+// Errors are intentionally NOT cached. A daemon that started before ssh
+// was installed on the host would otherwise pin the failure for the full
+// process lifetime — never recovering once ssh appeared on PATH. Caching
+// only successful results keeps the hot path fast (a single Stat + lock
+// acquire) while letting transient resolution failures clear on the next
+// call.
 func resolveSSHBinary() (string, error) {
 	override := strings.TrimSpace(os.Getenv("CC_CLIP_SSH"))
 	sshBinaryMu.Lock()
 	defer sshBinaryMu.Unlock()
-	if sshBinaryCached && sshBinaryOverride == override {
-		if sshBinaryErr != nil {
-			return "", sshBinaryErr
-		}
+	if sshBinaryCached && sshBinaryOverride == override && sshBinaryErr == nil {
 		if _, err := os.Stat(sshBinaryPath); err == nil {
 			return sshBinaryPath, nil
 		}
@@ -45,25 +50,26 @@ func resolveSSHBinary() (string, error) {
 	sshBinaryOverride = override
 	sshBinaryCached = true
 	if override != "" {
-		abs, err := filepath.Abs(override)
+		resolved, err := resolveTrustedSSHBinaryOverride(override)
 		if err != nil {
-			sshBinaryErr = fmt.Errorf("resolve CC_CLIP_SSH=%q: %w", override, err)
-			return "", sshBinaryErr
-		}
-		if err := requireTrustedSSHBinaryPrefix(abs); err != nil {
+			// Do not cache: a future call (after the operator fixes
+			// CC_CLIP_SSH or installs the binary) must retry.
+			sshBinaryCached = false
 			sshBinaryErr = err
 			return "", sshBinaryErr
 		}
-		sshBinaryPath = abs
+		sshBinaryPath = resolved
 		return sshBinaryPath, nil
 	}
 	path, err := exec.LookPath("ssh")
 	if err != nil {
+		sshBinaryCached = false
 		sshBinaryErr = fmt.Errorf("locate ssh binary: %w", err)
 		return "", sshBinaryErr
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
+		sshBinaryCached = false
 		sshBinaryErr = fmt.Errorf("resolve ssh binary path: %w", err)
 		return "", sshBinaryErr
 	}
@@ -71,14 +77,34 @@ func resolveSSHBinary() (string, error) {
 	return sshBinaryPath, nil
 }
 
-// requireTrustedSSHBinaryPrefix refuses CC_CLIP_SSH overrides that resolve
-// outside a small allowlist of system/user-local bin directories. Without
-// this, a writable dotfile setting CC_CLIP_SSH=/tmp/evil-ssh would redirect
-// every reconnect through an attacker-controlled binary for the lifetime of
-// the daemon.
-func requireTrustedSSHBinaryPrefix(abs string) error {
+// resolveTrustedSSHBinaryOverride resolves a CC_CLIP_SSH override to its
+// canonical on-disk path and validates that the resolved target itself lives
+// under a trusted prefix. Returning the real path is load-bearing: if we were
+// to validate `/usr/local/bin/ssh-link` but exec the symlink path, a writable
+// symlink could be retargeted after validation and silently escape to an
+// attacker-controlled binary.
+func resolveTrustedSSHBinaryOverride(override string) (string, error) {
+	abs, err := filepath.Abs(override)
+	if err != nil {
+		return "", fmt.Errorf("resolve CC_CLIP_SSH=%q: %w", override, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve CC_CLIP_SSH=%q real path: %w", override, err)
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", fmt.Errorf("normalize CC_CLIP_SSH=%q real path %q: %w", override, resolved, err)
+	}
+	if err := requireTrustedSSHBinaryPrefix(resolved); err != nil {
+		return "", fmt.Errorf("CC_CLIP_SSH=%q resolves to %q: %w", override, resolved, err)
+	}
+	return resolved, nil
+}
+
+func trustedSSHBinaryPrefixes() []string {
 	allowed := []string{"/usr/bin/", "/bin/", "/usr/local/bin/", "/opt/homebrew/bin/", "/usr/sbin/", "/sbin/"}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home, err := userhome.Dir(); err == nil {
 		allowed = append(allowed, filepath.Join(home, ".local", "bin")+string(filepath.Separator), filepath.Join(home, "bin")+string(filepath.Separator))
 	}
 	if runtime.GOOS == "windows" {
@@ -88,30 +114,47 @@ func requireTrustedSSHBinaryPrefix(abs string) error {
 			`C:\Program Files (x86)\Git\usr\bin\`,
 			`C:\ProgramData\chocolatey\bin\`,
 		)
-		if home, err := os.UserHomeDir(); err == nil {
+		if home, err := userhome.Dir(); err == nil {
 			allowed = append(allowed,
 				filepath.Join(home, "scoop", "shims")+string(filepath.Separator),
 				filepath.Join(home, "scoop", "apps")+string(filepath.Separator),
 			)
 		}
 	}
-	candidate := abs
-	if runtime.GOOS == "windows" {
-		candidate = strings.ToLower(filepath.Clean(abs))
+	return allowed
+}
+
+// requireTrustedSSHBinaryPrefix refuses ssh binary paths that live outside a
+// small allowlist of system/user-local bin directories. Callers should pass a
+// cleaned, canonical path when validating an override.
+func requireTrustedSSHBinaryPrefix(path string) error {
+	candidate := filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
+		candidate = resolved
 	}
-	for _, prefix := range allowed {
-		checkPrefix := prefix
+	if runtime.GOOS == "windows" {
+		candidate = strings.ToLower(candidate)
+	}
+	for _, prefix := range trustedSSHBinaryPrefixes() {
+		checkPrefix := filepath.Clean(prefix)
+		if resolved, err := filepath.EvalSymlinks(checkPrefix); err == nil {
+			checkPrefix = resolved
+		}
 		if runtime.GOOS == "windows" {
-			checkPrefix = strings.ToLower(filepath.Clean(prefix))
+			checkPrefix = strings.ToLower(checkPrefix)
 			if !strings.HasSuffix(checkPrefix, `\`) {
 				checkPrefix += `\`
+			}
+		} else {
+			if !strings.HasSuffix(checkPrefix, string(filepath.Separator)) {
+				checkPrefix += string(filepath.Separator)
 			}
 		}
 		if strings.HasPrefix(candidate, checkPrefix) {
 			return nil
 		}
 	}
-	return fmt.Errorf("CC_CLIP_SSH=%q must live under a trusted prefix (e.g. /usr/bin, ~/.local/bin)", abs)
+	return fmt.Errorf("ssh binary %q must live under a trusted prefix (e.g. /usr/bin, ~/.local/bin)", path)
 }
 
 // maxSSHHostLength limits SSH host alias length. DNS labels cap at 253
@@ -235,6 +278,12 @@ const sshConfigResolveTimeout = 10 * time.Second
 // tunnel is alive. Identity-position and session-type directives are
 // stripped so the tunnel is always `-N -R …`.
 var excludedTunnelSSHOptions = map[string]struct{}{
+	// AddKeysToAgent / IdentityAgent / PKCS11Provider: agent / key-loading
+	// directives that would inject keys into the user's ssh-agent or
+	// delegate auth to an attacker-chosen helper binary. The tunnel is a
+	// non-interactive service; it has no business mutating the user's
+	// agent or loading external auth providers.
+	"addkeystoagent":          {},
 	"batchmode":               {},
 	"canonicalizecommand":     {},
 	"clearallforwardings":     {},
@@ -248,20 +297,31 @@ var excludedTunnelSSHOptions = map[string]struct{}{
 	"forwardx11":              {},
 	"forwardx11trusted":       {},
 	"host":                    {},
+	"identityagent":           {},
 	"knownhostscommand":       {},
 	"localcommand":            {},
 	"localforward":            {},
 	"match":                   {},
 	"originalhost":            {},
 	"permitlocalcommand":      {},
-	"proxycommand":            {},
-	"remotecommand":           {},
-	"remoteforward":           {},
-	"requesttty":              {},
-	"serveralivecountmax":     {},
-	"serveraliveinterval":     {},
-	"sessiontype":             {},
-	"sshaskpass":              {},
+	// PermitTunnel / Tunnel / TunnelDevice: layer-3 VPN-style tun/tap
+	// directives. The reverse-forward tunnel ssh process must only be a
+	// `-N -R` port forward, never a tun(4) peer — which would create a
+	// virtual network interface and route host traffic through the
+	// remote. Strip so a hostile ssh_config can't upgrade the forward
+	// into a kernel-level tun device.
+	"permittunnel":        {},
+	"pkcs11provider":      {},
+	"proxycommand":        {},
+	"remotecommand":       {},
+	"remoteforward":       {},
+	"requesttty":          {},
+	"serveralivecountmax": {},
+	"serveraliveinterval": {},
+	"sessiontype":         {},
+	"sshaskpass":          {},
+	"tunnel":              {},
+	"tunneldevice":        {},
 }
 
 func resolveSSHTunnelConfig(ctx context.Context, cfg TunnelConfig) (TunnelConfig, error) {
@@ -340,6 +400,47 @@ func sshTunnelScratchRoot() string {
 		}
 	}
 	return root
+}
+
+// sweepStaleSSHTunnelScratchDirs removes `cc-clip-ssh-config-*` temp
+// directories under sshTunnelScratchRoot that are older than the given
+// age. Previous daemon crashes (OOM kill, launchd unclean stop, panic)
+// leave these behind because buildSSHTunnelArgs' cleanup closure only
+// runs in the reconnect-loop exit path. Over weeks of daemon restarts
+// the pile grows unboundedly — every tunnel spawn creates one dir.
+//
+// maxAge bounds how aggressive the sweep is. Anything younger could
+// still be owned by a live tunnel process from this or a sibling
+// cc-clip daemon; removing it would break the ongoing ssh session. One
+// hour is long enough to outlive any tunnel's cold-start grace while
+// still reclaiming the overwhelming majority of abandoned scratch dirs.
+//
+// Best-effort: errors are logged but not returned — a garbage-collection
+// failure must never block tunnel startup.
+func sweepStaleSSHTunnelScratchDirs(maxAge time.Duration) {
+	root := sshTunnelScratchRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "cc-clip-ssh-config-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(root, name))
+	}
 }
 
 func buildSSHTunnelArgs(cfg TunnelConfig, configPath string) []string {

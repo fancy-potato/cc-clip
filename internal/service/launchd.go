@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 const (
@@ -15,28 +17,71 @@ const (
 	plistFileName = "com.cc-clip.daemon.plist"
 )
 
+func launchdFallbackBaseDir() string {
+	return filepath.Join(os.TempDir(), "cc-clip")
+}
+
 // PlistPath returns the full path to the launchd plist file.
 func PlistPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join("~", "Library", "LaunchAgents", plistFileName)
+	home, err := userhome.Dir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, "Library", "LaunchAgents", plistFileName)
 	}
-	return filepath.Join(home, "Library", "LaunchAgents", plistFileName)
+	return filepath.Join(launchdFallbackBaseDir(), "LaunchAgents", plistFileName)
 }
 
 // logPath returns the path for daemon log output.
 func logPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join("~", "Library", "Logs", "cc-clip.log")
+	home, err := userhome.Dir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, "Library", "Logs", "cc-clip.log")
 	}
-	return filepath.Join(home, "Library", "Logs", "cc-clip.log")
+	return filepath.Join(launchdFallbackBaseDir(), "Logs", "cc-clip.log")
+}
+
+// escapeXMLText escapes a string for safe embedding inside an XML text node
+// (i.e. between `<string>` and `</string>`). Hand-rolled to avoid pulling in
+// encoding/xml: the `internal/service/package_contents_test.go` anti-feature
+// test restricts which packages this subtree may import. The five mappings
+// below are the full set required for #PCDATA per XML 1.0, plus `'` which
+// some strict XML consumers reject inside attribute values even though our
+// usage is text-only. A user installation path such as
+// `/Users/alice/My Launch & Setup/cc-clip` would otherwise emit invalid XML
+// and be rejected by `launchctl load` at install time.
+func escapeXMLText(s string) string {
+	// Replace in a single pass to avoid N-pass cascades where `&amp;` gets
+	// re-escaped into `&amp;amp;`. Order is irrelevant because the
+	// replacement bytes (<, >, ", ', &) are themselves re-escaped by this
+	// same map; we just need to ensure we don't loop over our own output.
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '&':
+			b.WriteString("&amp;")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '"':
+			b.WriteString("&quot;")
+		case '\'':
+			b.WriteString("&apos;")
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 // generatePlist creates the launchd plist XML content.
 // Includes an explicit PATH so Homebrew tools (pngpaste) are found
 // even though launchd doesn't source the user's shell profile.
 func generatePlist(binaryPath string, port int) string {
+	// Every interpolated path/label/log is passed through escapeXMLText so
+	// metacharacters in user-controllable values (binary path, $HOME) can't
+	// break the plist XML. The port is an int, not XML-dangerous, but we
+	// still %d-format rather than %s-interpolate to keep the contract tight.
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -65,7 +110,7 @@ func generatePlist(binaryPath string, port int) string {
     <string>%s</string>
 </dict>
 </plist>
-`, plistLabel, binaryPath, port, logPath(), logPath())
+`, escapeXMLText(plistLabel), escapeXMLText(binaryPath), port, escapeXMLText(logPath()), escapeXMLText(logPath()))
 }
 
 // launchctlLoad loads a plist via launchctl. Overridable for testing.

@@ -458,6 +458,39 @@ Host myalias
 
 ---
 
+## SSH Config Error Sentinels (`ErrOnlyGlobMatch`, `ErrHostBlockInInclude`, `ErrSymlinkConfig`)
+
+The three error names below come straight from `internal/sshconfig` — if `cc-clip setup` / `connect` / `uninstall --peer` prints one of these sentinel strings in a warning or error, the linked section explains the fix.
+
+### `ErrOnlyGlobMatch` — alias only matches a wildcard / negation `Host` block
+
+**Symptom:** `cc-clip setup myalias` or `cc-clip connect myalias` prints a warning mentioning `ErrOnlyGlobMatch`, or the human message *"alias is matched only by a wildcard or negation `Host` pattern"*.
+
+**Cause:** The only `Host` stanza in `~/.ssh/config` that would apply to `myalias` is a wildcard (`Host *`, `Host *.example.com`, `Host srv?`) or negation (`!myalias`). cc-clip refuses to write per-peer `CC_CLIP_*` SetEnv into a wildcard block because it would leak your laptop's token path and port to every host that matches.
+
+**Fix:** Add a dedicated literal `Host <alias>` block. See *"Host is matched only by a wildcard or negation pattern"* above for a copy-paste-ready example. OpenSSH applies the first value for each option across all matching blocks, so layering a literal block over an existing wildcard is safe.
+
+### `ErrHostBlockInInclude` — `Host <alias>` lives in an `Include`d file
+
+**Symptom:** `cc-clip setup myalias` prints a warning mentioning `ErrHostBlockInInclude`, or the human message *"no literal `Host <alias>` block in top-level ssh_config; cc-clip does not walk Include directives"*.
+
+**Cause:** The top-level `~/.ssh/config` has one or more `Include` directives (e.g. `Include ~/.ssh/config.d/*`) but no literal `Host <alias>` block that matches your alias. cc-clip intentionally does **not** walk `Include` chains — walking them would let a path-traversal exploit in an included file rewrite an unrelated one — so the alias might legitimately live in a fragment cc-clip cannot see.
+
+**Fix:** Inline the `Host <alias>` stanza into the top-level `~/.ssh/config` and rerun setup. See *"no literal `Host <alias>` block in top-level ssh_config"* above for the full explanation. Disabling the `Include` also works if you don't rely on the other hosts it carries.
+
+### `ErrSymlinkConfig` — `~/.ssh/config` is a symlink
+
+**Symptom:** `cc-clip setup` / `connect` / `uninstall --peer` prints a warning mentioning `ErrSymlinkConfig`, or the human message *"refusing to edit symlinked ~/.ssh/config"*.
+
+**Cause:** `~/.ssh/config` is a symlink (common with dotfile managers). cc-clip refuses to replace it because an atomic rewrite would replace the symlink itself with a regular file, detaching the path from your dotfiles target. Same refusal applies when removing the managed SetEnv block during `uninstall --peer`.
+
+**Fix:** Decide how you want cc-clip's managed SetEnv block to be stored:
+
+- **Easiest:** resolve the symlink to a regular file (`cp -L ~/.ssh/config ~/.ssh/config.real && rm ~/.ssh/config && mv ~/.ssh/config.real ~/.ssh/config`) and rerun setup. cc-clip will then manage the block in place. You lose the dotfile link.
+- **Dotfile-friendly:** edit the symlink's target file through your dotfile manager and add the SetEnv block by hand (copy the template from the *"Multi-laptop on a Shared Remote Account"* section of the README). cc-clip will not touch it on subsequent runs, but it also won't refresh it — rerun your dotfile sync when the per-peer port/state dir changes.
+
+---
+
 ## Notifications Silently Drop — Inspect `notify-health.log` and `CC_CLIP_STRICT`
 
 The remote `cc-clip-hook` script is fire-and-forget by design: any failure posting to the local daemon's `/notify` endpoint is logged but never blocks Claude Code. If notifications aren't arriving on your workstation:

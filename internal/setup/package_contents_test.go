@@ -1,10 +1,12 @@
 package setup
 
 import (
+	"fmt"
+	"go/scanner"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 )
@@ -27,6 +29,15 @@ func TestPackageDoesNotTouchSSHConfig(t *testing.T) {
 	//   - the O_NOFOLLOW guard that only existed to protect config writes
 	// All substrings are matched case-insensitively, so `SSHConfig`,
 	// `SSHConfigOptions`, etc. are already covered by the `sshconfig` entry.
+	//
+	// IMPORTANT for future contributors: identifiers like `O_NOFOLLOW` and
+	// `openForWrite` are on this list because they were the exact names used
+	// by the deleted ssh-config writer. If you are adding an UNRELATED
+	// nofollow helper to `internal/setup` (say, a generic hardened-open for
+	// some new non-ssh-config file), do NOT reuse these names — pick a
+	// different identifier, OR remove the stale entry here and document the
+	// rationale in the commit message. This list is a spelling-based guard;
+	// collisions with unrelated features silently expand its blast radius.
 	forbidden := []string{
 		".ssh/config",
 		"RemoteForward",
@@ -68,7 +79,17 @@ func TestPackageDoesNotTouchSSHConfig(t *testing.T) {
 			return filepath.SkipDir
 		}
 		name := d.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if !strings.HasSuffix(name, ".go") {
+			return nil
+		}
+		// Only this file (the anti-feature test itself) is allowed to
+		// mention the forbidden substrings: that is where they are listed.
+		// Scan every other file — production AND test — because test files
+		// can equally well shell out or use os-level APIs to rewrite
+		// ~/.ssh/config. A previous revision skipped `_test.go`, which
+		// left a trivial bypass for a regression: `helper_test.go` that
+		// exec's `sed -i /...ssh/config` would have passed silently.
+		if name == "package_contents_test.go" {
 			return nil
 		}
 		files = append(files, path)
@@ -89,7 +110,20 @@ func TestPackageDoesNotTouchSSHConfig(t *testing.T) {
 		// or `SetEnv CC_CLIP_` shows up in an identifier or code token the
 		// contributor is actually reintroducing sshconfig logic; a comment
 		// mentioning the forbidden text is fine.
-		src := strings.ToLower(stripGoCommentsAndStrings(string(data)))
+		stripped, scanErrs := stripGoCommentsAndStringsWithErrors(string(data))
+		if len(scanErrs) > 0 {
+			// A syntax error in a scanned file is fatal to this
+			// anti-feature test: without a clean tokenization, the
+			// scanner silently discards tokens past the error point,
+			// giving a contributor a free window to smuggle
+			// `sshconfig` identifiers into a file that happens to
+			// have a mid-edit typo. Surface the first error and
+			// instruct the contributor to fix the syntax before
+			// the guard can run.
+			t.Errorf("%s: fix syntax error(s) before anti-feature scan can run: %v", path, scanErrs[0])
+			continue
+		}
+		src := strings.ToLower(stripped)
 		for _, needle := range forbidden {
 			if strings.Contains(src, strings.ToLower(needle)) {
 				t.Errorf("%s contains forbidden reference %q; internal/setup must not touch ~/.ssh/config (see CLAUDE.md)", path, needle)
@@ -99,25 +133,120 @@ func TestPackageDoesNotTouchSSHConfig(t *testing.T) {
 }
 
 // stripGoCommentsAndStrings removes // line comments, /* … */ block comments,
-// and the contents of "…" / `…` string literals from Go source. Good enough
-// for the anti-feature scan: the invariant is about executable code, so false
-// negatives in rare edge cases (an identifier inside a raw string literal
-// that we blank out) are acceptable.
-var (
-	reGoLineComment  = regexp.MustCompile(`(?m)//[^\n]*`)
-	reGoBlockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
-	reGoRawString    = regexp.MustCompile("`[^`]*`")
-	// Double-quoted strings may contain escaped quotes (\"). Non-greedy
-	// capture between unescaped quotes covers the common cases.
-	reGoDoubleString = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
-)
-
+// and the contents of "…" / `…` / '…' string/rune literals from Go source,
+// leaving only executable tokens (identifiers, operators, keywords,
+// numeric literals). Previous revisions used an ordered sequence of regexps
+// (strip comments, then strings). That was unsafe because a line like
+//
+//	foo := "http://x"; bar := ".ssh/config"
+//
+// would have its `//x"; bar := ".ssh/config` range eaten by the line-comment
+// regex before the string-literal regex ever got to it — bypassing the
+// `.ssh/config` guard entirely. Using `go/scanner` gives us the real Go
+// lexer, so string and comment boundaries are respected regardless of order.
 func stripGoCommentsAndStrings(src string) string {
-	src = reGoBlockComment.ReplaceAllString(src, "")
-	src = reGoLineComment.ReplaceAllString(src, "")
-	src = reGoRawString.ReplaceAllString(src, "``")
-	src = reGoDoubleString.ReplaceAllString(src, `""`)
-	return src
+	stripped, _ := stripGoCommentsAndStringsWithErrors(src)
+	return stripped
+}
+
+// stripGoCommentsAndStringsWithErrors is the error-surfacing sibling of
+// stripGoCommentsAndStrings. Callers that need to detect a truncated
+// tokenization (the anti-feature test, specifically) must use this
+// variant — a silently-dropped scanner error could otherwise let a
+// contributor smuggle forbidden identifiers past the substring scan by
+// introducing a syntax error earlier in the file. Non-fatal callers can
+// keep using stripGoCommentsAndStrings.
+func stripGoCommentsAndStringsWithErrors(src string) (string, []error) {
+	var (
+		s       scanner.Scanner
+		scanErr []error
+	)
+	fset := token.NewFileSet()
+	file := fset.AddFile("scan.go", fset.Base(), len(src))
+	// Mode 0 means: do NOT report comments as tokens (they are skipped).
+	// Errors are captured into scanErr so the caller can fail loudly
+	// rather than silently accepting a half-scanned file. A previous
+	// revision used an empty error handler — that let a truncated
+	// tokenization silently bypass the anti-feature substring scan.
+	s.Init(file, []byte(src), func(pos token.Position, msg string) {
+		scanErr = append(scanErr, fmt.Errorf("%s: %s", pos, msg))
+	}, 0)
+
+	var b strings.Builder
+	for {
+		_, tok, lit := s.Scan()
+		if tok == token.EOF {
+			break
+		}
+		switch tok {
+		case token.COMMENT:
+			// scanner.Mode 0 elides comments, but keep this arm for clarity
+			// if we ever set ScanComments in the future.
+			continue
+		case token.STRING, token.CHAR:
+			// Drop the literal contents entirely. The guard cares whether
+			// forbidden substrings appear in executable code; string /
+			// rune literals are data, not code, and a comment or doc that
+			// mentions `.ssh/config` should not trip the scan.
+			continue
+		case token.IDENT, token.INT, token.FLOAT, token.IMAG:
+			b.WriteString(lit)
+			b.WriteByte(' ')
+		default:
+			// Keywords and operators surface as their token literal form.
+			// We still emit them so identifier-like keywords (e.g. `func`)
+			// are visible to the substring scan — they never match any of
+			// the forbidden entries, but we want the output to look like
+			// code rather than a run-together blob.
+			b.WriteString(tok.String())
+			b.WriteByte(' ')
+		}
+	}
+	return b.String(), scanErr
+}
+
+// TestStripGoCommentsAndStringsHandlesMixedCommentAndStringOnOneLine pins the
+// P1-7 regression: a previous implementation stripped `//` line comments
+// before string literals, so a line containing both would have its comment
+// range eaten past the closing quote of the following string literal, which
+// in turn made `.ssh/config` hide inside a comment the scanner never
+// examined. The go/scanner rewrite tokenises correctly regardless of order;
+// this test fails loud if someone swaps it back for a regex sequence.
+func TestStripGoCommentsAndStringsHandlesMixedCommentAndStringOnOneLine(t *testing.T) {
+	// Wrap the problematic line in a valid Go source snippet so the lexer
+	// accepts it. If the strip function bails on the first error, the
+	// forbidden substring would leak through and the test would pass
+	// misleadingly — hence asserting the presence of benign identifiers
+	// (`foo`, `bar`) alongside the absence of the forbidden substring.
+	src := "package p\n" +
+		"func _f() { foo := \"http://x\"; bar := \".ssh/config\"; _ = foo; _ = bar }\n"
+	stripped := strings.ToLower(stripGoCommentsAndStrings(src))
+	if strings.Contains(stripped, ".ssh/config") {
+		t.Fatalf("string literal contents leaked into stripped code output: %q", stripped)
+	}
+	if strings.Contains(stripped, "http://x") {
+		t.Fatalf("string literal contents leaked into stripped code output: %q", stripped)
+	}
+	// Identifiers should survive so the forbidden-substring scan still sees
+	// any reintroduced deleted-helper names that happen to co-occur with a
+	// string literal on the same source line.
+	if !strings.Contains(stripped, "foo") || !strings.Contains(stripped, "bar") {
+		t.Fatalf("identifiers dropped from stripped output: %q", stripped)
+	}
+}
+
+// TestStripGoCommentsAndStringsDoesNotTripOnForbiddenInsideCommentOrString
+// is the positive counterpart: the forbidden substrings SHOULD be eaten
+// when they sit inside comments or string literals, otherwise harmless
+// docstrings mentioning the legacy directive names would trip the guard.
+func TestStripGoCommentsAndStringsDoesNotTripOnForbiddenInsideCommentOrString(t *testing.T) {
+	src := "package p\n" +
+		"// RemoteForward only lives in docstrings here; should be stripped\n" +
+		"const _ = \"RemoteForward literal\"\n"
+	stripped := strings.ToLower(stripGoCommentsAndStrings(src))
+	if strings.Contains(stripped, "remoteforward") {
+		t.Fatalf("expected RemoteForward in comment/string to be stripped, got %q", stripped)
+	}
 }
 
 // TestPackageDoesNotDependOnSSHConfigRewriters is the import-graph half of
@@ -127,12 +256,23 @@ func stripGoCommentsAndStrings(src string) string {
 // `internal/setup-helpers/`) and import it — the compiler would resolve the
 // import but the substring scan only looks at files under `internal/setup`.
 //
-// `go list -deps` walks the full import closure (direct + transitive), so
-// any package in the "forbidden" set that shows up here means `internal/setup`
-// is either calling it directly or pulling it in through another dep. The
-// rule is strict: contributors who need ssh_config behavior must route users
-// through `cmd/cc-clip` (which owns user-facing flows) instead of hiding it
-// behind a `setup.X` call.
+// `go list -deps` walks the full import closure (direct + transitive) for
+// the `./` argument (this package, `internal/setup`). Any package in the
+// "forbidden" set that shows up here means `internal/setup` is either
+// calling it directly or pulling it in through another dep. The rule is
+// strict: contributors who need ssh_config behavior must route users
+// through `cmd/cc-clip` (which owns user-facing flows) instead of hiding
+// it behind a `setup.X` call.
+//
+// Scope of this guarantee: it covers `internal/setup`'s OWN transitive
+// deps only. It deliberately does NOT walk `cmd/cc-clip`'s dep graph —
+// that binary legitimately imports `internal/sshconfig` and an expanded
+// scan would fire on every compile. The anti-feature invariant we are
+// defending is "`internal/setup` stays flat and ssh-config-free", not
+// "the whole repo pretends sshconfig does not exist". If a future
+// contributor wires ssh-config logic into `cmd/cc-clip` itself, that has
+// to be caught by the per-package invariants documented in AGENTS.md,
+// not by this test.
 func TestPackageDoesNotDependOnSSHConfigRewriters(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skipf("go toolchain not in PATH: %v", err)

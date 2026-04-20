@@ -4,10 +4,13 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
 
 func writeTempConfig(t *testing.T, content string) string {
@@ -27,6 +30,55 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read: %v", err)
 	}
 	return string(data)
+}
+
+// fakeUserhomeResolver is a minimal test double satisfying the
+// userhome.Resolver interface. Fields are plain func values so each
+// test can configure only what it exercises.
+type fakeUserhomeResolver struct {
+	lookup func(string) (*user.User, error)
+	home   func() (string, error)
+	sudo   func() bool
+}
+
+func (f fakeUserhomeResolver) LookupUser(name string) (*user.User, error) {
+	return f.lookup(name)
+}
+
+func (f fakeUserhomeResolver) UserHomeDir() (string, error) {
+	return f.home()
+}
+
+func (f fakeUserhomeResolver) IsSudoRoot() bool {
+	if f.sudo == nil {
+		return false
+	}
+	return f.sudo()
+}
+
+func TestLocalConfigPathUsesSUDOUserHome(t *testing.T) {
+	t.Setenv("SUDO_USER", "alice")
+	t.Setenv("SUDO_UID", "501")
+	userhome.SetResolverForTest(t, fakeUserhomeResolver{
+		lookup: func(name string) (*user.User, error) {
+			if name != "alice" {
+				t.Fatalf("lookupUser(%q), want alice", name)
+			}
+			return &user.User{Username: "alice", Uid: "501", HomeDir: "/Users/alice"}, nil
+		},
+		home: func() (string, error) {
+			return "/var/root", nil
+		},
+		sudo: func() bool { return true },
+	})
+
+	got, err := LocalConfigPath()
+	if err != nil {
+		t.Fatalf("LocalConfigPath: %v", err)
+	}
+	if got != filepath.Join("/Users/alice", ".ssh", "config") {
+		t.Fatalf("LocalConfigPath = %q, want /Users/alice/.ssh/config", got)
+	}
 }
 
 func TestApplyInsertsBlockInsideExistingHost(t *testing.T) {
@@ -297,6 +349,18 @@ Host other
 	}
 }
 
+func TestApplyReportsHostBlockInIndentedTopLevelInclude(t *testing.T) {
+	path := writeTempConfig(t, `  Include ~/.ssh/conf.d/*.conf
+
+Host other
+  HostName other.example.com
+`)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrHostBlockInInclude) {
+		t.Fatalf("expected ErrHostBlockInInclude, got %v", err)
+	}
+}
+
 func TestApplyIgnoresIncludeInsideHostBlock(t *testing.T) {
 	path := writeTempConfig(t, `Host other
   HostName other.example.com
@@ -363,6 +427,73 @@ func TestHostBlockStatusFromBytesReportsUnsupportedIncludeLayout(t *testing.T) {
 	err := HostBlockStatusFromBytes(data, "myalias")
 	if !errors.Is(err, ErrHostBlockInInclude) {
 		t.Fatalf("expected ErrHostBlockInInclude, got %v", err)
+	}
+}
+
+// TestApplyReportsHostBlockInIncludeAfterMatchThenHost pins the
+// Match → Host → Include monotonic-reachability bit. The nested-state
+// approach used to flip `insideHostBlock=true` on the Host directive
+// and then skip the Include as "inside a Host that doesn't match our
+// alias". But once a Match has been seen earlier in the file it could
+// have fired unconditionally (`Match all`) and the Include is still
+// reachable from its body — a later Host directive does not erase that.
+// Without the monotonic reachableViaMatch bit this returns
+// ErrHostBlockMissing (the wrong answer, silently ignoring the Include).
+func TestApplyReportsHostBlockInIncludeAfterMatchThenHost(t *testing.T) {
+	path := writeTempConfig(t, `Match all
+
+Host other
+  # no alias matching myalias here
+
+Include ~/.ssh/conf.d/other.conf
+`)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrHostBlockInInclude) {
+		t.Fatalf("expected ErrHostBlockInInclude (Include after Match→Host is reachable), got %v", err)
+	}
+}
+
+// TestHasIncludeDirectiveHandlesBackslashContinuation pins that the
+// scanner honors ssh_config's line-continuation syntax: a physical line
+// ending in `\` (ignoring trailing whitespace) extends the logical
+// directive. The continuation body must NOT be mis-classified as a new
+// top-level directive.
+//
+// OpenSSH semantics: `Host foo \` + whitespace-indented `extra` = one
+// Host directive carrying two aliases (`foo` and `extra`), opening a
+// single host block. A subsequent `Include` at column 0 is then INSIDE
+// that Host block and conditional on matching foo/extra, so querying
+// about an unrelated alias must NOT surface ErrHostBlockInInclude
+// (the Include cannot reach us). Querying about `extra` must succeed
+// because the continuation adds `extra` as a literal alias. Without
+// the continuation-aware scanner, the continuation line `  extra` gets
+// treated as a separate token and the classification desyncs.
+func TestHasIncludeDirectiveHandlesBackslashContinuation(t *testing.T) {
+	data := []byte("Host foo \\\n  extra\n\nInclude ~/.ssh/conf.d/extra.conf\n")
+	// `extra` must be a literal match via continuation, not a miss.
+	if err := HostBlockStatusFromBytes(data, "extra"); err != nil {
+		t.Fatalf("expected `extra` alias to match the Host foo continuation, got %v", err)
+	}
+	// Unrelated alias: no literal Host matches, but the Include sits
+	// inside the `Host foo extra` block so it does NOT reach us. The
+	// correct classification is ErrHostBlockMissing, not InInclude.
+	if err := HostBlockStatusFromBytes(data, "myalias"); !errors.Is(err, ErrHostBlockMissing) {
+		t.Fatalf("expected ErrHostBlockMissing (Include sits inside unrelated Host block via continuation), got %v", err)
+	}
+}
+
+// TestHasIncludeDirectiveHandlesBackslashContinuationWithTopLevelInclude
+// covers the complementary case where the Include is at top level
+// (before any Host/Match) and the Host directive later uses a
+// continuation. The Include is unconditionally reachable, so the
+// classifier must surface ErrHostBlockInInclude. Without continuation
+// handling, the `Host foo \` line's continuation body would be
+// mis-read as a second top-level directive and the Include scanner's
+// reachability bookkeeping desyncs.
+func TestHasIncludeDirectiveHandlesBackslashContinuationWithTopLevelInclude(t *testing.T) {
+	data := []byte("Include ~/.ssh/conf.d/extra.conf\n\nHost foo \\\n  extra\n  HostName foo.example.com\n")
+	if err := HostBlockStatusFromBytes(data, "myalias"); !errors.Is(err, ErrHostBlockInInclude) {
+		t.Fatalf("expected ErrHostBlockInInclude (top-level Include before any Host), got %v", err)
 	}
 }
 
@@ -707,19 +838,33 @@ func TestApplyRepairsOrphanedEndMarker(t *testing.T) {
 	}
 }
 
-// TestApplyEscapesEnvValueWithQuotesAndBackslash pins the contract that a
-// value containing `"` or `\` is both quoted AND escaped, even when it has
-// no whitespace. CC_CLIP_STATE_DIR is remote-influenceable, so a pathological
-// path like /home/u/"weird"\dir must not corrupt ssh_config tokenization.
-func TestApplyEscapesEnvValueWithQuotesAndBackslash(t *testing.T) {
+// TestApplyRejectsBackslashInEnvValue pins the contract that a value
+// containing `\` is rejected, because OpenSSH's ssh_config tokenizer does
+// not interpret `\\`/`\"` inside quoted SetEnv values the way this package
+// round-trips them: a written `"a\\b"` would be delivered to the remote as
+// the literal five-byte string `a\\b`, not `a\b`. CC_CLIP_STATE_DIR is
+// remote-influenceable, so we fail Apply rather than silently corrupt the
+// value on round-trip through ssh -G.
+func TestApplyRejectsBackslashInEnvValue(t *testing.T) {
 	path := writeTempConfig(t, "Host myalias\n  HostName srv\n")
-	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_WEIRD": `a"b\c`}); err != nil {
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_WEIRD": `a"b\c`})
+	if !errors.Is(err, ErrInvalidEnvValue) {
+		t.Fatalf("expected ErrInvalidEnvValue for backslash value; got %v", err)
+	}
+}
+
+// TestApplyEscapesEnvValueWithQuotesOnly pins the contract that a value
+// containing `"` (but no `\`) is still quoted-and-escaped so an existing
+// quote cannot prematurely terminate the quoted SetEnv value.
+func TestApplyEscapesEnvValueWithQuotesOnly(t *testing.T) {
+	path := writeTempConfig(t, "Host myalias\n  HostName srv\n")
+	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_WEIRD": `a"b"c`}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	got := readFile(t, path)
-	want := `SetEnv CC_CLIP_WEIRD="a\"b\\c"`
+	want := `SetEnv CC_CLIP_WEIRD="a\"b\"c"`
 	if !strings.Contains(got, want) {
-		t.Fatalf("expected escaped quotes/backslash %q; got:\n%s", want, got)
+		t.Fatalf("expected escaped quotes %q; got:\n%s", want, got)
 	}
 }
 
@@ -1107,16 +1252,18 @@ func TestApplyDoesNotTreatGluedHashAsComment(t *testing.T) {
 
 // TestReadManagedEnvRoundTrip pins that Apply(env) → ReadManagedEnvFromBytes
 // returns the same map, including values that had to be emitted quoted
-// (`#`, spaces, `"`, `\`). A regression that breaks either the writer or
-// the reader would make the new doctor SetEnv-alignment check produce
-// false positives on every run.
+// (`#`, spaces, `"`). Values containing `\` are rejected by Apply (see
+// TestApplyRejectsBackslashInEnvValue) because OpenSSH's ssh_config
+// parser does not interpret the escape the same way this package
+// round-trips it; covering them here would therefore be an incorrect
+// contract.
 func TestReadManagedEnvRoundTrip(t *testing.T) {
 	cases := []map[string]string{
 		{"CC_CLIP_PORT": "18340"},
 		{"CC_CLIP_PORT": "18340", "CC_CLIP_STATE_DIR": "/home/shared/.cache/cc-clip/peers/peer-a"},
 		{"CC_CLIP_PORT": "18340", "CC_CLIP_STATE_DIR": "/home/u with space/peers/peer a"},
 		{"CC_CLIP_PORT": "18340", "CC_CLIP_STATE_DIR": "/home/u/foo#bar"},
-		{"CC_CLIP_PORT": "18340", "CC_CLIP_STATE_DIR": `a"b\c`},
+		{"CC_CLIP_PORT": "18340", "CC_CLIP_STATE_DIR": `a"b_c`},
 	}
 	for i, env := range cases {
 		path := writeTempConfig(t, "Host myalias\n  HostName srv\n")
@@ -1485,5 +1632,454 @@ func TestApplyHandlesLargeConfig(t *testing.T) {
 	got := readFile(t, path)
 	if !strings.Contains(got, "# >>> cc-clip SetEnv") {
 		t.Fatalf("marker not inserted in large config (size=%d)", len(got))
+	}
+}
+
+// TestApplyDetectsUserSetEnvAfterOrphanBeginMarker pins P2-14: a stray
+// `# >>> cc-clip SetEnv (do not edit) >>>` with NO matching end marker
+// must not suppress user-SetEnv conflict detection on subsequent lines.
+// The previous implementation used a simple insideManagedMarker flag
+// that latched on begin and only cleared on end, so any user SetEnv
+// after an orphan begin was silently classified as managed.
+func TestApplyDetectsUserSetEnvAfterOrphanBeginMarker(t *testing.T) {
+	original := `Host myalias
+  HostName srv
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv FOO=bar
+`
+	path := writeTempConfig(t, original)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrSetEnvConflict) {
+		t.Fatalf("expected ErrSetEnvConflict even after orphan begin marker, got %v", err)
+	}
+	if got := readFile(t, path); got != original {
+		t.Fatalf("config was mutated while rejecting conflict:\n--- got\n%s\n--- want\n%s", got, original)
+	}
+}
+
+// TestApplyDetectsUserSetEnvAfterOrphanEndMarker covers the symmetric
+// case: a stray end marker without a matching begin must also not
+// confuse conflict detection.
+func TestApplyDetectsUserSetEnvAfterOrphanEndMarker(t *testing.T) {
+	original := `Host myalias
+  HostName srv
+  # <<< cc-clip SetEnv (do not edit) <<<
+  SetEnv FOO=bar
+`
+	path := writeTempConfig(t, original)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrSetEnvConflict) {
+		t.Fatalf("expected ErrSetEnvConflict with orphan end marker, got %v", err)
+	}
+	if got := readFile(t, path); got != original {
+		t.Fatalf("config was mutated while rejecting conflict:\n--- got\n%s\n--- want\n%s", got, original)
+	}
+}
+
+// TestApplyDetectsUserSetEnvWithMismatchedMarkerCounts covers the
+// broader P2-14 case: two begin markers but only one end should NOT
+// produce a latched "always inside" region that swallows user SetEnv.
+func TestApplyDetectsUserSetEnvWithMismatchedMarkerCounts(t *testing.T) {
+	original := `Host myalias
+  HostName srv
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv CC_CLIP_PORT=18340
+  # <<< cc-clip SetEnv (do not edit) <<<
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv FOO=bar
+`
+	path := writeTempConfig(t, original)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18341"})
+	if !errors.Is(err, ErrSetEnvConflict) {
+		t.Fatalf("expected ErrSetEnvConflict with mismatched marker counts, got %v", err)
+	}
+	if got := readFile(t, path); got != original {
+		t.Fatalf("config was mutated while rejecting conflict:\n--- got\n%s\n--- want\n%s", got, original)
+	}
+}
+
+// TestApplyOrphanSweepPreservesBlanksAndCommentsBetweenOrphanAndLegacySetEnv
+// pins the surgical-removal fix. `findAdjacentManagedSetEnv` skips over
+// blank lines and comments when scanning, so an orphan followed by
+// "blank, blank, comment, managed-SetEnv" is treated as adjacent. The
+// previous removal was an inclusive `[min..max]` span — it deleted the
+// blanks and comment between them as a side effect, violating
+// "never touch user content". The fix removes ONLY the two specific
+// indices (orphan + SetEnv), preserving everything in between.
+func TestApplyOrphanSweepPreservesBlanksAndCommentsBetweenOrphanAndLegacySetEnv(t *testing.T) {
+	// Orphan begin marker (no matching end), then two blank lines, then
+	// a user-authored comment, then the legacy managed SetEnv that the
+	// orphan-adjacent sweep reaps. After Apply, the comment and one or
+	// both blank lines must remain in the rewritten file.
+	original := "Host myalias\n" +
+		"  HostName srv\n" +
+		"  " + markerBegin + "\n" +
+		"\n" +
+		"\n" +
+		"  # user-authored comment that must survive\n" +
+		"  SetEnv CC_CLIP_PORT=18339\n"
+	path := writeTempConfig(t, original)
+	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := readFile(t, path)
+	if !strings.Contains(got, "# user-authored comment that must survive") {
+		t.Fatalf("user comment was deleted by orphan sweep:\n%s", got)
+	}
+	// Old SetEnv with port 18339 must be gone, replaced by 18340 inside
+	// a fresh marker pair.
+	if strings.Contains(got, "CC_CLIP_PORT=18339") {
+		t.Fatalf("expected legacy SetEnv to be reaped; got:\n%s", got)
+	}
+	if !strings.Contains(got, "CC_CLIP_PORT=18340") {
+		t.Fatalf("expected new SetEnv to be written; got:\n%s", got)
+	}
+	// Exactly one new begin marker; the orphan should be gone.
+	if got, want := strings.Count(got, markerBegin), 1; got != want {
+		t.Fatalf("expected exactly %d begin marker after rewrite, got %d", want, got)
+	}
+}
+
+// TestApplyPreservesUserSetEnvContainingCCClipPortSubstring pins P2-15:
+// a user-authored SetEnv whose VALUE happens to contain the literal
+// substring `CC_CLIP_PORT=` must NOT be misclassified as managed and
+// deleted by the orphan-adjacent sweep. The previous substring-based
+// findAdjacentManagedSetEnv would match on any occurrence, regardless
+// of whether the key itself was CC_CLIP_PORT.
+func TestApplyPreservesUserSetEnvContainingCCClipPortSubstring(t *testing.T) {
+	// A user SetEnv whose KEY is MY_VAR but whose VALUE contains the
+	// literal substring `CC_CLIP_PORT=`. We verify it's rejected as a
+	// user-authored conflict (not silently deleted) on Apply.
+	original := `Host myalias
+  HostName srv
+  # >>> cc-clip SetEnv (do not edit) >>>
+  SetEnv MY_VAR="prefix-CC_CLIP_PORT=foo"
+`
+	path := writeTempConfig(t, original)
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrSetEnvConflict) {
+		t.Fatalf("expected ErrSetEnvConflict (user SetEnv w/ substring must not be masked as managed), got %v", err)
+	}
+	if got := readFile(t, path); got != original {
+		t.Fatalf("user SetEnv with CC_CLIP_PORT= substring was mutated:\n--- got\n%s\n--- want\n%s", got, original)
+	}
+}
+
+// TestApplyPreservesCRLFMajorityOverStrayCR pins P2-17: a mostly-LF
+// file with one stray `\r` must stay LF on rewrite. The previous
+// "any line with \r wins" logic would flip the whole file to CRLF,
+// turning a one-line hand-edit artifact into a platform-style
+// conversion.
+func TestApplyPreservesCRLFMajorityOverStrayCR(t *testing.T) {
+	// Four LF lines, one with a stray \r before the \n.
+	original := "Host myalias\n  HostName srv\r\n  User alice\n  Port 22\n"
+	path := writeTempConfig(t, original)
+	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := readFile(t, path)
+	// Majority was LF; the output must not contain \r\n.
+	if strings.Contains(got, "\r\n") {
+		t.Fatalf("expected LF output despite minority CRLF line; got:\n%q", got)
+	}
+	// Sanity: the marker pair was still written.
+	if !strings.Contains(got, markerBegin) {
+		t.Fatalf("expected marker inserted; got:\n%s", got)
+	}
+}
+
+// TestApplyPreservesLFWhenCRLFCountTies covers the tie-break rule: when
+// CRLF and LF line counts are equal, LF wins (matches the Unix-authored
+// common case and keeps behavior deterministic).
+func TestApplyPreservesLFWhenCRLFCountTies(t *testing.T) {
+	// Two LF lines and two CRLF lines: counts tie, fall back to LF.
+	original := "Host myalias\n  HostName srv\r\n  User alice\r\n  Port 22\n"
+	path := writeTempConfig(t, original)
+	if err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	got := readFile(t, path)
+	if strings.Contains(got, "\r\n") {
+		t.Fatalf("expected LF output on tie; got:\n%q", got)
+	}
+}
+
+// TestApplyRejectsMixedLiteralWildcardHostBlock pins P2-A: a Host block
+// whose token list contains BOTH a literal matching the alias AND a
+// non-negated wildcard (e.g. `Host myalias *`) must be rejected with
+// ErrOnlyGlobMatch. Accepting it would inject CC_CLIP_* into a block
+// OpenSSH applies to every host, leaking per-laptop env to every ssh
+// target.
+func TestApplyRejectsMixedLiteralWildcardHostBlock(t *testing.T) {
+	cases := []struct {
+		name   string
+		config string
+		alias  string
+	}{
+		{
+			name:   "literal_then_star",
+			config: "Host myalias *\n  HostName srv\n",
+			alias:  "myalias",
+		},
+		{
+			name:   "star_then_literal",
+			config: "Host * myalias\n  HostName srv\n",
+			alias:  "myalias",
+		},
+		{
+			name:   "literal_between_two_globs",
+			config: "Host dev-* myalias prod-*\n  HostName srv\n",
+			alias:  "myalias",
+		},
+		{
+			name:   "literal_with_qmark_glob",
+			config: "Host myalias foo?\n  HostName srv\n",
+			alias:  "myalias",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTempConfig(t, tc.config)
+			err := ApplyToFile(path, tc.alias, map[string]string{"CC_CLIP_PORT": "18340"})
+			if !errors.Is(err, ErrOnlyGlobMatch) {
+				t.Fatalf("expected ErrOnlyGlobMatch, got %v", err)
+			}
+			if got := readFile(t, path); got != tc.config {
+				t.Fatalf("config was mutated on mixed literal+wildcard rejection:\n--- got\n%s\n--- want\n%s", got, tc.config)
+			}
+		})
+	}
+}
+
+// TestApplyAcceptsLiteralWithNegatedWildcard confirms the flipside of
+// P2-A: a Host token list with a literal match AND a NEGATED wildcard
+// (e.g. `Host myalias !*.example.com`) does not broaden the match,
+// because the negated wildcard only excludes hosts — it doesn't add any.
+// Treating this as mixed-glob-reject would surprise users whose stanza
+// uses negation to narrow rather than expand scope.
+func TestApplyAcceptsLiteralWithNegatedWildcard(t *testing.T) {
+	path := writeTempConfig(t, "Host myalias !*.example.com\n  HostName srv\n")
+	err := ApplyToFile(path, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if err != nil {
+		t.Fatalf("Apply should accept literal+negated-wildcard, got %v", err)
+	}
+	got := readFile(t, path)
+	if !strings.Contains(got, "# >>> cc-clip SetEnv") {
+		t.Fatalf("expected marker inserted; got:\n%s", got)
+	}
+}
+
+// TestReadConfigRejectsOversizeFile pins P2-B: ~/.ssh/config must be
+// capped so a runaway or hostile writer cannot force unbounded memory
+// allocation in readConfig. Exactly at the cap must still parse; one
+// byte over must fail closed with ErrSSHConfigTooLarge.
+func TestReadConfigRejectsOversizeFile(t *testing.T) {
+	dir := t.TempDir()
+	overPath := filepath.Join(dir, "over")
+	// maxSSHConfigSize+1 bytes: clearly over the cap.
+	if err := os.WriteFile(overPath, make([]byte, maxSSHConfigSize+1), 0o600); err != nil {
+		t.Fatalf("seed over: %v", err)
+	}
+	err := ApplyToFile(overPath, "myalias", map[string]string{"CC_CLIP_PORT": "18340"})
+	if !errors.Is(err, ErrSSHConfigTooLarge) {
+		t.Fatalf("expected ErrSSHConfigTooLarge for over-cap file, got %v", err)
+	}
+
+	// At exactly the cap, the size gate must NOT fire. We pad with
+	// comment lines so the content is still syntactically valid
+	// ssh_config (an all-NUL blob would trip other validation).
+	atCapPath := filepath.Join(dir, "atcap")
+	header := "Host myalias\n  HostName srv\n"
+	padding := strings.Repeat("# p\n", (maxSSHConfigSize-len(header))/4)
+	body := header + padding
+	// Pad the remainder with spaces so we land exactly on the cap.
+	if rem := maxSSHConfigSize - len(body); rem > 0 {
+		body += strings.Repeat(" ", rem-1) + "\n"
+	}
+	if len(body) != maxSSHConfigSize {
+		t.Fatalf("seed size = %d, want %d", len(body), maxSSHConfigSize)
+	}
+	if err := os.WriteFile(atCapPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed at-cap: %v", err)
+	}
+	if err := ApplyToFile(atCapPath, "myalias", map[string]string{"CC_CLIP_PORT": "18340"}); err != nil {
+		if errors.Is(err, ErrSSHConfigTooLarge) {
+			t.Fatalf("at-cap file (%d bytes) should not trigger size cap, got %v", len(body), err)
+		}
+		// Other errors (e.g. parse) are acceptable here; the test's
+		// contract is specifically about the size gate.
+	}
+}
+
+// TestSetEnvIsManagedOnly pins P3-F: the helper identifies lines that
+// cc-clip itself wrote, used by the orphan-adjacent sweep to know what
+// it is allowed to delete. A user SetEnv whose VALUE happens to contain
+// the literal substring `CC_CLIP_PORT=` must NOT be classified as
+// managed — key equality is what matters, not a substring match.
+func TestSetEnvIsManagedOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		rest string
+		want bool
+	}{
+		{
+			name: "single_managed_key",
+			rest: "CC_CLIP_PORT=18340",
+			want: true,
+		},
+		{
+			name: "both_managed_keys",
+			rest: "CC_CLIP_PORT=18340 CC_CLIP_STATE_DIR=/home/u/.cache/cc-clip/peers/abc",
+			want: true,
+		},
+		{
+			name: "managed_key_plus_user_key",
+			rest: "CC_CLIP_PORT=18340 MY_VAR=foo",
+			want: false,
+		},
+		{
+			name: "user_only",
+			rest: "MY_VAR=foo",
+			want: false,
+		},
+		{
+			name: "quoted_value_with_embedded_managed_substring",
+			rest: `MY_VAR="prefix-CC_CLIP_PORT=foo"`,
+			want: false,
+		},
+		{
+			name: "quoted_value_with_embedded_equals",
+			rest: `CC_CLIP_STATE_DIR="/path=weird" CC_CLIP_PORT=18340`,
+			want: true,
+		},
+		{
+			name: "empty_rest",
+			rest: "",
+			want: false,
+		},
+		{
+			name: "token_without_equals",
+			rest: "CC_CLIP_PORT",
+			want: false,
+		},
+		{
+			name: "unterminated_quote",
+			rest: `CC_CLIP_PORT="18340`,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := setEnvIsManagedOnly(tc.rest)
+			if got != tc.want {
+				t.Fatalf("setEnvIsManagedOnly(%q) = %v, want %v", tc.rest, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCollectManagedMarkerPairs pins P3-F: the helper walks a block and
+// returns only properly-paired marker ranges. Orphan begins / ends and
+// mismatched counts must be omitted so callers can treat them as
+// non-managed regions and sweep them via findOrphanMarker.
+func TestCollectManagedMarkerPairs(t *testing.T) {
+	cases := []struct {
+		name  string
+		lines []string
+		// pairs are expressed as [begin, end] indices into lines.
+		wantPairs [][2]int
+	}{
+		{
+			name: "B1_B2_E1_E2",
+			// Two begins then two ends. Per findMarkerPair's first-begin →
+			// first-following-end pairing, this is one pair (B1,E1),
+			// which consumes the inner B2 — cursor advances past E1 and
+			// the orphan E2 that remains has no partner.
+			lines: []string{
+				"Host myalias",
+				markerBegin,
+				markerBegin,
+				markerEnd,
+				markerEnd,
+			},
+			wantPairs: [][2]int{{1, 3}},
+		},
+		{
+			name: "E1_B1_E2",
+			// Orphan end, then a real begin with a following end. Only
+			// the (B1,E2) pair should be returned.
+			lines: []string{
+				"Host myalias",
+				markerEnd,
+				markerBegin,
+				markerEnd,
+			},
+			wantPairs: [][2]int{{2, 3}},
+		},
+		{
+			name: "B1_E1_B2_E2",
+			// Two disjoint pairs: both should be returned in order.
+			lines: []string{
+				"Host myalias",
+				markerBegin,
+				markerEnd,
+				markerBegin,
+				markerEnd,
+			},
+			wantPairs: [][2]int{{1, 2}, {3, 4}},
+		},
+		{
+			name: "B1_setenv_B2_setenv_E1",
+			// One nested begin whose end is shared with the outer: pair
+			// (B1,E1) is returned, covering both managed SetEnv lines.
+			lines: []string{
+				"Host myalias",
+				markerBegin,
+				"  SetEnv CC_CLIP_PORT=1",
+				markerBegin,
+				"  SetEnv CC_CLIP_PORT=2",
+				markerEnd,
+			},
+			wantPairs: [][2]int{{1, 5}},
+		},
+		{
+			name: "no_markers",
+			lines: []string{
+				"Host myalias",
+				"  HostName srv",
+			},
+			wantPairs: nil,
+		},
+		{
+			name: "orphan_begin_only",
+			lines: []string{
+				"Host myalias",
+				markerBegin,
+				"  SetEnv CC_CLIP_PORT=1",
+			},
+			wantPairs: nil,
+		},
+		{
+			name: "orphan_end_only",
+			lines: []string{
+				"Host myalias",
+				"  SetEnv CC_CLIP_PORT=1",
+				markerEnd,
+			},
+			wantPairs: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := collectManagedMarkerPairs(tc.lines, 0, len(tc.lines))
+			if len(got) != len(tc.wantPairs) {
+				t.Fatalf("got %d pairs, want %d (got=%v want=%v)", len(got), len(tc.wantPairs), got, tc.wantPairs)
+			}
+			for i, want := range tc.wantPairs {
+				if got[i] != want {
+					t.Errorf("pair %d: got %v, want %v", i, got[i], want)
+				}
+			}
+		})
 	}
 }

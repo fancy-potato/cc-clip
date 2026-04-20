@@ -70,6 +70,23 @@ func TestLoadLocalIdentityWithoutCreating(t *testing.T) {
 	}
 }
 
+func TestBaseDirPathDoesNotCreateCacheDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	got, err := BaseDirPath()
+	if err != nil {
+		t.Fatalf("BaseDirPath: %v", err)
+	}
+	want := filepath.Join(home, ".cache", "cc-clip")
+	if got != want {
+		t.Fatalf("BaseDirPath = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Fatalf("BaseDirPath should not create %s, stat err=%v", want, err)
+	}
+}
+
 // TestLoadLocalIdentityPropagatesIDReadErrors pins that a hard read error
 // on the peer-id file (e.g. a directory at the expected path) is surfaced
 // as a non-sentinel error, NOT misclassified as ErrLocalIdentityNotFound.
@@ -142,15 +159,33 @@ func TestValidateID(t *testing.T) {
 
 func TestAliasForHost(t *testing.T) {
 	got := AliasForHost("myserver", "MacBook Pro")
-	if got != "myserver-cc-clip-macbook-pro" {
-		t.Fatalf("unexpected alias %q", got)
+	// Alias is deterministic: sanitized host + short host fingerprint +
+	// `-cc-clip-` + sanitized label. The fingerprint disambiguates inputs
+	// that sanitize to the same base (e.g. `a@b` vs `a-b`).
+	want := "myserver-" + hostFingerprint("myserver") + "-cc-clip-macbook-pro"
+	if got != want {
+		t.Fatalf("unexpected alias %q (want %q)", got, want)
 	}
 }
 
 func TestAliasForHostKeepsUserScopedDestinationsDistinct(t *testing.T) {
 	got := AliasForHost("alice@example.com", "MacBook Pro")
-	if got != "alice-example-com-cc-clip-macbook-pro" {
-		t.Fatalf("unexpected alias %q", got)
+	want := "alice-example-com-" + hostFingerprint("alice@example.com") + "-cc-clip-macbook-pro"
+	if got != want {
+		t.Fatalf("unexpected alias %q (want %q)", got, want)
+	}
+}
+
+// TestAliasForHostDistinguishesSanitizeCollisions pins that two distinct
+// hosts which collapse to the same sanitized base (e.g. `a@b` vs `a-b`)
+// still get distinct aliases via the fingerprint suffix. Without the
+// fingerprint, one laptop's peer record could silently cross-route to
+// the other's on a shared account.
+func TestAliasForHostDistinguishesSanitizeCollisions(t *testing.T) {
+	a := AliasForHost("user@box", "laptop")
+	b := AliasForHost("user-box", "laptop")
+	if a == b {
+		t.Fatalf("aliases collided: %q", a)
 	}
 }
 
@@ -169,7 +204,7 @@ func TestReservePortReusesExistingPeer(t *testing.T) {
 	}
 }
 
-func TestReservePortPreservesExistingPeerPortWhenAlreadyBound(t *testing.T) {
+func TestReservePortKeepsExistingPeerPortWhenAlreadyOwned(t *testing.T) {
 	dir := t.TempDir()
 	first, err := ReservePort(dir, "peer-a", "macbook", 18339, 18341)
 	if err != nil {
@@ -185,7 +220,7 @@ func TestReservePortPreservesExistingPeerPortWhenAlreadyBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	if second.ReservedPort != first.ReservedPort {
-		t.Fatalf("expected reconnect to keep reserved port %d, got %d", first.ReservedPort, second.ReservedPort)
+		t.Fatalf("expected reconnect to keep owned port %d, got %d", first.ReservedPort, second.ReservedPort)
 	}
 }
 
@@ -449,6 +484,50 @@ func TestReleasePortSweepsOrphanPortRowsWhenPeerPresent(t *testing.T) {
 	}
 }
 
+func TestLookupAndListAllHidePhantomPeerRowsWithoutPortOwnership(t *testing.T) {
+	dir := t.TempDir()
+	registryDir := filepath.Join(dir, "registry")
+	if err := os.MkdirAll(registryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := RFC3339Now()
+	if err := writeRegistry(dir, PortsFile{
+		Version:    registryVersion,
+		RangeStart: 18339,
+		RangeEnd:   18341,
+		Ports: map[string]string{
+			"18340": "other-peer",
+		},
+	}, PeersFile{
+		Version: registryVersion,
+		Peers: map[string]Registration{
+			"peer-a": {
+				PeerID:       "peer-a",
+				Label:        "macbook",
+				ReservedPort: 18339,
+				StateDir:     filepath.Join(dir, "peers", "peer-a"),
+				CreatedAt:    now,
+				UpdatedAt:    now,
+				LastConnect:  now,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("writeRegistry: %v", err)
+	}
+
+	if _, err := Lookup(dir, "peer-a"); !errors.Is(err, ErrPeerNotFound) {
+		t.Fatalf("Lookup phantom peer row: got %v, want ErrPeerNotFound", err)
+	}
+
+	regs, err := ListAll(dir)
+	if err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	if len(regs) != 0 {
+		t.Fatalf("ListAll exposed phantom peer rows: %#v", regs)
+	}
+}
+
 func TestReservePortFailsOnCorruptRegistry(t *testing.T) {
 	dir := t.TempDir()
 	registryDir := filepath.Join(dir, "registry")
@@ -555,14 +634,17 @@ func TestReservePortRemovesStaleRegistryLock(t *testing.T) {
 	}
 
 	oldRetryInterval := registryLockRetryInterval
-	oldMaxAttempts := registryLockMaxAttempts
+	oldMaxBackoff := registryLockMaxBackoff
+	oldDeadline := registryLockAcquireDeadline
 	oldStaleAfter := registryLockStaleAfter
 	registryLockRetryInterval = time.Millisecond
-	registryLockMaxAttempts = 2
+	registryLockMaxBackoff = time.Millisecond
+	registryLockAcquireDeadline = 50 * time.Millisecond
 	registryLockStaleAfter = time.Minute
 	defer func() {
 		registryLockRetryInterval = oldRetryInterval
-		registryLockMaxAttempts = oldMaxAttempts
+		registryLockMaxBackoff = oldMaxBackoff
+		registryLockAcquireDeadline = oldDeadline
 		registryLockStaleAfter = oldStaleAfter
 	}()
 
@@ -931,6 +1013,65 @@ func TestStaleRegistryLockKeepsLockOnMatchingBootID(t *testing.T) {
 	}
 }
 
+// TestReadLockHolderFullRejectsSuspiciousPIDs pins the P2-23 guard: a
+// corrupt pid file whose first line is 0 or 1 must NOT be treated as a
+// valid holder. pid 0 is never a process; pid 1 is init/systemd (always
+// alive on Unix) — accepting it would pin the lock for 10 minutes on
+// every corruption. Falling back to `!ok` forces the caller into the
+// mtime-only heuristic, which reaps the lock at registryLockStaleAfter.
+func TestReadLockHolderFullRejectsSuspiciousPIDs(t *testing.T) {
+	for _, badPID := range []string{"0", "1", "-1", "not-a-number"} {
+		lockPath := filepath.Join(t.TempDir(), "registry", "lock")
+		if err := os.MkdirAll(lockPath, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lockPath, "pid"), []byte(badPID+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, _, _, ok := readLockHolderFull(lockPath)
+		if ok {
+			t.Fatalf("readLockHolderFull accepted suspicious pid %q", badPID)
+		}
+	}
+}
+
+// TestLookupDoesNotCreateRegistryDir pins the P2-21 split:
+// loadRegistryForRead must not MkdirAll on read paths. A stat-level
+// ENOENT on the registry dir turns into an empty-view result, not a
+// freshly-created directory. Mutating the filesystem from a read probe
+// would undermine uninstall's ability to distinguish "no peers, never
+// registered" from "registry directory exists but is empty".
+func TestLookupDoesNotCreateRegistryDir(t *testing.T) {
+	dir := t.TempDir()
+	registryDir := filepath.Join(dir, "registry")
+
+	_, err := Lookup(dir, "peer-a")
+	if !errors.Is(err, ErrPeerNotFound) {
+		t.Fatalf("Lookup on empty registry: got %v, want ErrPeerNotFound", err)
+	}
+	if _, statErr := os.Stat(registryDir); !os.IsNotExist(statErr) {
+		t.Fatalf("Lookup must not create registry dir; got stat err=%v", statErr)
+	}
+}
+
+// TestListAllDoesNotCreateRegistryDir is the ListAll companion to
+// TestLookupDoesNotCreateRegistryDir — same P2-21 contract.
+func TestListAllDoesNotCreateRegistryDir(t *testing.T) {
+	dir := t.TempDir()
+	registryDir := filepath.Join(dir, "registry")
+
+	regs, err := ListAll(dir)
+	if err != nil {
+		t.Fatalf("ListAll on empty registry: got %v, want nil", err)
+	}
+	if len(regs) != 0 {
+		t.Fatalf("ListAll on empty registry returned %d regs, want 0", len(regs))
+	}
+	if _, statErr := os.Stat(registryDir); !os.IsNotExist(statErr) {
+		t.Fatalf("ListAll must not create registry dir; got stat err=%v", statErr)
+	}
+}
+
 // TestLoadLocalIdentityDoesNotCreateBaseDir pins that probing for the local
 // peer identity is read-only. LoadOrCreateLocalIdentity may MkdirAll as a
 // side effect of minting a new identity; LoadLocalIdentity must not. The
@@ -953,5 +1094,42 @@ func TestLoadLocalIdentityDoesNotCreateBaseDir(t *testing.T) {
 
 	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
 		t.Fatalf("LoadLocalIdentity must not create %s on a missing-identity probe; got stat err=%v", cacheDir, err)
+	}
+}
+
+// TestReadLockHolderFullPreservesPIDOnCorruptBootID pins the fix that a
+// garbled boot-id line MUST NOT discard the valid PID from line 1. The
+// previous behavior collapsed to ok=false on a malformed boot-id, which
+// dropped the staleness check from "PID liveness + hard ceiling" to
+// "mtime only with 30s window" — letting a flaky-IO partial write or a
+// truncated upgrade steal the lock from a still-live holder.
+func TestReadLockHolderFullPreservesPIDOnCorruptBootID(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pid"), []byte("12345\nthis is not a boot id\n2026-04-20T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	pid, bootID, _, ok := readLockHolderFull(dir)
+	if !ok {
+		t.Fatalf("expected ok=true; corrupt boot-id should not discard valid PID")
+	}
+	if pid != 12345 {
+		t.Fatalf("pid = %d, want 12345", pid)
+	}
+	if bootID != "" {
+		t.Fatalf("bootID = %q, want empty (corrupt → blanked)", bootID)
+	}
+}
+
+// TestReadLockHolderFullEmptyPayload pins the empty-file case
+// (TestReadLockHolderFullRejectsSuspiciousPIDs covers pid 0/1/negative/
+// non-numeric; this test fills the missing "no bytes at all" cell).
+func TestReadLockHolderFullEmptyPayload(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pid"), []byte(""), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	_, _, _, ok := readLockHolderFull(dir)
+	if ok {
+		t.Fatalf("expected ok=false for empty pid file")
 	}
 }

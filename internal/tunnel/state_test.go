@@ -294,3 +294,58 @@ func TestRemoveState(t *testing.T) {
 		t.Fatal("expected error after removal")
 	}
 }
+
+// TestValidateTunnelStateClearsCachedOptionsWhenUnresolved pins the
+// cache-pin security invariant: SSHOptions must only be trusted when
+// SSHConfigResolved=true. If a state file has options present but the
+// flag unset (planted via migration, stale file, or a malicious edit),
+// validateTunnelState MUST clear the options slice so the manager is
+// forced to re-run `ssh -G` instead of silently adopting un-vouched-for
+// option values. Previous behavior auto-promoted the flag, defeating
+// the security guarantee documented in AGENTS.md.
+func TestValidateTunnelStateClearsCachedOptionsWhenUnresolved(t *testing.T) {
+	s := &TunnelState{
+		Config: TunnelConfig{
+			Host:              "example.com",
+			LocalPort:         18339,
+			RemotePort:        18340,
+			SSHOptions:        []string{"User=alice", "Port=22"},
+			SSHConfigResolved: false,
+		},
+		Status: StatusStopped,
+	}
+	if err := validateTunnelStateForSave(s); err != nil {
+		t.Fatalf("validateTunnelStateForSave: %v", err)
+	}
+	if s.Config.SSHConfigResolved {
+		t.Fatalf("SSHConfigResolved was auto-promoted to true; must remain false to force ssh -G re-query")
+	}
+	if len(s.Config.SSHOptions) != 0 {
+		t.Fatalf("SSHOptions not cleared: %v", s.Config.SSHOptions)
+	}
+}
+
+// TestValidateTunnelStatePreservesResolvedOptions pins the complementary
+// case: when SSHConfigResolved=true, the cached options are trusted and
+// left intact so the manager does not needlessly re-query ssh -G.
+func TestValidateTunnelStatePreservesResolvedOptions(t *testing.T) {
+	s := &TunnelState{
+		Config: TunnelConfig{
+			Host:              "example.com",
+			LocalPort:         18339,
+			RemotePort:        18340,
+			SSHOptions:        []string{"User=alice", "Port=22"},
+			SSHConfigResolved: true,
+		},
+		Status: StatusStopped,
+	}
+	if err := validateTunnelStateForSave(s); err != nil {
+		t.Fatalf("validateTunnelStateForSave: %v", err)
+	}
+	if !s.Config.SSHConfigResolved {
+		t.Fatalf("SSHConfigResolved flipped to false")
+	}
+	if len(s.Config.SSHOptions) != 2 {
+		t.Fatalf("SSHOptions mutated: %v", s.Config.SSHOptions)
+	}
+}
