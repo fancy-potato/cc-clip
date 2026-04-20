@@ -37,8 +37,10 @@ release:
   github:
     owner: fancy-potato
     name: cc-clip
+  replace_existing_artifacts: true
   draft: false
   prerelease: auto
+  mode: replace
 
 changelog:
   sort: asc
