@@ -19,7 +19,7 @@ type cmdNotifySoundDeps struct {
 
 func cmdNotifySound() {
 	if len(os.Args) != 3 {
-		failUsage("usage: cc-clip notify-sound <sound|off>")
+		failUsage("usage: cc-clip notify-sound <name|/path/to/sound|off>")
 	}
 	// Only TrimSpace the raw argv input here; daemon.WriteNotificationSound
 	// is the canonical trim/validate point. Stripping twice at the CLI
@@ -27,7 +27,7 @@ func cmdNotifySound() {
 	// the lib's stored value could drift.
 	sound := strings.TrimSpace(os.Args[2])
 	if sound == "" {
-		failUsage("usage: cc-clip notify-sound <sound|off>")
+		failUsage("usage: cc-clip notify-sound <name|/path/to/sound|off>")
 	}
 	if err := runCmdNotifySound(sound, cmdNotifySoundDeps{
 		lookPath:   exec.LookPath,
@@ -39,9 +39,6 @@ func cmdNotifySound() {
 }
 
 func runCmdNotifySound(sound string, deps cmdNotifySoundDeps) error {
-	if runtime.GOOS != "darwin" {
-		return fmt.Errorf("notify-sound is only supported on macOS")
-	}
 	if deps.lookPath == nil {
 		deps.lookPath = exec.LookPath
 	}
@@ -59,15 +56,35 @@ func runCmdNotifySound(sound string, deps cmdNotifySoundDeps) error {
 		if err := deps.writeSound(""); err != nil {
 			return fmt.Errorf("clear notification sound: %w", err)
 		}
-		fmt.Printf("Disabled terminal-notifier sound for cc-clip notifications (%s)\n", path)
+		fmt.Printf("Disabled cc-clip notification sound (%s)\n", path)
 		return nil
 	}
-	if _, err := deps.lookPath("terminal-notifier"); err != nil {
-		return fmt.Errorf("terminal-notifier is not installed.\nInstall it first:\n  brew install terminal-notifier")
+
+	kind := daemon.ClassifySoundValue(sound)
+
+	// cc-clip's laptop side only supports macOS and Windows — Linux is
+	// the remote target, never the laptop. Name-type values (Apple
+	// built-ins) further require terminal-notifier on macOS. Path-type
+	// values are played by afplay (macOS) or PowerShell's SoundPlayer
+	// (Windows); on any other GOOS we fail fast rather than silently
+	// persisting a value that would never play.
+	switch kind {
+	case daemon.SoundKindName:
+		if runtime.GOOS != "darwin" {
+			return fmt.Errorf("sound names (Apple built-ins) are only supported on macOS; pass an absolute path to an audio file instead")
+		}
+		if _, err := deps.lookPath("terminal-notifier"); err != nil {
+			return fmt.Errorf("terminal-notifier is not installed.\nInstall it first:\n  brew install terminal-notifier")
+		}
+	case daemon.SoundKindPath:
+		if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+			return fmt.Errorf("notify-sound paths are only supported on macOS and Windows laptops")
+		}
 	}
+
 	// Validation lives in the lib helper — WriteNotificationSound rejects
-	// invalid names with ErrInvalidNotificationSound, so the CLI does not
-	// need to duplicate the regex check.
+	// invalid names or non-existent paths with ErrInvalidNotificationSound,
+	// so the CLI does not need to duplicate those checks.
 	if err := deps.writeSound(sound); err != nil {
 		return fmt.Errorf("save notification sound: %w", err)
 	}

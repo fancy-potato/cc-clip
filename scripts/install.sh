@@ -8,7 +8,13 @@ REPO="fancy-potato/cc-clip"
 INSTALL_DIR="${CC_CLIP_INSTALL_DIR:-$HOME/.local/bin}"
 LOCAL_SHARE_DIR="${CC_CLIP_SHARE_DIR:-$HOME/.local/share/cc-clip}"
 SWIFTBAR_APP="/Applications/SwiftBar.app"
-SWIFTBAR_PLUGIN_DIR="${SWIFTBAR_PLUGIN_DIR:-$HOME/Documents/SwiftBar}"
+SWIFTBAR_PLUGIN_DIR_DEFAULT="$HOME/Documents/SwiftBar"
+# SWIFTBAR_PLUGIN_DIR, if exported by the caller, is an explicit
+# operator override and is honored as-is. Leave it empty here so
+# install_swiftbar_plugin can distinguish "unset" from "set to
+# default" — the former triggers the defaults-read lookup on a host
+# that already has SwiftBar installed; the latter does not.
+SWIFTBAR_PLUGIN_DIR="${SWIFTBAR_PLUGIN_DIR-}"
 LOCAL_PLUGIN_DIR="${CC_CLIP_SWIFTBAR_PLUGIN_DIR:-$LOCAL_SHARE_DIR/swiftbar}"
 LOCAL_SCRIPT_DIR="${CC_CLIP_SCRIPT_DIR:-$LOCAL_SHARE_DIR/scripts}"
 PLUGIN_NAME="cc-clip-tunnels.30s.sh"
@@ -227,10 +233,40 @@ install_terminal_notifier_if_missing() {
     fi
 }
 
+resolve_swiftbar_plugin_dir() {
+    # Resolve the plugin directory in priority order:
+    #   1. SWIFTBAR_PLUGIN_DIR env var explicitly passed by the operator
+    #   2. The existing SwiftBar `PluginDirectory` preference, when
+    #      SwiftBar is already installed. This means "user had SwiftBar
+    #      set up with their own plugin folder, we drop in alongside
+    #      their other plugins and don't clobber their setting."
+    #   3. Default `$HOME/Documents/SwiftBar` (the SwiftBar-recommended
+    #      location, created on-demand below).
+    # Side effect: sets SWIFTBAR_PLUGIN_DIR and SWIFTBAR_PLUGIN_DIR_SOURCE.
+    if [ -n "$SWIFTBAR_PLUGIN_DIR" ]; then
+        SWIFTBAR_PLUGIN_DIR_SOURCE="env"
+        return 0
+    fi
+
+    if [ -d "$SWIFTBAR_APP" ]; then
+        existing="$(defaults read com.ameba.SwiftBar PluginDirectory 2>/dev/null || true)"
+        if [ -n "$existing" ]; then
+            SWIFTBAR_PLUGIN_DIR="$existing"
+            SWIFTBAR_PLUGIN_DIR_SOURCE="pref"
+            return 0
+        fi
+    fi
+
+    SWIFTBAR_PLUGIN_DIR="$SWIFTBAR_PLUGIN_DIR_DEFAULT"
+    SWIFTBAR_PLUGIN_DIR_SOURCE="default"
+}
+
 install_swiftbar_plugin() {
     if [ "$(uname -s)" != "Darwin" ]; then
         return 0
     fi
+
+    resolve_swiftbar_plugin_dir
 
     plugin_src="$1"
     local_plugin="$LOCAL_PLUGIN_DIR/$PLUGIN_NAME"
@@ -247,7 +283,14 @@ install_swiftbar_plugin() {
     # missing (which a `rm -f` + `ln -s` window would briefly expose).
     ln -sfn "$local_plugin" "$plugin_link"
 
-    defaults write com.ameba.SwiftBar PluginDirectory -string "$SWIFTBAR_PLUGIN_DIR" >/dev/null 2>&1 || true
+    # Only write the PluginDirectory preference when WE chose the
+    # directory (env override or first-time default). When the path
+    # came from SwiftBar's own prefs (source=pref), the user already
+    # configured it — rewriting would be a no-op at best and a clobber
+    # of a path we racily misread at worst.
+    if [ "$SWIFTBAR_PLUGIN_DIR_SOURCE" != "pref" ]; then
+        defaults write com.ameba.SwiftBar PluginDirectory -string "$SWIFTBAR_PLUGIN_DIR" >/dev/null 2>&1 || true
+    fi
 
     if [ -d "$SWIFTBAR_APP" ]; then
         osascript -e 'tell application "SwiftBar" to quit' >/dev/null 2>&1 || true
@@ -258,6 +301,11 @@ install_swiftbar_plugin() {
     echo "SwiftBar plugin installed:"
     echo "  local script: $local_plugin"
     echo "  SwiftBar link: $plugin_link"
+    case "$SWIFTBAR_PLUGIN_DIR_SOURCE" in
+        pref)    echo "  plugin dir:    $SWIFTBAR_PLUGIN_DIR (from existing SwiftBar preference)" ;;
+        env)     echo "  plugin dir:    $SWIFTBAR_PLUGIN_DIR (from SWIFTBAR_PLUGIN_DIR override)" ;;
+        default) echo "  plugin dir:    $SWIFTBAR_PLUGIN_DIR (default)" ;;
+    esac
 }
 
 install_maintenance_script() {

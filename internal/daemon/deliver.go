@@ -22,7 +22,17 @@ type DeliveryChain struct {
 // Deliver iterates through adapters in order. Returns nil on the first
 // success. If all adapters fail, returns the last error. If no adapters
 // are configured, returns an error.
+//
+// A configured path-type notify-sound is played async regardless of
+// which adapter (if any) succeeded: the sound is orthogonal to the
+// visual channel, and silently dropping it when cmux wins (tmux present)
+// or when all adapters fail (no terminal-notifier, not in tmux) would
+// surprise operators who explicitly set a sound. Name-type sounds are
+// still delivered through terminal-notifier `-sound` on darwin, so we
+// only trigger the standalone player for paths.
 func (c *DeliveryChain) Deliver(ctx context.Context, env NotifyEnvelope) error {
+	playConfiguredPathSound()
+
 	var lastErr error
 	for _, adapter := range c.adapters {
 		if err := adapter.Deliver(ctx, env); err != nil {
@@ -36,6 +46,21 @@ func (c *DeliveryChain) Deliver(ctx context.Context, env NotifyEnvelope) error {
 		return fmt.Errorf("no delivery adapters configured")
 	}
 	return lastErr
+}
+
+// playConfiguredPathSound reads the persisted notify-sound preference
+// and, if it is a filesystem path, fires the platform audio player
+// asynchronously. Name-type sounds (Apple built-ins) are ignored here
+// because terminal-notifier handles them directly via `-sound`.
+func playConfiguredPathSound() {
+	sound, err := ReadNotificationSound()
+	if err != nil || sound == "" {
+		return
+	}
+	if ClassifySoundValue(sound) != SoundKindPath {
+		return
+	}
+	PlayAudioFile(sound)
 }
 
 // Notify satisfies the Notifier interface by bridging NotifyEvent into

@@ -216,12 +216,17 @@ Notifications:
     --urgency        Urgency level (default: 1)
     --from-codex     Parse Codex JSON payload (extracts last-assistant-message)
     --port           Daemon port (default: 18339, env: CC_CLIP_PORT)
-  notify-sound <sound|off>
-                     Persist terminal-notifier sound for cc-clip notifications
-                     Requires terminal-notifier on the local Mac
-                     Common names: Glass, Ping, Pop, Submarine, Funk, Hero, Sosumi
-                     List sounds: ls /System/Library/Sounds
-                     Examples: cc-clip notify-sound Glass | default | off
+  notify-sound <name|/path/to/sound|off>
+                     Persist notification sound. Names (e.g. Glass, Ping)
+                     route to terminal-notifier on macOS; absolute paths
+                     to audio files are played via afplay on macOS or
+                     PowerShell SoundPlayer (.wav) on Windows. cc-clip's
+                     laptop side does not support Linux.
+                     List Apple names: ls /System/Library/Sounds
+                     Examples:
+                       cc-clip notify-sound Glass
+                       cc-clip notify-sound ~/sounds/ping.wav
+                       cc-clip notify-sound off
 
 Internal (used by deploy):
   peer               Internal registry management

@@ -1122,7 +1122,7 @@ func TestRunCmdNotifySoundClearsSound(t *testing.T) {
 	if got != "" {
 		t.Fatalf("sound = %q, want empty after off", got)
 	}
-	if !strings.Contains(stdout, "Disabled terminal-notifier sound") {
+	if !strings.Contains(stdout, "Disabled cc-clip notification sound") {
 		t.Fatalf("stdout = %q, want disabled message", stdout)
 	}
 }
@@ -1154,7 +1154,7 @@ func TestRunCmdNotifySoundClearsSoundWithoutTerminalNotifier(t *testing.T) {
 	if got != "" {
 		t.Fatalf("sound = %q, want empty after off", got)
 	}
-	if !strings.Contains(stdout, "Disabled terminal-notifier sound") {
+	if !strings.Contains(stdout, "Disabled cc-clip notification sound") {
 		t.Fatalf("stdout = %q, want disabled message", stdout)
 	}
 }

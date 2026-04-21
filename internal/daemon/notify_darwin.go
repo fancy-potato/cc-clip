@@ -149,8 +149,14 @@ func (n *DarwinNotifier) sendViaTerminalNotifier(title, subtitle, body, imagePat
 		"-message", body,
 		"-group", "cc-clip",
 	}
+	// Only forward Apple built-in sound *names* to terminal-notifier;
+	// filesystem paths are handled by the standalone afplay step in
+	// DeliveryChain.Deliver (terminal-notifier's -sound flag only
+	// accepts names from NSSound, not paths).
 	if sound, err := ReadNotificationSound(); err == nil && sound != "" {
-		args = append(args, "-sound", sound)
+		if ClassifySoundValue(sound) == SoundKindName {
+			args = append(args, "-sound", sound)
+		}
 	}
 	if imagePath != "" {
 		args = append(args, "-contentImage", imagePath)

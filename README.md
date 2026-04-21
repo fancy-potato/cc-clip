@@ -229,15 +229,17 @@ Install it with:
 brew install terminal-notifier
 ```
 
-Set the notification sound with:
+Set the notification sound with either a macOS built-in sound name or an absolute path to an audio file:
 
 ```bash
-cc-clip notify-sound Glass
-cc-clip notify-sound default
-cc-clip notify-sound off
+cc-clip notify-sound Glass                # Apple built-in (macOS only, via terminal-notifier)
+cc-clip notify-sound ~/sounds/ping.wav    # file path — macOS or Windows laptop
+cc-clip notify-sound off                  # disable
 ```
 
-Common sound names usually include `Glass`, `Ping`, `Pop`, `Submarine`, `Funk`, `Hero`, and `Sosumi`, but the source of truth is your local macOS sound set. To inspect what your machine currently offers:
+Path-type sounds are played by the local daemon using the platform's native tool: `afplay` on macOS and PowerShell's `System.Media.SoundPlayer` on Windows (`.wav` only). cc-clip's laptop side is macOS-first with partial Windows support; Linux is the remote target in this product and never plays sounds.
+
+Common Apple sound names usually include `Glass`, `Ping`, `Pop`, `Submarine`, `Funk`, `Hero`, and `Sosumi`, but the source of truth is your local macOS sound set. To inspect what your machine currently offers:
 
 ```bash
 ls /System/Library/Sounds
