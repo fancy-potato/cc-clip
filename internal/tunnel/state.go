@@ -348,6 +348,11 @@ func validateResolvedTunnelOptions(opts []string) error {
 		if strings.ContainsAny(value, "\x00\r\n") {
 			return fmt.Errorf("ssh option %q contains control characters", key)
 		}
+		if strings.EqualFold(key, "identityagent") {
+			if err := validateIdentityAgentValue(value); err != nil {
+				return fmt.Errorf("ssh option %q is invalid: %v", key, err)
+			}
+		}
 	}
 	return nil
 }

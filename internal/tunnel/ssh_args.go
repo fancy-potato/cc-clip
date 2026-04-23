@@ -278,11 +278,14 @@ const sshConfigResolveTimeout = 10 * time.Second
 // tunnel is alive. Identity-position and session-type directives are
 // stripped so the tunnel is always `-N -R …`.
 var excludedTunnelSSHOptions = map[string]struct{}{
-	// AddKeysToAgent / IdentityAgent / PKCS11Provider: agent / key-loading
-	// directives that would inject keys into the user's ssh-agent or
-	// delegate auth to an attacker-chosen helper binary. The tunnel is a
+	// AddKeysToAgent / PKCS11Provider: agent / key-loading directives
+	// that would inject keys into the user's ssh-agent or delegate auth
+	// to an attacker-chosen helper binary. The tunnel is a
 	// non-interactive service; it has no business mutating the user's
-	// agent or loading external auth providers.
+	// agent or loading external auth providers. IdentityAgent is handled
+	// separately via validateIdentityAgentValue so tunnels can honor
+	// pinned agent sockets (for example 1Password) without accepting
+	// arbitrary helper paths from ssh_config.
 	"addkeystoagent":          {},
 	"batchmode":               {},
 	"canonicalizecommand":     {},
@@ -297,7 +300,6 @@ var excludedTunnelSSHOptions = map[string]struct{}{
 	"forwardx11":              {},
 	"forwardx11trusted":       {},
 	"host":                    {},
-	"identityagent":           {},
 	"knownhostscommand":       {},
 	"localcommand":            {},
 	"localforward":            {},
@@ -374,6 +376,11 @@ func sshTunnelArgs(ctx context.Context, cfg TunnelConfig) ([]string, func(), err
 		return nil, nil, fmt.Errorf("create empty ssh config: %w", err)
 	}
 	configPath := configFile.Name()
+	if err := writeTunnelSSHConfig(configFile, cfg.SSHOptions); err != nil {
+		_ = configFile.Close()
+		_ = os.RemoveAll(scratchDir)
+		return nil, nil, fmt.Errorf("write ssh config: %w", err)
+	}
 	if err := configFile.Chmod(0600); err != nil {
 		_ = configFile.Close()
 		_ = os.RemoveAll(scratchDir)
@@ -445,11 +452,6 @@ func sweepStaleSSHTunnelScratchDirs(maxAge time.Duration) {
 
 func buildSSHTunnelArgs(cfg TunnelConfig, configPath string) []string {
 	args := []string{"-F", configPath}
-
-	for _, opt := range cfg.SSHOptions {
-		args = append(args, "-o", opt)
-	}
-
 	args = append(args,
 		"-N",
 		"-v",
@@ -463,6 +465,29 @@ func buildSSHTunnelArgs(cfg TunnelConfig, configPath string) []string {
 		cfg.Host,
 	)
 	return args
+}
+
+func writeTunnelSSHConfig(f *os.File, opts []string) error {
+	if _, err := f.WriteString("Host *\n"); err != nil {
+		return err
+	}
+	for _, opt := range opts {
+		if _, err := f.WriteString("  " + formatTunnelSSHConfigOption(opt) + "\n"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func formatTunnelSSHConfigOption(opt string) string {
+	key, value, ok := strings.Cut(opt, "=")
+	if !ok {
+		return opt
+	}
+	if strings.EqualFold(key, "identityagent") && strings.ContainsAny(value, " \t") {
+		return fmt.Sprintf("%s %q", key, value)
+	}
+	return opt
 }
 
 func resolvedTunnelOptionsFromSSHConfig(resolved string) []string {
@@ -502,4 +527,123 @@ func resolvedTunnelOptionsFromSSHConfig(resolved string) []string {
 		opts = append(opts, fmt.Sprintf("%s=%s", fields[0], value))
 	}
 	return opts
+}
+
+// validateIdentityAgentValue accepts the small subset of IdentityAgent values
+// that are appropriate for an unattended persistent tunnel:
+//   - the OpenSSH special values `none` and `SSH_AUTH_SOCK`
+//   - absolute paths under trusted per-user/runtime roots whose basename looks
+//     like an agent socket (`agent*`, `*ssh*`, or `Listeners` on macOS launchd)
+//
+// We intentionally do not allow arbitrary relative paths, token expansion, or
+// home-directory shorthands here. `ssh -G` typically resolves user-authored
+// paths to their concrete form, and cached tunnel options should be explicit
+// enough that a later daemon restart cannot be tricked into opening an
+// unrelated local socket.
+func validateIdentityAgentValue(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fmt.Errorf("IdentityAgent value is empty")
+	}
+	switch trimmed {
+	case "none", "SSH_AUTH_SOCK":
+		return nil
+	}
+	if strings.ContainsAny(trimmed, "\x00\r\n") {
+		return fmt.Errorf("IdentityAgent contains control characters")
+	}
+	if strings.ContainsAny(trimmed, "%$~") {
+		return fmt.Errorf("IdentityAgent must be fully resolved (got %q)", trimmed)
+	}
+	if runtime.GOOS == "windows" {
+		if strings.HasPrefix(trimmed, `\\.\pipe\`) {
+			if trustedIdentityAgentBase(trimmed) {
+				return nil
+			}
+			return fmt.Errorf("IdentityAgent named pipe %q does not look like an SSH agent", trimmed)
+		}
+		if !filepath.IsAbs(trimmed) {
+			return fmt.Errorf("IdentityAgent must be an absolute path or named pipe (got %q)", trimmed)
+		}
+	} else if !filepath.IsAbs(trimmed) {
+		return fmt.Errorf("IdentityAgent must be an absolute path (got %q)", trimmed)
+	}
+	if !trustedIdentityAgentBase(trimmed) {
+		return fmt.Errorf("IdentityAgent path %q does not look like an SSH agent socket", trimmed)
+	}
+	if !pathHasTrustedPrefix(trimmed, trustedIdentityAgentPrefixes()) {
+		return fmt.Errorf("IdentityAgent path %q is outside trusted local agent roots", trimmed)
+	}
+	return nil
+}
+
+func trustedIdentityAgentPrefixes() []string {
+	var allowed []string
+	if home, err := userhome.Dir(); err == nil {
+		allowed = append(allowed,
+			filepath.Join(home, ".ssh"),
+			filepath.Join(home, ".gnupg"),
+			filepath.Join(home, ".1password"),
+			filepath.Join(home, ".local"),
+			filepath.Join(home, "Library"),
+			filepath.Join(home, "AppData"),
+		)
+	}
+	if runtime.GOOS == "windows" {
+		return append(allowed, `\\.\pipe\`)
+	}
+	if xdg := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); xdg != "" {
+		allowed = append(allowed, xdg)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		allowed = append(allowed,
+			"/var/run/com.apple.launchd",
+			"/private/var/run/com.apple.launchd",
+			"/private/tmp/com.apple.launchd",
+		)
+	default:
+		allowed = append(allowed, "/run/user")
+	}
+	return allowed
+}
+
+func trustedIdentityAgentBase(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return false
+	}
+	return base == "listeners" || strings.Contains(base, "agent") || strings.Contains(base, "ssh")
+}
+
+func pathHasTrustedPrefix(path string, prefixes []string) bool {
+	candidate := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		candidate = strings.ToLower(candidate)
+	}
+	for _, prefix := range prefixes {
+		if prefix == "" {
+			continue
+		}
+		rawPrefix := prefix
+		checkPrefix := filepath.Clean(prefix)
+		if runtime.GOOS == "windows" {
+			checkPrefix = strings.ToLower(checkPrefix)
+		}
+		if candidate == checkPrefix {
+			return true
+		}
+		if runtime.GOOS == "windows" {
+			if strings.HasPrefix(strings.ToLower(rawPrefix), `\\.\pipe\`) && strings.HasPrefix(candidate, strings.ToLower(rawPrefix)) {
+				return true
+			}
+		}
+		if !strings.HasSuffix(checkPrefix, string(filepath.Separator)) {
+			checkPrefix += string(filepath.Separator)
+		}
+		if strings.HasPrefix(candidate, checkPrefix) {
+			return true
+		}
+	}
+	return false
 }

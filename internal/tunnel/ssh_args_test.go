@@ -4,11 +4,25 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/shunmei/cc-clip/internal/userhome"
 )
+
+type stubHomeResolver struct {
+	home string
+}
+
+func (r stubHomeResolver) LookupUser(name string) (*user.User, error) {
+	return &user.User{Username: name, HomeDir: r.home, Uid: "1000"}, nil
+}
+
+func (r stubHomeResolver) UserHomeDir() (string, error) { return r.home, nil }
+func (r stubHomeResolver) IsSudoRoot() bool             { return false }
 
 func TestValidateSSHHost(t *testing.T) {
 	tests := []struct {
@@ -114,6 +128,61 @@ func TestResolveSSHTunnelConfigUsesConfigQueryStub(t *testing.T) {
 	}
 	if !strings.Contains(joined, "user=demo") {
 		t.Fatalf("options missing stubbed user: %v", cfg.SSHOptions)
+	}
+}
+
+func TestResolveSSHTunnelConfigPreservesTrustedIdentityAgent(t *testing.T) {
+	home := t.TempDir()
+	userhome.SetResolverForTest(t, stubHomeResolver{home: home})
+
+	cfg := TunnelConfig{
+		Host:       "example",
+		LocalPort:  18339,
+		RemotePort: 19001,
+	}
+
+	prev := sshConfigQueryFunc
+	sshConfigQueryFunc = func(ctx context.Context, host string) (string, error) {
+		return strings.Join([]string{
+			"hostname example.internal",
+			"user demo",
+			"identityagent " + filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock"),
+		}, "\n"), nil
+	}
+	t.Cleanup(func() { sshConfigQueryFunc = prev })
+
+	got, err := resolveSSHTunnelConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("resolveSSHTunnelConfig: %v", err)
+	}
+	joined := strings.Join(got.SSHOptions, " ")
+	if !strings.Contains(joined, "identityagent="+filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock")) {
+		t.Fatalf("SSHOptions missing trusted identityagent: %v", got.SSHOptions)
+	}
+}
+
+func TestResolveSSHTunnelConfigRejectsUntrustedIdentityAgent(t *testing.T) {
+	home := t.TempDir()
+	userhome.SetResolverForTest(t, stubHomeResolver{home: home})
+
+	cfg := TunnelConfig{
+		Host:       "example",
+		LocalPort:  18339,
+		RemotePort: 19001,
+	}
+
+	prev := sshConfigQueryFunc
+	sshConfigQueryFunc = func(ctx context.Context, host string) (string, error) {
+		return "hostname example.internal\nidentityagent /etc/ssh/agent.sock\n", nil
+	}
+	t.Cleanup(func() { sshConfigQueryFunc = prev })
+
+	_, err := resolveSSHTunnelConfig(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("resolveSSHTunnelConfig = nil, want identityagent validation error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "identityagent") {
+		t.Fatalf("err = %v, want identityagent context", err)
 	}
 }
 
@@ -405,6 +474,9 @@ func resetSSHBinaryCacheForTest(t *testing.T) {
 }
 
 func TestBuildSSHTunnelArgsFiltersForwardsFromResolvedConfig(t *testing.T) {
+	home := t.TempDir()
+	userhome.SetResolverForTest(t, stubHomeResolver{home: home})
+
 	cfg := TunnelConfig{
 		Host:       "alias-host",
 		LocalPort:  18339,
@@ -417,6 +489,7 @@ func TestBuildSSHTunnelArgsFiltersForwardsFromResolvedConfig(t *testing.T) {
 		"user demo",
 		"port 2222",
 		"identityfile ~/.ssh/id_ed25519",
+		"identityagent " + filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock"),
 		"proxyjump bastion",
 		"localforward 8080 [127.0.0.1]:8080",
 		"remoteforward 18080 [127.0.0.1]:18080",
@@ -427,29 +500,63 @@ func TestBuildSSHTunnelArgsFiltersForwardsFromResolvedConfig(t *testing.T) {
 
 	cfg.SSHOptions = resolvedTunnelOptionsFromSSHConfig(resolved)
 	cfg.SSHConfigResolved = true
-	args := buildSSHTunnelArgs(cfg, "/tmp/empty-ssh-config")
+	args, cleanup, err := sshTunnelArgs(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("sshTunnelArgs err = %v", err)
+	}
+	t.Cleanup(cleanup)
 	joined := strings.Join(args, " ")
+	configPath := ""
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "-F" {
+			configPath = args[i+1]
+			break
+		}
+	}
+	if configPath == "" {
+		t.Fatalf("sshTunnelArgs did not emit -F <path>: %v", args)
+	}
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", configPath, err)
+	}
+	configText := string(configData)
 
 	for _, unexpected := range []string{
-		"-o host=alias-host",
-		"localforward",
-		"remoteforward 18080",
-		"dynamicforward",
-		"requesttty",
-		"remotecommand",
+		"-o hostname=example.internal",
+		"-o user=demo",
+		"-o port=2222",
+		"-o identityfile=~/.ssh/id_ed25519",
+		"-o identityagent=",
+		"-o proxyjump=bastion",
 	} {
-		if strings.Contains(strings.ToLower(joined), unexpected) {
+		if strings.Contains(strings.ToLower(joined), strings.ToLower(unexpected)) {
 			t.Fatalf("ssh args unexpectedly preserved %q: %v", unexpected, args)
 		}
 	}
 
 	for _, expected := range []string{
-		"-F /tmp/empty-ssh-config",
-		"-o hostname=example.internal",
-		"-o user=demo",
-		"-o port=2222",
-		"-o identityfile=~/.ssh/id_ed25519",
-		"-o proxyjump=bastion",
+		"host *",
+		"hostname=example.internal",
+		"user=demo",
+		"port=2222",
+		"identityfile=~/.ssh/id_ed25519",
+		`identityagent "` + filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock") + `"`,
+		"proxyjump=bastion",
+	} {
+		if !strings.Contains(strings.ToLower(configText), strings.ToLower(expected)) {
+			t.Fatalf("ssh config missing %q:\n%s", expected, configText)
+		}
+	}
+
+	for _, expected := range []string{
+		"-F " + configPath,
+		"-o BatchMode=yes",
+		"-o ExitOnForwardFailure=yes",
+		"-o ServerAliveInterval=15",
+		"-o ServerAliveCountMax=3",
+		"-o ControlMaster=no",
+		"-o ControlPath=none",
 		"-R 19001:127.0.0.1:18339",
 		"alias-host",
 	} {
