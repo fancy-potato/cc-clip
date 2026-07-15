@@ -817,6 +817,7 @@ All settings have sensible defaults. The local daemon port defaults to `18339`.
 | Output dir | `$XDG_RUNTIME_DIR/claude-images` | `CC_CLIP_OUT_DIR` |
 | Probe timeout | 500ms | `CC_CLIP_PROBE_TIMEOUT_MS` |
 | Fetch timeout | 5000ms | `CC_CLIP_FETCH_TIMEOUT_MS` |
+| Image transfer timeout | 60000ms | `CC_CLIP_TOTAL_TIMEOUT_MS` |
 | Debug logs | off | `CC_CLIP_DEBUG=1` |
 
 </details>

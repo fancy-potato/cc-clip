@@ -16,7 +16,7 @@ CC_CLIP_TOKEN_FILE="${CC_CLIP_TOKEN_FILE:-${CC_CLIP_STATE_DIR}/session.token}"
 CC_CLIP_SESSION_FILE="${CC_CLIP_SESSION_FILE:-${CC_CLIP_STATE_DIR}/session.id}"
 CC_CLIP_PROBE_TIMEOUT_MS="${CC_CLIP_PROBE_TIMEOUT_MS:-500}"
 CC_CLIP_FETCH_TIMEOUT_MS="${CC_CLIP_FETCH_TIMEOUT_MS:-5000}"
-CC_CLIP_TOTAL_TIMEOUT_MS="${CC_CLIP_TOTAL_TIMEOUT_MS:-8000}"
+CC_CLIP_TOTAL_TIMEOUT_MS="${CC_CLIP_TOTAL_TIMEOUT_MS:-60000}"
 REAL_XCLIP="%s"
 
 _cc_clip_log() {
@@ -77,7 +77,7 @@ _cc_clip_fetch_binary() {
     local token
     token=$(_cc_clip_read_token) || return 12
     local timeout_s
-    timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_TOTAL_TIMEOUT_MS}/1000}")
     local session_hdr
     session_hdr=$(_cc_clip_session_header)
     local tmpfile
@@ -169,6 +169,7 @@ CC_CLIP_TOKEN_FILE="${CC_CLIP_TOKEN_FILE:-${CC_CLIP_STATE_DIR}/session.token}"
 CC_CLIP_SESSION_FILE="${CC_CLIP_SESSION_FILE:-${CC_CLIP_STATE_DIR}/session.id}"
 CC_CLIP_PROBE_TIMEOUT_MS="${CC_CLIP_PROBE_TIMEOUT_MS:-500}"
 CC_CLIP_FETCH_TIMEOUT_MS="${CC_CLIP_FETCH_TIMEOUT_MS:-5000}"
+CC_CLIP_TOTAL_TIMEOUT_MS="${CC_CLIP_TOTAL_TIMEOUT_MS:-60000}"
 REAL_WL_PASTE="%s"
 
 _cc_clip_log() {
@@ -223,7 +224,7 @@ _cc_clip_fetch_binary() {
     local token
     token=$(cat "$CC_CLIP_TOKEN_FILE" 2>/dev/null) || return 12
     local timeout_s
-    timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    timeout_s=$(awk "BEGIN {printf \"%%f\", ${CC_CLIP_TOTAL_TIMEOUT_MS}/1000}")
     local session_hdr
     session_hdr=$(_cc_clip_session_header)
     local tmpfile

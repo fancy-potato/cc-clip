@@ -201,3 +201,24 @@ func TestXclipShimContent(t *testing.T) {
 		}
 	}
 }
+
+func TestShimImageFetchUsesTotalTimeout(t *testing.T) {
+	shims := map[string]string{
+		"xclip":    XclipShim(18339, "/usr/bin/xclip"),
+		"wl-paste": WlPasteShim(18339, "/usr/bin/wl-paste"),
+	}
+
+	for name, content := range shims {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(content, `CC_CLIP_TOTAL_TIMEOUT_MS="${CC_CLIP_TOTAL_TIMEOUT_MS:-60000}"`) {
+				t.Fatal("shim missing 60 second image transfer timeout")
+			}
+			if got := strings.Count(content, "CC_CLIP_TOTAL_TIMEOUT_MS"); got != 3 {
+				t.Fatalf("CC_CLIP_TOTAL_TIMEOUT_MS occurrence count = %d, want declaration plus binary fetch use", got)
+			}
+			if got := strings.Count(content, "CC_CLIP_FETCH_TIMEOUT_MS"); got != 3 {
+				t.Fatalf("CC_CLIP_FETCH_TIMEOUT_MS occurrence count = %d, want declaration plus JSON fetch use", got)
+			}
+		})
+	}
+}
